@@ -36,10 +36,11 @@
 ### Phase 3: UX/Feature Improvements
 - [x] **Fix 8:** Remove non-functional Plugins menu item
 - [x] **Fix 9:** Remove non-functional model selector from chat
+- [x] **Fix 10:** Remove non-functional global search bar
 
 ## Next
 
-- [ ] Additional Phase 3 improvements (search functionality, etc.)
+- [ ] Additional Phase 3 improvements (if needed)
 
 ## Pending Queue
 
