@@ -926,10 +926,7 @@ Screens.chat = function () {
             <div class="chat-header">
                 <div class="chat-header-left">
                     ${!chatState.historyOpen ? '<button class="btn-icon" title="Show chats" onclick="chatToggleHistory()" style="width:32px;height:32px;margin-right:4px"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg></button>' : ''}
-                    <select class="chat-select" id="chat-model-select" title="Model">
-                        <option value="default">Default Model</option>
-                    </select>
-                    <button class="btn-icon" title="Export Chat" onclick="chatExport()" style="width:32px;height:32px;margin-left:4px">
+                    <button class="btn-icon" title="Export Chat" onclick="chatExport()" style="width:32px;height:32px">
                         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                     </button>
                 </div>
@@ -1025,9 +1022,8 @@ Screens.chat = function () {
         };
     }
 
-    // Load sessions and models
+    // Load sessions
     chatLoadHistory();
-    chatLoadModels();
 
     // Render current session or welcome
     if (chatState.currentSessionId) {
@@ -1189,47 +1185,6 @@ window.chatClearCurrent = function () {
         toast('Chat cleared', 'info', 1500);
     }).catch(e => toast('Error: ' + e.message, 'error'));
 };
-
-async function chatLoadModels() {
-    try {
-        const data = await api('GET', '/api/models');
-        const sel = document.getElementById('chat-model-select');
-        if (!sel) return;
-        sel.innerHTML = '<option value="default">Default Model</option>';
-        // Add the current default model if known
-        if (data.default_model) {
-            sel.innerHTML += '<option value="' + escA(data.default_model) + '">' + escH(data.default_model) + '</option>';
-        }
-        // Add configured models from all_models (array of {provider, model} objects)
-        const seen = new Set(['default', data.default_model || '']);
-        (data.all_models || []).forEach(m => {
-            const name = m.model || (typeof m === 'string' ? m : '');
-            if (name && !seen.has(name)) {
-                seen.add(name);
-                sel.innerHTML += '<option value="' + escA(name) + '">' + escH(name) + '</option>';
-            }
-        });
-        // Add popular OpenRouter models as suggestions
-        const popular = [
-            'anthropic/claude-opus-4',
-            'anthropic/claude-sonnet-4',
-            'anthropic/claude-haiku-4',
-            'openai/gpt-4o',
-            'openai/gpt-4o-mini',
-            'google/gemini-2.5-pro',
-            'google/gemini-2.5-flash',
-            'meta-llama/llama-4-maverick',
-            'deepseek/deepseek-r1',
-            'deepseek/deepseek-chat',
-            'x-ai/grok-3',
-        ];
-        popular.forEach(m => {
-            if (!seen.has(m)) {
-                sel.innerHTML += '<option value="' + escA(m) + '">' + escH(m) + '</option>';
-            }
-        });
-    } catch (e) { /* silent */ }
-}
 
 window.chatQuick = function (text) {
     document.getElementById('chat-input').value = text;
