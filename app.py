@@ -13,6 +13,7 @@ import json
 import shutil
 import subprocess
 import time
+import logging
 from datetime import datetime
 from pathlib import Path
 from functools import wraps
@@ -23,6 +24,16 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 import uuid
 from werkzeug.utils import secure_filename
+
+# ---------------------------------------------------------------------------
+# Logging Setup
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger('hermes-webui')
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -103,16 +114,19 @@ def require_token(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not HERMES_WEBUI_TOKEN:
+            logger.warning("Authentication not configured - rejecting API request")
             # Fail closed: if no token is configured, deny access
             return jsonify({"ok": False, "error": "API authentication not configured"}), 401
         
         # Check Authorization header for Bearer token
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
+            logger.warning("API request missing Authorization header from %s", request.remote_addr)
             return jsonify({"ok": False, "error": "Missing or invalid Authorization header"}), 401
         
         provided_token = auth_header[7:]  # Remove "Bearer " prefix
         if provided_token != HERMES_WEBUI_TOKEN:
+            logger.warning("API authentication failed - invalid token from %s", request.remote_addr)
             return jsonify({"ok": False, "error": "Invalid token"}), 401
         
         return f(*args, **kwargs)
@@ -312,6 +326,7 @@ def _skill_frontmatter(skill_md: Path) -> dict:
 
 
 def _http_error(msg: str, status: int = 500):
+    logger.error("HTTP error %d: %s", status, msg)
     return jsonify({"ok": False, "error": msg}), status
 
 
@@ -1424,7 +1439,20 @@ def catch_all(path):
 
 if __name__ == "__main__":
     PORT = int(os.environ.get("FLASK_PORT", 5000))
+    
+    # Log startup configuration
+    logger.info("=" * 60)
+    logger.info("Hermes Admin Panel Starting")
+    logger.info("=" * 60)
+    logger.info("Server: http://127.0.0.1:%d", PORT)
+    logger.info("Config: %s", CONFIG_PATH)
+    logger.info("Skills: %s", SKILLS_DIR)
+    logger.info("Auth: %s", "CONFIGURED" if HERMES_WEBUI_TOKEN else "NOT CONFIGURED")
+    logger.info("CORS: localhost only")
+    logger.info("=" * 60)
+    
     print(f"[Hermes Admin Panel] Starting on http://127.0.0.1:{PORT}")
     print(f"[Hermes Admin Panel] Config: {CONFIG_PATH}")
     print(f"[Hermes Admin Panel] Skills: {SKILLS_DIR}")
+    
     app.run(host="127.0.0.1", port=PORT, debug=False)

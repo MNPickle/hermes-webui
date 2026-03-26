@@ -27,6 +27,7 @@
 - [x] **Fix 1:** Create requirements.txt
 - [x] **Fix 2:** Authentication
 - [x] **Fix 5:** Production server / startup hardening
+- [x] **Fix 6:** Basic structured logging
 
 ## Next
 
