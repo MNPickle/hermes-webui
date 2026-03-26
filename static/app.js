@@ -2,12 +2,43 @@
 
 const API = { base: '' };
 
+// Token management
+function getToken() {
+    return localStorage.getItem('hermes_webui_token');
+}
+
+function setToken(token) {
+    localStorage.setItem('hermes_webui_token', token);
+}
+
+function promptForToken() {
+    const token = prompt('Enter your HERMES_WEBUI_TOKEN to access the admin panel:\n\n(Set this with: export HERMES_WEBUI_TOKEN=your-token-here)');
+    if (token) {
+        setToken(token);
+        location.reload();
+    }
+}
+
 async function api(method, path, body) {
-    const opts = { method, headers: { 'Content-Type': 'application/json' } };
+    const token = getToken();
+    const opts = { 
+        method, 
+        headers: { 
+            'Content-Type': 'application/json',
+            ...(token && { 'Authorization': 'Bearer ' + token })
+        } 
+    };
     if (body !== undefined && body !== null) opts.body = JSON.stringify(body);
     const resp = await fetch(API.base + path, opts);
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || data.message || 'Request failed');
+    if (!resp.ok) {
+        // If 401 and no token or invalid token, prompt for it
+        if (resp.status === 401) {
+            promptForToken();
+            throw new Error('Authentication required');
+        }
+        throw new Error(data.error || data.message || 'Request failed');
+    }
     return data;
 }
 
