@@ -319,8 +319,8 @@ def _http_error(msg: str, status: int = 500):
 # 1. Health
 # ===================================================================
 
-@require_token
 @app.route("/api/health")
+@require_token
 def api_health():
     try:
         pid = _find_gateway_pid()
@@ -346,8 +346,8 @@ def api_health():
 # 2. System info
 # ===================================================================
 
-@require_token
 @app.route("/api/system")
+@require_token
 def api_system():
     try:
         import platform
@@ -372,8 +372,8 @@ def api_system():
 # 3–6. Config endpoints
 # ===================================================================
 
-@require_token
 @app.route("/api/config", methods=["GET"])
+@require_token
 def api_config_get():
     try:
         return jsonify(cfg.get())
@@ -381,8 +381,8 @@ def api_config_get():
         return _http_error(str(exc))
 
 
-@require_token
 @app.route("/api/config/<section>", methods=["GET"])
+@require_token
 def api_config_get_section(section):
     try:
         return jsonify(cfg.get(section))
@@ -390,8 +390,8 @@ def api_config_get_section(section):
         return _http_error(str(exc))
 
 
-@require_token
 @app.route("/api/config/<section>", methods=["PUT"])
+@require_token
 def api_config_put_section(section):
     try:
         data = request.get_json(force=True)
@@ -401,8 +401,8 @@ def api_config_put_section(section):
         return jsonify({"ok": False, "errors": [str(exc)]}), 500
 
 
-@require_token
 @app.route("/api/config/reload", methods=["POST"])
+@require_token
 def api_config_reload():
     try:
         cfg.load()
@@ -415,8 +415,8 @@ def api_config_reload():
 # 7–9. Environment variables
 # ===================================================================
 
-@require_token
 @app.route("/api/env", methods=["GET"])
+@require_token
 def api_env_get():
     try:
         raw = dotenv_values(str(ENV_PATH)) if ENV_PATH.exists() else {}
@@ -432,8 +432,8 @@ def api_env_get():
         return _http_error(str(exc))
 
 
-@require_token
 @app.route("/api/env", methods=["POST"])
+@require_token
 def api_env_set():
     try:
         data = request.get_json(force=True)
@@ -447,8 +447,8 @@ def api_env_set():
         return _http_error(str(exc))
 
 
-@require_token
 @app.route("/api/env/<key>", methods=["PUT"])
+@require_token
 def api_env_update(key):
     try:
         data = request.get_json(force=True)
@@ -459,8 +459,8 @@ def api_env_update(key):
         return _http_error(str(exc))
 
 
-@require_token
 @app.route("/api/env/<key>", methods=["DELETE"])
+@require_token
 def api_env_delete(key):
     try:
         unset_key(str(ENV_PATH), key)
@@ -498,8 +498,8 @@ def _get_providers_info():
     return default, custom, auxiliary
 
 
-@require_token
 @app.route("/api/providers", methods=["GET"])
+@require_token
 def api_providers_get():
     try:
         default, custom, auxiliary = _get_providers_info()
@@ -514,8 +514,8 @@ def api_providers_get():
         return _http_error(str(exc))
 
 
-@require_token
 @app.route("/api/providers", methods=["POST"])
+@require_token
 def api_providers_add():
     try:
         data = request.get_json(force=True)
@@ -537,8 +537,8 @@ def api_providers_add():
         return _http_error(str(exc))
 
 
-@require_token
 @app.route("/api/providers/<name>", methods=["PUT"])
+@require_token
 def api_providers_update(name):
     try:
         data = request.get_json(force=True)
@@ -559,8 +559,8 @@ def api_providers_update(name):
         return _http_error(str(exc))
 
 
-@require_token
 @app.route("/api/providers/<name>", methods=["DELETE"])
+@require_token
 def api_providers_delete(name):
     try:
         raw = cfg.get_raw()
@@ -574,8 +574,8 @@ def api_providers_delete(name):
         return _http_error(str(exc))
 
 
-@require_token
 @app.route("/api/providers/<name>/test", methods=["POST"])
+@require_token
 def api_providers_test(name):
     try:
         raw = cfg.get_raw()
@@ -648,8 +648,8 @@ def api_providers_test(name):
 # 15. Models
 # ===================================================================
 
-@require_token
 @app.route("/api/models", methods=["GET"])
+@require_token
 def api_models_get():
     try:
         raw = cfg.get_raw()
@@ -692,8 +692,8 @@ def api_models_get():
 # 16–20. Agents / Personalities
 # ===================================================================
 
-@require_token
 @app.route("/api/agents", methods=["GET"])
+@require_token
 def api_agents_get():
     try:
         raw = cfg.get_raw()
@@ -709,8 +709,8 @@ def api_agents_get():
         return _http_error(str(exc))
 
 
-@require_token
 @app.route("/api/agents", methods=["POST"])
+@require_token
 def api_agents_add():
     try:
         data = request.get_json(force=True)
@@ -732,8 +732,8 @@ def api_agents_add():
         return _http_error(str(exc))
 
 
-@require_token
 @app.route("/api/agents/<name>", methods=["PUT"])
+@require_token
 def api_agents_update(name):
     try:
         data = request.get_json(force=True)
@@ -751,8 +751,8 @@ def api_agents_update(name):
         return _http_error(str(exc))
 
 
-@require_token
 @app.route("/api/agents/<name>", methods=["DELETE"])
+@require_token
 def api_agents_delete(name):
     try:
         raw = cfg.get_raw()
@@ -769,8 +769,8 @@ def api_agents_delete(name):
         return _http_error(str(exc))
 
 
-@require_token
 @app.route("/api/agents/<name>/duplicate", methods=["POST"])
+@require_token
 def api_agents_duplicate(name):
     try:
         data = request.get_json(force=True)
@@ -796,8 +796,8 @@ def api_agents_duplicate(name):
 # 21–22. Skills
 # ===================================================================
 
-@require_token
 @app.route("/api/skills", methods=["GET"])
+@require_token
 def api_skills_get():
     try:
         skills = []
@@ -825,8 +825,8 @@ def api_skills_get():
         return _http_error(str(exc))
 
 
-@require_token
 @app.route("/api/skills/<path:name>/toggle", methods=["POST"])
+@require_token
 def api_skill_toggle(name):
     try:
         skill_path = SKILLS_DIR / name
@@ -850,8 +850,8 @@ def api_skill_toggle(name):
 # 23–24. Channels
 # ===================================================================
 
-@require_token
 @app.route("/api/channels", methods=["GET"])
+@require_token
 def api_channels_get():
     try:
         raw = cfg.get_raw()
@@ -875,8 +875,8 @@ def api_channels_get():
         return _http_error(str(exc))
 
 
-@require_token
 @app.route("/api/channels/<name>", methods=["PUT"])
+@require_token
 def api_channels_update(name):
     try:
         data = request.get_json(force=True)
@@ -896,8 +896,8 @@ def api_channels_update(name):
 # 25–26. Sessions
 # ===================================================================
 
-@require_token
 @app.route("/api/sessions", methods=["GET"])
+@require_token
 def api_sessions_get():
     """Return a list of recent chat sessions for the session selector."""
     try:
@@ -914,8 +914,8 @@ def api_sessions_get():
         return jsonify({"sessions": []})
 
 
-@require_token
 @app.route("/api/sessions/config", methods=["GET"])
+@require_token
 def api_sessions_config_get():
     try:
         return jsonify(cfg.get("session_reset") or {})
@@ -923,8 +923,8 @@ def api_sessions_config_get():
         return _http_error(str(exc))
 
 
-@require_token
 @app.route("/api/sessions/config", methods=["PUT"])
+@require_token
 def api_sessions_config_put():
     try:
         data = request.get_json(force=True)
@@ -938,8 +938,8 @@ def api_sessions_config_put():
 # 27–28. Hooks / Webhooks
 # ===================================================================
 
-@require_token
 @app.route("/api/hooks", methods=["GET"])
+@require_token
 def api_hooks_get():
     try:
         hooks = cfg.get("hooks")
@@ -950,8 +950,8 @@ def api_hooks_get():
         return _http_error(str(exc))
 
 
-@require_token
 @app.route("/api/hooks", methods=["PUT"])
+@require_token
 def api_hooks_put():
     try:
         data = request.get_json(force=True)
@@ -965,8 +965,8 @@ def api_hooks_put():
 # 29. Logs
 # ===================================================================
 
-@require_token
 @app.route("/api/logs")
+@require_token
 def api_logs_get():
     try:
         lines = request.args.get("lines", 200, type=int)
@@ -1005,8 +1005,8 @@ def api_logs_get():
 # 30. Tools
 # ===================================================================
 
-@require_token
 @app.route("/api/tools", methods=["GET"])
+@require_token
 def api_tools_get():
     try:
         tools = []
@@ -1054,8 +1054,8 @@ def api_tools_get():
 # 31. Service control
 # ===================================================================
 
-@require_token
 @app.route("/api/service/<action>", methods=["POST"])
+@require_token
 def api_service_action(action):
     try:
         action = action.lower()
@@ -1082,8 +1082,8 @@ def api_service_action(action):
 # 33. Onboarding check
 # ===================================================================
 
-@require_token
 @app.route("/api/onboarding", methods=["GET"])
+@require_token
 def api_onboarding_get():
     try:
         raw = cfg.get_raw()
@@ -1247,8 +1247,8 @@ def _get_or_create_chat_session(session_id=None):
     return chat_sessions[session_id]
 
 
-@require_token
 @app.route("/api/chat", methods=["POST"])
+@require_token
 def api_chat():
     data = request.get_json()
     message = data.get("message", "").strip()
@@ -1288,8 +1288,8 @@ def api_chat():
                      "message_count": len(sess["messages"]), "title": sess.get("title", "")})
 
 
-@require_token
 @app.route("/api/upload", methods=["POST"])
+@require_token
 def api_upload():
     if "file" not in request.files:
         return jsonify({"error": "No file"}), 400
@@ -1306,8 +1306,8 @@ def api_upload():
                      "type": f.content_type, "url": f"/uploads/{unique}"})
 
 
-@require_token
 @app.route("/api/upload/base64", methods=["POST"])
+@require_token
 def api_upload_base64():
     """Accept a base64-encoded image (from clipboard paste) and save it."""
     data = request.get_json() or {}
@@ -1337,8 +1337,8 @@ def serve_upload(filename):
     return send_from_directory(str(UPLOAD_FOLDER), filename)
 
 
-@require_token
 @app.route("/api/chat/sessions", methods=["GET"])
+@require_token
 def api_chat_sessions():
     sessions = []
     for sid, s in chat_sessions.items():
@@ -1355,8 +1355,8 @@ def api_chat_sessions():
     return jsonify({"sessions": sessions})
 
 
-@require_token
 @app.route("/api/chat/sessions/<session_id>/messages", methods=["GET"])
+@require_token
 def api_chat_messages(session_id):
     if session_id not in chat_sessions:
         return jsonify({"error": "Session not found"}), 404
@@ -1364,8 +1364,8 @@ def api_chat_messages(session_id):
                      "title": chat_sessions[session_id].get("title", "")})
 
 
-@require_token
 @app.route("/api/chat/sessions/<session_id>/rename", methods=["POST"])
+@require_token
 def api_chat_rename(session_id):
     if session_id not in chat_sessions:
         return jsonify({"error": "Session not found"}), 404
@@ -1377,15 +1377,15 @@ def api_chat_rename(session_id):
     return jsonify({"ok": True, "title": chat_sessions[session_id].get("title", "")})
 
 
-@require_token
 @app.route("/api/chat/sessions/<session_id>/delete", methods=["POST"])
+@require_token
 def api_chat_delete(session_id):
     _delete_session_from_disk(session_id)
     return jsonify({"ok": True})
 
 
-@require_token
 @app.route("/api/chat/sessions/<session_id>/clear", methods=["POST"])
+@require_token
 def api_chat_clear(session_id):
     if session_id in chat_sessions:
         chat_sessions[session_id]["messages"] = []
@@ -1393,8 +1393,8 @@ def api_chat_clear(session_id):
     return jsonify({"ok": True})
 
 
-@require_token
 @app.route("/api/chat/status", methods=["GET"])
+@require_token
 def api_chat_status():
     return jsonify({
         "api_server": _check_api_server(),
