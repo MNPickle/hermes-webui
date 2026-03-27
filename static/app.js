@@ -1204,7 +1204,7 @@ window.chatClearCurrent = function () {
         chatRenderMessages();
         chatLoadHistory();
         toast('Chat cleared', 'info', 1500);
-    }).catch(e => toast('Error: ' + e.message, 'error'));
+    }).catch(e => { chatState.isThinking = false; toast('Error: ' + e.message, 'error'); });
 };
 
 window.chatQuick = function (text) {

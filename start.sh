@@ -18,7 +18,7 @@ echo ""
 cd "$APP_DIR" || exit 1
 
 # Check if already running on this port
-if curl -s "http://127.0.0.1:$PORT/api/health" > /dev/null 2>&1; then
+if curl -s "http://127.0.0.1:$PORT/" > /dev/null 2>&1; then
     echo "  Web UI is already running on port $PORT"
     echo "  Open http://127.0.0.1:$PORT in your browser"
     echo "=========================================="

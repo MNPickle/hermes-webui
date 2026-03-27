@@ -1456,6 +1456,8 @@ def api_chat_rename(session_id):
 @app.route("/api/chat/sessions/<session_id>/delete", methods=["POST"])
 @require_token
 def api_chat_delete(session_id):
+    if session_id not in chat_sessions:
+        return jsonify({"ok": False, "error": "Session not found"}), 404
     _delete_session_from_disk(session_id)
     return jsonify({"ok": True})
 
@@ -1463,9 +1465,10 @@ def api_chat_delete(session_id):
 @app.route("/api/chat/sessions/<session_id>/clear", methods=["POST"])
 @require_token
 def api_chat_clear(session_id):
-    if session_id in chat_sessions:
-        chat_sessions[session_id]["messages"] = []
-        _save_session(session_id)
+    if session_id not in chat_sessions:
+        return jsonify({"ok": False, "error": "Session not found"}), 404
+    chat_sessions[session_id]["messages"] = []
+    _save_session(session_id)
     return jsonify({"ok": True})
 
 
