@@ -572,7 +572,7 @@ Screens.models = async function () {
         html += '<div class="stat-card green"><div class="stat-value font-mono" style="font-size:16px">' + escH(data.fallback_model || 'None') + '</div><div class="stat-label">Fallback Model</div></div></div>';
 
         html += '<div class="card"><div class="card-header"><span>All Models</span></div><div class="table-container"><table class="table"><thead><tr><th>Model ID</th></tr></thead><tbody>';
-        (data.all_models || []).forEach(m => { html += '<tr><td class="font-mono text-sm">' + escH(m) + '</td></tr>'; });
+        (data.all_models || []).forEach(m => { html += '<tr><td class="font-mono text-sm">' + escH(m.provider + ' / ' + m.model) + '</td></tr>'; });
         if (!data.all_models || data.all_models.length === 0) html += '<tr><td class="text-muted">No models listed</td></tr>';
         html += '</tbody></table></div></div>';
         content.innerHTML = html;

@@ -34,7 +34,7 @@ else
     echo "  [PRODUCTION] Using gunicorn"
     "$WEBUI_VENV/bin/gunicorn" \
         --bind "127.0.0.1:$PORT" \
-        --workers 2 \
+        --workers 1 \
         --timeout 120 \
         --access-logfile - \
         --error-logfile - \

@@ -1499,21 +1499,6 @@ def catch_all(path):
 # ===================================================================
 
 if __name__ == "__main__":
-    PORT = int(os.environ.get("FLASK_PORT", 5000))
-    
-    # Log startup configuration
-    logger.info("=" * 60)
-    logger.info("Hermes Admin Panel Starting")
-    logger.info("=" * 60)
-    logger.info("Server: http://127.0.0.1:%d", PORT)
-    logger.info("Config: %s", CONFIG_PATH)
-    logger.info("Skills: %s", SKILLS_DIR)
-    logger.info("Auth: %s", "CONFIGURED" if HERMES_WEBUI_TOKEN else "NOT CONFIGURED")
-    logger.info("CORS: localhost only")
-    logger.info("=" * 60)
-    
-    print(f"[Hermes Admin Panel] Starting on http://127.0.0.1:{PORT}")
-    print(f"[Hermes Admin Panel] Config: {CONFIG_PATH}")
-    print(f"[Hermes Admin Panel] Skills: {SKILLS_DIR}")
-    
-    app.run(host="127.0.0.1", port=PORT, debug=False)
+    print("[Hermes Admin Panel] ERROR: do not run this file directly.")
+    print("[Hermes Admin Panel] Use start.sh to run in production, or DEV=1 ./start.sh for development.")
+    exit(1)
