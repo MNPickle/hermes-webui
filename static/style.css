@@ -1850,7 +1850,7 @@ pre code {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px;
+  padding: 12px 8px;
   font-weight: 600;
   font-size: 13px;
   color: var(--text-secondary);
@@ -1858,11 +1858,22 @@ pre code {
   letter-spacing: 0.5px;
   flex-shrink: 0;
   min-height: 48px;
+  overflow: hidden;
+  gap: 8px;
+}
+
+.chat-history-header > span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chat-history-actions {
   display: flex;
   gap: 4px;
+  flex-shrink: 0;
 }
 
 .chat-history-list {
