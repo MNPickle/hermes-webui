@@ -943,7 +943,10 @@ async function chatHandlePaste(e) {
                     const b64data = reader.result;
                     const resp = await fetch('/api/upload/base64', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': 'Bearer ' + getToken(),
+                        },
                         body: JSON.stringify({ data: b64data, ext }),
                     });
                     if (resp.ok) {
@@ -1401,7 +1404,11 @@ async function chatUploadFile(file) {
     const fd = new FormData();
     fd.append('file', file);
     try {
-        const resp = await fetch('/api/upload', { method: 'POST', body: fd });
+        const resp = await fetch('/api/upload', {
+            method: 'POST',
+            headers: { 'Authorization': 'Bearer ' + getToken() },
+            body: fd,
+        });
         if (resp.ok) {
             const data = await resp.json();
             chatState.pendingFiles.push(data);
