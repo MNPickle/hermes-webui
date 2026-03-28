@@ -56,8 +56,12 @@ function showModal(title, bodyHtml, footerHtml = '') {
     document.getElementById('modal-body').innerHTML = bodyHtml;
     document.getElementById('modal-footer').innerHTML = footerHtml;
     document.getElementById('modal-overlay').classList.remove('hidden');
+    document.getElementById('modal-overlay').classList.add('active');
 }
-function closeModal() { document.getElementById('modal-overlay').classList.add('hidden'); }
+function closeModal() {
+    document.getElementById('modal-overlay').classList.remove('active');
+    document.getElementById('modal-overlay').classList.add('hidden');
+}
 
 function escH(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
 function escA(s) { return String(s == null ? '' : s).replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
