@@ -276,8 +276,10 @@ async function serviceAction(action) {
         // Invalidate health cache so next check gets fresh gateway status
         _healthCache = null;
         checkHealth();
+        // Re-render service card with fresh status from /api/health
+        Screens.service();
         if (action === 'start' || action === 'restart') {
-            setTimeout(() => { _healthCache = null; checkHealth(); }, 3000);
+            setTimeout(() => { _healthCache = null; checkHealth(); Screens.service(); }, 3000);
         }
         if (action === 'doctor' && r.output) {
             showModal('Diagnostics Output', '<pre class="font-mono text-sm" style="max-height:400px;overflow:auto;white-space:pre-wrap">' + escH(r.output) + '</pre>');
