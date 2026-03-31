@@ -403,7 +403,7 @@ Screens.settings = async function () {
                 }
                 formHtml += '</div>';
             });
-            return '<div class="tab-pane' + (i === 0 ? ' active' : '') + '" data-tab="' + t.id + '">' + formHtml + '<button class="btn btn-primary mt-16" onclick="saveSettings(this)">Save Settings</button></div>';
+            return '<div class="tab-pane' + (i === 0 ? ' active' : '') + '" data-tab="' + t.id + '">' + formHtml + '<p class="form-hint">Saves active tab only</p><button class="btn btn-primary" onclick="saveSettings(this)">Save Settings</button></div>';
         }).join('');
 
         content.innerHTML = tabsHtml + panelsHtml;
@@ -508,9 +508,11 @@ window.editEnvVar = async function (key) {
     try {
         const data = await api('GET', '/api/env');
         const val = data.vars[key] || '';
+        const masked = val ? '•'.repeat(Math.min(val.length, 20)) + (val.length > 20 ? '…' : '') : '(empty)';
         showModal('Edit Variable: ' + key,
             '<div class="form-group"><label class="form-label">Key</label><input class="form-input" value="' + escA(key) + '" disabled></div>' +
-            '<div class="form-group"><label class="form-label">Value</label>' + inputH('env-edit-value', '', 'text', 'Enter new value') + '</div>',
+            '<div class="form-group"><label class="form-label">Current Value</label><div class="font-mono text-sm" style="color:var(--muted);padding:4px 0">' + escH(masked) + '</div></div>' +
+            '<div class="form-group"><label class="form-label">New Value</label>' + inputH('env-edit-value', '', 'text', 'Enter new value') + '</div>',
             '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="saveEditEnvVar(\'' + escA(key) + '\')">Save</button>'
         );
     } catch (e) { toast('Error: ' + e.message, 'error'); }
@@ -608,36 +610,43 @@ Screens.providers = async function () {
     }
 };
 
-window.providerModal = function (title, name, base_url, model, saveFn) {
+window.providerModal = function (title, name, base_url, model, api_key, saveFn) {
     showModal(title,
         '<div class="form-group"><label class="form-label">Name</label>' + inputH('prov-name', name, 'text', 'e.g. my-provider', name ? 'disabled' : '') + '</div>' +
         '<div class="form-group"><label class="form-label">Base URL</label>' + inputH('prov-url', base_url, 'url', 'https://api.example.com/v1') + '</div>' +
-        '<div class="form-group"><label class="form-label">Model</label>' + inputH('prov-model', model, 'text', 'e.g. gpt-4') + '</div>',
+        '<div class="form-group"><label class="form-label">Model</label>' + inputH('prov-model', model, 'text', 'e.g. gpt-4') + '</div>' +
+        '<div class="form-group"><label class="form-label">API Key <span class="form-label-hint">(optional)</span></label>' + inputH('prov-api-key', api_key || '', 'password', 'Leave blank to keep current') + '</div>',
         '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="' + saveFn + '">Save</button>'
     );
 };
-window.addProvider = function () { window.providerModal('Add Provider', '', '', '', 'saveNewProvider()'); };
+window.addProvider = function () { window.providerModal('Add Provider', '', '', '', '', 'saveNewProvider()'); };
 window.editProvider = async function (name) {
     try {
         const data = await api('GET', '/api/providers');
         const p = (data.custom || []).find(x => x.name === name);
         if (!p) { toast('Provider not found', 'error'); return; }
-        window.providerModal('Edit Provider: ' + name, p.name, p.base_url, p.model, 'saveEditProvider()');
+        window.providerModal('Edit Provider: ' + name, p.name, p.base_url, p.model, p.api_key || '', 'saveEditProvider()');
     } catch (e) { toast('Error: ' + e.message, 'error'); }
 };
 window.saveNewProvider = async function () {
     const name = document.getElementById('prov-name').value.trim();
     const base_url = document.getElementById('prov-url').value.trim();
     const model = document.getElementById('prov-model').value.trim();
+    const api_key = document.getElementById('prov-api-key').value;
     if (!name) { toast('Name required', 'error'); return; }
-    try { await api('POST', '/api/providers', { name, base_url, model }); toast('Provider added', 'success'); closeModal(); Screens.providers(); }
+    const payload = { name, base_url, model };
+    if (api_key) payload.api_key = api_key;
+    try { await api('POST', '/api/providers', payload); toast('Provider added', 'success'); closeModal(); Screens.providers(); }
     catch (e) { toast('Error: ' + e.message, 'error'); }
 };
 window.saveEditProvider = async function () {
     const name = document.getElementById('prov-name').value.trim();
     const base_url = document.getElementById('prov-url').value.trim();
     const model = document.getElementById('prov-model').value.trim();
-    try { await api('PUT', '/api/providers/' + name, { base_url, model }); toast('Provider updated', 'success'); closeModal(); Screens.providers(); }
+    const api_key = document.getElementById('prov-api-key').value;
+    const payload = { base_url, model };
+    if (api_key) payload.api_key = api_key;
+    try { await api('PUT', '/api/providers/' + name, payload); toast('Provider updated', 'success'); closeModal(); Screens.providers(); }
     catch (e) { toast('Error: ' + e.message, 'error'); }
 };
 window.deleteProvider = function (name) {
