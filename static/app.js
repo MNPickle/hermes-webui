@@ -1205,6 +1205,7 @@ async function chatLoadHistory() {
                 '<div class="chat-history-item-preview">' + preview + '</div>' +
                 '<div class="chat-history-item-meta">' + msgCount + ' msgs</div>' +
                 '<div class="chat-history-item-actions">' +
+                '<button class="btn-icon" title="Rename" onclick="event.stopPropagation();chatRenameSessionPrompt(\'' + escA(s.id) + '\', \'' + escA(s.title || 'Untitled') + '\')" style="width:22px;height:22px"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg></button>' +
                 '<button class="btn-icon" title="Delete" onclick="event.stopPropagation();chatDeleteSession(\'' + escA(s.id) + '\')" style="width:22px;height:22px"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>' +
                 '</div></div>';
         }).join('');
@@ -1237,6 +1238,17 @@ window.chatDeleteSession = async function (sid) {
         }
         chatLoadHistory();
     } catch (e) { toast('Delete failed', 'error'); }
+};
+
+window.chatRenameSessionPrompt = async function (sid, currentTitle) {
+    const newTitle = window.prompt('Rename chat:', currentTitle);
+    if (newTitle === null) return;  // cancelled
+    if (newTitle.trim() === '') { toast('Name cannot be empty', 'warning'); return; }
+    try {
+        await api('POST', '/api/chat/sessions/' + sid + '/rename', { title: newTitle.trim() });
+        toast('Chat renamed', 'success', 1500);
+        chatLoadHistory();
+    } catch (e) { toast('Rename failed', 'error'); }
 };
 
 window.chatToggleHistory = function () {
