@@ -25,7 +25,7 @@
   /* Text */
   --text-primary: #e2e5f0;
   --text-secondary: #8890a8;
-  --text-muted: #545a72;
+  --text-muted: #6b7389;
 
   /* Accent */
   --accent: #6366f1;
@@ -126,7 +126,7 @@
   --border-light: #181b2a;
   --text-primary: #e2e5f0;
   --text-secondary: #8890a8;
-  --text-muted: #545a72;
+  --text-muted: #6b7389;
   --accent-dim: rgba(99, 102, 241, 0.12);
   --accent-glow: rgba(99, 102, 241, 0.25);
   --teal-dim: rgba(6, 182, 212, 0.12);
@@ -435,6 +435,10 @@ pre code {
   white-space: nowrap;
   margin-bottom: 2px;
   text-decoration: none;
+  background: none;
+  border: none;
+  text-align: left;
+  font-family: inherit;
 }
 
 .nav-item:hover {
