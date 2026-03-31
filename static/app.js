@@ -18,20 +18,27 @@ class AuthRequired extends Error {
 }
 
 let _tokenPromptActive = false;
+let _tokenPromptDeferred = null;
 
 function promptForToken() {
     if (_tokenPromptActive) return null;
     _tokenPromptActive = true;
+    // Create a deferred that waiting requests will await
+    let resolveDeferred;
+    _tokenPromptDeferred = new Promise(resolve => { resolveDeferred = resolve; });
     try {
         const token = prompt('Enter your HERMES_WEBUI_TOKEN to access the admin panel:\n\n(Set this with: export HERMES_WEBUI_TOKEN=your-token-here)');
         if (token && token.trim()) {
             const trimmed = token.trim();
             setToken(trimmed);
-            return trimmed; // return the saved token so api() can retry
+            resolveDeferred(trimmed); // resolve the deferred so all waiters retry
+            return trimmed;
         }
+        resolveDeferred(null); // user cancelled
         return null;
     } finally {
         _tokenPromptActive = false;
+        _tokenPromptDeferred = null;
     }
 }
 
@@ -49,10 +56,27 @@ async function api(method, path, body) {
     if (!resp.ok) {
         if (resp.status === 401) {
             if (!token) {
-                // No stored token: prompt, then retry once with the newly saved token
+                if (_tokenPromptActive) {
+                    // Another request is prompting — wait for the result, then retry
+                    const savedToken = await _tokenPromptDeferred;
+                    if (savedToken) {
+                        const retryOpts = {
+                            method,
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Authorization': 'Bearer ' + savedToken
+                            }
+                        };
+                        if (body !== undefined && body !== null) retryOpts.body = JSON.stringify(body);
+                        const retryResp = await fetch(API.base + path, retryOpts);
+                        if (retryResp.ok) return retryResp.json();
+                        if (retryResp.status === 401) throw new Error('Authentication failed: check your token');
+                    }
+                    throw new AuthRequired();
+                }
+                // No prompt in progress — prompt now, then retry once
                 const savedToken = promptForToken();
                 if (savedToken) {
-                    // Retry with the saved token
                     const retryOpts = {
                         method,
                         headers: {
@@ -63,12 +87,8 @@ async function api(method, path, body) {
                     if (body !== undefined && body !== null) retryOpts.body = JSON.stringify(body);
                     const retryResp = await fetch(API.base + path, retryOpts);
                     if (retryResp.ok) return retryResp.json();
-                    // Retry also failed — fall through to error handling
-                    if (retryResp.status === 401) {
-                        throw new Error('Authentication failed: check your token');
-                    }
+                    if (retryResp.status === 401) throw new Error('Authentication failed: check your token');
                 }
-                // User cancelled or prompt failed — throw AuthRequired for caller to handle
                 throw new AuthRequired();
             }
             // Stored token was rejected
