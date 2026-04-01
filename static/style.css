@@ -1906,11 +1906,30 @@ pre code {
 }
 
 .chat-history.collapsed {
-  width: 0;
-  min-width: 0;
-  opacity: 0;
-  border-right: none;
-  pointer-events: none;
+  width: 44px;
+  min-width: 44px;
+  opacity: 1;
+  border-right: 1px solid var(--border);
+  overflow: visible;
+}
+
+/* When collapsed, hide everything except the toggle button */
+.chat-history.collapsed .chat-history-header > span,
+.chat-history.collapsed .chat-history-actions > .btn-icon:first-child,
+.chat-history.collapsed .chat-history-list {
+  display: none;
+}
+
+/* Show only the toggle button in collapsed state */
+.chat-history.collapsed .chat-history-header {
+  justify-content: center;
+  padding: 8px 6px;
+}
+
+.chat-history.collapsed .chat-history-actions {
+  justify-content: center;
+  width: 100%;
+  flex: unset;
 }
 
 /* When main sidebar is collapsed, chat history expands to full width */

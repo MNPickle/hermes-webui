@@ -1808,7 +1808,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const params = new URLSearchParams(window.location.search);
     const hash = window.location.hash.replace('#', '');
     const direct = params.get('go') || hash || '';
-    navigate(direct && Screens[direct] ? direct : 'dashboard');
+    navigate(direct && Screens[direct] ? direct : 'chat');
     // Listen for hash changes
     window.addEventListener('hashchange', () => {
         const h = window.location.hash.replace('#', '');
