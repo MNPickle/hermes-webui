@@ -19,7 +19,7 @@ from pathlib import Path
 from functools import wraps
 
 import yaml
-from dotenv import dotenv_values, set_key, unset_key
+from dotenv import dotenv_values, load_dotenv, set_key, unset_key
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 import uuid
@@ -38,6 +38,11 @@ logger = logging.getLogger('hermes-webui')
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
+APP_ROOT = Path(__file__).resolve().parent
+REPO_ENV_PATH = APP_ROOT / ".env"
+if REPO_ENV_PATH.exists():
+    load_dotenv(REPO_ENV_PATH, override=False)
+
 HERMES_HOME = Path.home() / ".hermes"
 CONFIG_PATH = HERMES_HOME / "config.yaml"
 ENV_PATH = HERMES_HOME / ".env"
@@ -62,14 +67,14 @@ def _find_hermes_bin():
 HERMES_BIN = _find_hermes_bin()
 SESSIONS_DIR = HERMES_HOME / "sessions"
 UPLOADS_DIR = Path.home() / "hermes-web-ui" / "uploads"
-UPLOAD_FOLDER = Path(__file__).parent / "uploads"
+UPLOAD_FOLDER = APP_ROOT / "uploads"
 UPLOAD_FOLDER.mkdir(exist_ok=True)
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB
 HERMES_API_URL = os.environ.get("HERMES_API_URL", "http://127.0.0.1:8642")
 BACKUP_DIR = HERMES_HOME / "backups"
 
 # Chat session storage (persisted to disk)
-CHAT_DATA_DIR = Path(__file__).parent / "chat_data"
+CHAT_DATA_DIR = APP_ROOT / "chat_data"
 CHAT_DATA_DIR.mkdir(exist_ok=True)
 
 chat_sessions: dict = {}  # runtime cache: sid -> session dict
@@ -109,8 +114,8 @@ _load_all_sessions()
 # ---------------------------------------------------------------------------
 app = Flask(
     __name__,
-    template_folder=str(Path(__file__).parent / "templates"),
-    static_folder=str(Path(__file__).parent / "static"),
+    template_folder=str(APP_ROOT / "templates"),
+    static_folder=str(APP_ROOT / "static"),
 )
 # Restrict CORS to localhost by default
 CORS(app, resources={
