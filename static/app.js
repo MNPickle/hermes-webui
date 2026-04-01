@@ -1081,27 +1081,6 @@ Screens.chat = function () {
 
         <!-- Chat Main Area -->
         <div class="chat-main">
-            <div class="chat-header">
-                <div class="chat-header-left">
-                    ${!chatState.historyOpen ? '<button class="btn-icon" title="Show chats" onclick="chatToggleHistory()" style="width:32px;height:32px;margin-right:4px"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg></button>' : ''}
-                    <button class="btn-icon" title="Export Chat" onclick="chatExport()" style="width:32px;height:32px">
-                        <svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-                    </button>
-                </div>
-                <div class="chat-header-right">
-                    <button class="btn-icon" title="New session" onclick="chatNewSession()">
-                        <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                    </button>
-                    <button class="btn-icon" title="Regenerate response" onclick="chatRegenerate()">
-                        <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-                    </button>
-                    <button class="btn-icon" title="Clear chat" onclick="chatClearCurrent()">
-                        <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-                    </button>
-                </div>
-            </div>
-
-
             <div class="chat-transcript" id="chat-messages" role="log" aria-live="polite"></div>
 
             <div class="chat-file-bar hidden" id="chat-file-bar">
@@ -1124,6 +1103,20 @@ Screens.chat = function () {
                     </button>
                 </div>
                 <div class="chat-composer-footer">
+                    <div class="chat-composer-actions">
+                        <button class="chat-action-btn" title="Export Chat" onclick="chatExport()">
+                            <svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                        </button>
+                        <button class="chat-action-btn" title="New Chat" onclick="chatNewSession()">
+                            <svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                        </button>
+                        <button class="chat-action-btn" title="Regenerate" onclick="chatRegenerate()">
+                            <svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                        </button>
+                        <button class="chat-action-btn" title="Clear chat" onclick="chatClearCurrent()">
+                            <svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                        </button>
+                    </div>
                     <span class="chat-composer-hint">Enter to send, Shift+Enter for new line, Ctrl+V to paste image</span>
                     <span id="chat-voice-status" class="chat-voice-status"></span>
                 </div>
@@ -1157,7 +1150,8 @@ Screens.chat = function () {
             let t = '';
             for (let i = e.resultIndex; i < e.results.length; i++) t += e.results[i][0].transcript;
             input.value = t;
-            document.getElementById('chat-send-btn').disabled = false;
+            chatAutoResize(input);
+            document.getElementById('chat-send-btn').disabled = !input.value.trim();
         };
         chatState.recognition.onend = () => {
             // Auto-restart if user didn't manually stop

@@ -2066,17 +2066,7 @@ pre code {
 
 /* Chat Header */
 .chat-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 8px 16px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-secondary);
-  flex-shrink: 0;
-  overflow: visible;
-  box-sizing: border-box;
-  position: relative;
-  z-index: 5;
+  display: none;
 }
 
 .chat-header-left {
@@ -2545,13 +2535,49 @@ pre code {
 /* Composer footer */
 .chat-composer-footer {
   display: flex;
+  align-items: center;
   justify-content: space-between;
   padding: 6px 6px 0;
+  gap: 8px;
 }
 
 .chat-composer-hint {
   font-size: 11px;
   color: var(--text-muted);
+  flex: 1;
+}
+
+.chat-composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.chat-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.chat-action-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.chat-action-btn:active {
+  background: var(--accent-dim);
+  color: var(--accent);
 }
 
 .chat-voice-status {
