@@ -45,21 +45,19 @@ SKILLS_DIR = HERMES_HOME / "skills"
 
 # Hermes executable - try current install locations with fallback
 def _find_hermes_bin():
-    # First try: find hermes on PATH (resolves symlinks correctly in all contexts)
+    # Prefer HERMES_HOME/.venv (the explicitly managed venv) over PATH,
+    # to avoid picking up an older pipx-installed hermes
     import shutil as _shutil
-    found = _shutil.which("hermes")
-    if found:
-        return Path(found)
-    # Fallbacks for non-PATH installs
     candidates = [
-        Path.home() / ".local" / "bin" / "hermes",
-        HERMES_HOME / ".venv" / "bin" / "hermes",
+        HERMES_HOME / ".venv" / "bin" / "hermes",   # v0.6+ (explicitly managed)
+        Path.home() / ".local" / "bin" / "hermes",  # pipx user install
+        _shutil.which("hermes") or Path.home() / ".local" / "bin" / "hermes",
         HERMES_HOME / "hermes-agent" / "venv" / "bin" / "hermes",  # legacy
     ]
     for path in candidates:
-        if path.exists():
+        if path and path.exists():
             return path
-    return candidates[0]  # Return first candidate as fallback
+    return candidates[0]
 
 HERMES_BIN = _find_hermes_bin()
 SESSIONS_DIR = HERMES_HOME / "sessions"
