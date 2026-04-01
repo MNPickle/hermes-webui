@@ -344,6 +344,30 @@ pre code {
   min-height: 60px;
   flex-shrink: 0;
   overflow: visible;
+  box-sizing: border-box;
+  position: relative;
+  z-index: 10;
+}
+
+.sidebar-header .logo {
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  flex: 1;
+  min-width: 0;
+}
+
+.sidebar-header .sidebar-collapse-btn {
+  flex-shrink: 0;
+  position: relative;
+  z-index: 11;
+  width: 30px;
+  height: 30px;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.2s;
 }
 
 #sidebar.collapsed .sidebar-header {
@@ -1911,6 +1935,8 @@ pre code {
   overflow: visible;
   gap: 6px;
   box-sizing: border-box;
+  position: relative;
+  z-index: 5;
 }
 
 .chat-history-header > span {
@@ -2043,30 +2069,36 @@ pre code {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 16px;
+  padding: 8px 16px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-secondary);
   flex-shrink: 0;
   overflow: visible;
   box-sizing: border-box;
+  position: relative;
+  z-index: 5;
 }
 
 .chat-header-left {
   display: flex;
   align-items: center;
-  overflow: visible;
+  overflow: hidden;
   gap: 6px;
-  padding: 2px 0;
+  padding: 0;
   box-sizing: border-box;
+  min-width: 0;
+  flex: 1;
 }
 
 .chat-header-right {
   display: flex;
   align-items: center;
-  overflow: visible;
+  overflow: hidden;
   gap: 4px;
-  padding: 2px 0;
+  padding: 0;
   box-sizing: border-box;
+  min-width: 0;
+  flex-shrink: 0;
 }
 
 .chat-select {
