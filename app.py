@@ -1294,7 +1294,9 @@ def api_onboarding_get():
 # ===================================================================
 
 def _clean_cli_output(output: str) -> str:
-    """Strip CLI banner, box-drawing, tool list, metadata from hermes -q output."""
+    """Strip CLI banner, box-drawing, tool list, metadata, and think blocks from hermes -q output."""
+    # Strip think blocks: matches <think>...</think> tags and everything between them
+    output = re.sub(r'<think>.*?</think>', '', output, flags=re.DOTALL)
     lines = output.split('\n')
     clean = []
     skip = False
@@ -1479,7 +1481,10 @@ def api_chat():
         if _check_api_server():
             api_msgs = []
             for m in sess["messages"]:
-                api_msgs.append({"role": m["role"], "content": m["content"]})
+                msg = {"role": m["role"], "content": m["content"]}
+                if m.get("files"):
+                    msg["files"] = m["files"]
+                api_msgs.append(msg)
             response_text = _call_api_server(api_msgs, sid, files)
         else:
             response_text = _call_hermes_direct(message, files)

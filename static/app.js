@@ -1795,6 +1795,25 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
+    // ── Service Control ─────────────────────────────
+    window.serviceAction = async function (action) {
+        const btn = event && event.target && event.target.closest ? event.target.closest("button") : null;
+        if (btn) { btn.disabled = true; }
+        try {
+            const r = await api("POST", "/api/service/" + action);
+            if (r && r.ok) {
+                toast("Gateway " + action + "ed", "success");
+            } else {
+                toast("Gateway " + action + " failed: " + (r && r.error ? r.error : "unknown"), "error");
+            }
+            setTimeout(checkHealth, 1500);
+        } catch (e) {
+            toast("Gateway " + action + " error: " + e.message, "error");
+        } finally {
+            if (btn) { btn.disabled = false; }
+        }
+    };
+
     document.getElementById('sidebar-collapse').addEventListener('click', () => {
         document.getElementById('sidebar').classList.toggle('collapsed');
         document.getElementById('main-wrapper').classList.toggle('sidebar-collapsed');
