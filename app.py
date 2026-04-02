@@ -12,6 +12,7 @@ import copy
 import json
 import shutil
 import subprocess
+import signal
 import time
 import logging
 from datetime import datetime
@@ -76,6 +77,11 @@ BACKUP_DIR = HERMES_HOME / "backups"
 # Chat session storage (persisted to disk)
 CHAT_DATA_DIR = APP_ROOT / "chat_data"
 CHAT_DATA_DIR.mkdir(exist_ok=True)
+CHAT_REQUEST_DIR = APP_ROOT / "run" / "chat_requests"
+CHAT_REQUEST_DIR.mkdir(parents=True, exist_ok=True)
+CHAT_REQUEST_TIMEOUT = int(os.environ.get("HERMES_CHAT_TIMEOUT", "300"))
+CHAT_CANCEL_POLL_INTERVAL = 0.25
+CHAT_CANCEL_GRACE_SECONDS = 5.0
 
 chat_sessions: dict = {}  # runtime cache: sid -> session dict
 
@@ -104,6 +110,129 @@ def _delete_session_from_disk(session_id):
     path = CHAT_DATA_DIR / f"{session_id}.json"
     if path.exists():
         path.unlink()
+
+
+class ChatRequestCancelled(Exception):
+    """Raised when an in-flight chat request is cancelled by the client."""
+
+
+def _request_control_path(request_id: str) -> Path:
+    return CHAT_REQUEST_DIR / f"{secure_filename(request_id)}.json"
+
+
+def _read_request_control(request_id: str) -> dict | None:
+    path = _request_control_path(request_id)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Failed to read chat request control file %s: %s", path.name, exc)
+        return None
+
+
+def _write_request_control(request_id: str, payload: dict) -> None:
+    path = _request_control_path(request_id)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _register_chat_request(request_id: str, session_id: str | None) -> None:
+    _write_request_control(request_id, {
+        "request_id": request_id,
+        "session_id": session_id,
+        "status": "running",
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
+        "pid": None,
+        "pgid": None,
+        "cancel_requested_at": None,
+    })
+
+
+def _update_chat_request(request_id: str, **fields) -> dict | None:
+    payload = _read_request_control(request_id)
+    if payload is None:
+        return None
+    payload.update(fields)
+    payload["updated_at"] = datetime.now().isoformat()
+    _write_request_control(request_id, payload)
+    return payload
+
+
+def _remove_chat_request(request_id: str) -> None:
+    path = _request_control_path(request_id)
+    if path.exists():
+        path.unlink()
+
+
+def _is_process_alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _terminate_chat_process(pid: int | None, pgid: int | None, sig: int) -> bool:
+    try:
+        if pgid:
+            os.killpg(pgid, sig)
+        elif pid:
+            os.kill(pid, sig)
+        else:
+            return False
+        return True
+    except ProcessLookupError:
+        return True
+    except Exception as exc:
+        logger.warning("Failed to signal chat process pid=%s pgid=%s: %s", pid, pgid, exc)
+        return False
+
+
+def _cancel_chat_request(request_id: str) -> tuple[bool, str]:
+    payload = _read_request_control(request_id)
+    if payload is None:
+        return False, "Request not found"
+    if payload.get("status") == "completed":
+        return False, "Request already completed"
+    if payload.get("status") == "cancelled":
+        return True, "Request already cancelled"
+
+    pid = payload.get("pid")
+    pgid = payload.get("pgid")
+    _update_chat_request(
+        request_id,
+        status="cancel_requested",
+        cancel_requested_at=datetime.now().isoformat(),
+    )
+
+    if not pid:
+        return True, "Cancellation queued before subprocess start"
+
+    if not _terminate_chat_process(pid, pgid, signal.SIGTERM):
+        return False, "Failed to terminate Hermes process"
+
+    deadline = time.time() + CHAT_CANCEL_GRACE_SECONDS
+    while time.time() < deadline:
+        if not _is_process_alive(pid):
+            _update_chat_request(request_id, status="cancelled")
+            return True, "Request cancelled"
+        time.sleep(CHAT_CANCEL_POLL_INTERVAL)
+
+    _terminate_chat_process(pid, pgid, signal.SIGKILL)
+    for _ in range(int(1 / CHAT_CANCEL_POLL_INTERVAL)):
+        if not _is_process_alive(pid):
+            _update_chat_request(request_id, status="cancelled")
+            return True, "Request cancelled"
+        time.sleep(CHAT_CANCEL_POLL_INTERVAL)
+
+    return False, "Hermes process did not exit after cancellation"
 
 
 # Load sessions on startup
@@ -1345,7 +1474,7 @@ def _clean_cli_output(output: str) -> str:
     return result or "(Empty response)"
 
 
-def _call_hermes_direct(message: str, files: list = None) -> str:
+def _call_hermes_direct(message: str, files: list = None, request_id: str | None = None) -> str:
     """Call Hermes via CLI subprocess (fallback when API server is unavailable)."""
     prompt = message
     if files:
@@ -1368,22 +1497,66 @@ def _call_hermes_direct(message: str, files: list = None) -> str:
             prompt = "\n\n".join(file_info) + "\n\nUser message: " + message
         else:
             prompt = message
+    if request_id:
+        state = _read_request_control(request_id)
+        if state and state.get("cancel_requested_at"):
+            _update_chat_request(request_id, status="cancelled")
+            raise ChatRequestCancelled("Request cancelled before Hermes started")
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [str(HERMES_BIN), "chat", "-q", prompt],
-            capture_output=True, text=True, timeout=300,
             cwd=str(Path.home()),
             env={**os.environ, "NO_COLOR": "1"},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
         )
-        output = result.stdout.strip()
+        if request_id:
+            _update_chat_request(request_id, pid=proc.pid, pgid=os.getpgid(proc.pid))
+
+        deadline = time.time() + CHAT_REQUEST_TIMEOUT
+        while True:
+            if request_id:
+                state = _read_request_control(request_id)
+                if state and state.get("cancel_requested_at"):
+                    pgid = os.getpgid(proc.pid)
+                    _terminate_chat_process(proc.pid, pgid, signal.SIGTERM)
+                    try:
+                        stdout, stderr = proc.communicate(timeout=CHAT_CANCEL_GRACE_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        _terminate_chat_process(proc.pid, pgid, signal.SIGKILL)
+                        stdout, stderr = proc.communicate()
+                    _update_chat_request(request_id, status="cancelled")
+                    raise ChatRequestCancelled("Request cancelled")
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                _terminate_chat_process(proc.pid, os.getpgid(proc.pid), signal.SIGKILL)
+                proc.communicate()
+                raise subprocess.TimeoutExpired(proc.args, CHAT_REQUEST_TIMEOUT)
+            try:
+                stdout, stderr = proc.communicate(timeout=min(CHAT_CANCEL_POLL_INTERVAL, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+
+        if request_id:
+            state = _read_request_control(request_id)
+            if state and state.get("cancel_requested_at"):
+                _update_chat_request(request_id, status="cancelled")
+                raise ChatRequestCancelled("Request cancelled")
+
+        output = stdout.strip()
         if not output:
-            output = result.stderr.strip() or "(No response)"
+            output = stderr.strip() or "(No response)"
         import re as _re
         output = _re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', output)
         output = _re.sub(r'\x1b\].*?\x07', '', output)
         return _clean_cli_output(output)
+    except ChatRequestCancelled:
+        raise
     except subprocess.TimeoutExpired:
-        return "(Response timed out after 5 minutes)"
+        return f"(Response timed out after {CHAT_REQUEST_TIMEOUT // 60} minutes)"
     except Exception as e:
         return f"(Error calling Hermes: {e})"
 
@@ -1466,10 +1639,12 @@ def api_chat():
     data = request.get_json()
     message = data.get("message", "").strip()
     session_id = data.get("session_id")
+    request_id = (data.get("request_id") or str(uuid.uuid4())).strip()
     if not message:
         return jsonify({"error": "Message is required"}), 400
     sess = _get_or_create_chat_session(session_id)
     sid = sess["id"]
+    _register_chat_request(request_id, sid)
     files = []
     for ref in (data.get("files") or []):
         fpath = UPLOAD_FOLDER / ref
@@ -1492,9 +1667,23 @@ def api_chat():
                 api_msgs.append(msg)
             response_text = _call_api_server(api_msgs, sid, files)
         else:
-            response_text = _call_hermes_direct(message, files)
+            response_text = _call_hermes_direct(message, files, request_id=request_id)
+        _update_chat_request(request_id, status="completed")
+    except ChatRequestCancelled:
+        if sess["messages"] and sess["messages"][-1] == user_msg:
+            sess["messages"].pop()
+        if not sess["messages"]:
+            chat_sessions.pop(sid, None)
+        else:
+            sess["updated"] = datetime.now().isoformat()
+            _save_session(sid)
+        _update_chat_request(request_id, status="cancelled")
+        return jsonify({"ok": False, "cancelled": True, "session_id": sid}), 499
     except Exception as e:
+        _update_chat_request(request_id, status="failed", error=str(e))
         response_text = f"Error: {e}"
+    finally:
+        _remove_chat_request(request_id)
     assistant_msg = {"role": "assistant", "content": response_text,
                      "timestamp": datetime.now().isoformat()}
     sess["messages"].append(assistant_msg)
@@ -1502,6 +1691,21 @@ def api_chat():
     _save_session(sid)
     return jsonify({"session_id": sid, "response": response_text,
                      "message_count": len(sess["messages"]), "title": sess.get("title", "")})
+
+
+@app.route("/api/chat/cancel", methods=["POST"])
+@require_token
+@rate_limit
+def api_chat_cancel():
+    data = request.get_json() or {}
+    request_id = (data.get("request_id") or "").strip()
+    if not request_id:
+        return jsonify({"error": "request_id is required"}), 400
+    cancelled, detail = _cancel_chat_request(request_id)
+    status_code = 200 if cancelled else 409
+    if detail == "Request not found":
+        status_code = 404
+    return jsonify({"cancelled": cancelled, "detail": detail, "request_id": request_id}), status_code
 
 
 @app.route("/api/upload", methods=["POST"])

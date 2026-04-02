@@ -999,6 +999,7 @@ window.copyLogs = function () {
 
 const chatState = {
     currentSessionId: null,
+    currentRequestId: null,
     isThinking: false,
     pendingFiles: [],
     mediaRecorder: null,
@@ -1009,7 +1010,30 @@ const chatState = {
     speechSupported: false,
     historyOpen: true,
     localMessages: [],  // messages for the current viewed session
+    voiceBaseText: '',
+    voiceFinalTranscript: '',
 };
+
+function makeRequestId() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID();
+    }
+    return 'req-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+}
+
+function chatJoinTranscript(base, addition) {
+    if (!addition) return base || '';
+    if (!base) return addition;
+    if (/\s$/.test(base) || /^[\s.,!?;:]/.test(addition)) return base + addition;
+    return base + ' ' + addition;
+}
+
+function chatRenderVoiceTranscript(input, interimTranscript = '') {
+    const finalText = chatJoinTranscript(chatState.voiceBaseText, chatState.voiceFinalTranscript.trim());
+    input.value = chatJoinTranscript(finalText, interimTranscript.trim());
+    chatAutoResize(input);
+    document.getElementById('chat-send-btn').disabled = !input.value.trim() && chatState.pendingFiles.length === 0;
+}
 
 // ── CLIPBOARD PASTE ─────────────────────────────────────
 async function chatHandlePaste(e) {
@@ -1148,11 +1172,15 @@ Screens.chat = function () {
         chatState.recognition.interimResults = true;
         chatState.recognition.lang = 'en-US';
         chatState.recognition.onresult = (e) => {
-            let t = '';
-            for (let i = e.resultIndex; i < e.results.length; i++) t += e.results[i][0].transcript;
-            input.value = t;
-            chatAutoResize(input);
-            document.getElementById('chat-send-btn').disabled = !input.value.trim();
+            let finalChunk = '';
+            let interimChunk = '';
+            for (let i = e.resultIndex; i < e.results.length; i++) {
+                const transcript = e.results[i][0].transcript;
+                if (e.results[i].isFinal) finalChunk += transcript;
+                else interimChunk += transcript;
+            }
+            if (finalChunk) chatState.voiceFinalTranscript = chatJoinTranscript(chatState.voiceFinalTranscript, finalChunk.trim());
+            chatRenderVoiceTranscript(input, interimChunk);
         };
         chatState.recognition.onend = () => {
             // Auto-restart if user didn't manually stop
@@ -1374,9 +1402,17 @@ window.chatQuick = function (text) {
 };
 
 // ── ABORT ─────────────────────────────────────────────────
-window.chatAbort = function () {
-    if (chatState.chatAbortController) {
+window.chatAbort = async function () {
+    if (!chatState.currentRequestId || !chatState.chatAbortController) return;
+    try {
+        const resp = await api('POST', '/api/chat/cancel', { request_id: chatState.currentRequestId });
+        if (!resp.cancelled) {
+            toast(resp.detail || 'Unable to cancel request', 'warning');
+            return;
+        }
         chatState.chatAbortController.abort();
+    } catch (e) {
+        toast('Unable to cancel request: ' + e.message, 'warning');
     }
 };
 
@@ -1445,10 +1481,12 @@ window.chatSend = async function () {
     // AbortController for cancellation
     const controller = new AbortController();
     chatState.chatAbortController = controller;
+    chatState.currentRequestId = makeRequestId();
 
     try {
         const resp = await api('POST', '/api/chat', {
             message, session_id: chatState.currentSessionId,
+            request_id: chatState.currentRequestId,
             files: chatState.pendingFiles.map(f => f.stored_as),
         }, controller.signal);
         chatState.currentSessionId = resp.session_id;
@@ -1476,6 +1514,8 @@ window.chatSend = async function () {
                 const svg = sb.querySelector('svg');
                 if (svg) svg.innerHTML = '<path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>';
             }
+            chatState.currentRequestId = null;
+            chatState.chatAbortController = null;
             input.focus();
             return;
         }
@@ -1498,6 +1538,8 @@ window.chatSend = async function () {
 
     chatClearFiles();
     chatState.isThinking = false;
+    chatState.currentRequestId = null;
+    chatState.chatAbortController = null;
     const dotsEl = document.getElementById('chat-thinking-dots');
     if (dotsEl) dotsEl.remove();
     // Reset send button
@@ -1723,6 +1765,8 @@ function chatStartVoice() {
     const btn = document.getElementById('chat-voice-btn');
     const status = document.getElementById('chat-voice-status');
     if (chatState.speechSupported && chatState.recognition) {
+        chatState.voiceBaseText = input?.value.trim() || '';
+        chatState.voiceFinalTranscript = '';
         // Auto-resize textarea before voice starts
         if (input) { chatAutoResize(input); }
         try { chatState.recognition.start(); } catch(e) { /* already started */ }
@@ -1767,6 +1811,8 @@ function chatStopVoiceUI() {
     if (btn) btn.classList.remove('recording');
     if (status) { status.textContent = ''; status.classList.remove('active'); }
     chatState.isRecording = false;
+    chatState.voiceBaseText = '';
+    chatState.voiceFinalTranscript = '';
 }
 
 /* ═══════════════════════════════════════════════════════════════

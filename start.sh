@@ -35,10 +35,11 @@ if [ "${DEV}" = "1" ]; then
     SERVER_PID=$!
 else
     echo "  [PRODUCTION] Using gunicorn"
+    GUNICORN_TIMEOUT="${GUNICORN_TIMEOUT:-330}"
     "$WEBUI_VENV/bin/gunicorn" \
         --bind "127.0.0.1:$PORT" \
-        --workers 1 \
-        --timeout 120 \
+        --workers 2 \
+        --timeout "$GUNICORN_TIMEOUT" \
         --access-logfile - \
         --error-logfile - \
         app:app &
