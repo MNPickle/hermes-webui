@@ -16,8 +16,13 @@ cd ~/hermes-web-ui
 
 ### 2. Set Authentication Token
 ```bash
-# Choose a secure token
+# Option A: export it in your shell
 export HERMES_WEBUI_TOKEN=your-secure-random-token-here
+
+# Option B: store it in ~/hermes-web-ui/.env for app startup
+cat > .env <<'EOF'
+HERMES_WEBUI_TOKEN=your-secure-random-token-here
+EOF
 ```
 
 ### 3. Start the Server
@@ -27,6 +32,9 @@ export HERMES_WEBUI_TOKEN=your-secure-random-token-here
 
 # Development mode
 DEV=1 ./start.sh 5000
+
+# Or run gunicorn directly from the repo root
+~/.hermes/.venv/bin/gunicorn --bind 127.0.0.1:5000 app:app
 ```
 
 ### 4. Access the UI

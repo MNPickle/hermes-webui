@@ -24,6 +24,8 @@ if curl -s "http://127.0.0.1:$PORT/" > /dev/null 2>&1; then
     exit 0
 fi
 
+# Export repo .env for child processes launched by this script.
+# app.py also loads the same file on import, so direct gunicorn stays consistent.
 if [ -f "$APP_DIR/.env" ]; then
     set -a; . "$APP_DIR/.env"; set +a
 fi

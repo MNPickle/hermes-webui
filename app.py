@@ -41,9 +41,20 @@ logger = logging.getLogger('hermes-webui')
 # Paths
 # ---------------------------------------------------------------------------
 APP_ROOT = Path(__file__).resolve().parent
-REPO_ENV_PATH = APP_ROOT / ".env"
-if REPO_ENV_PATH.exists():
-    load_dotenv(REPO_ENV_PATH, override=False)
+
+
+def _load_runtime_env() -> Path:
+    """Load repo-local runtime env without overriding real process env."""
+    repo_env_path = APP_ROOT / ".env"
+    if repo_env_path.exists():
+        load_dotenv(repo_env_path, override=False)
+        logger.info("Loaded runtime env from %s", repo_env_path)
+    else:
+        logger.info("No runtime .env found at %s", repo_env_path)
+    return repo_env_path
+
+
+REPO_ENV_PATH = _load_runtime_env()
 
 HERMES_HOME = Path.home() / ".hermes"
 CONFIG_PATH = HERMES_HOME / "config.yaml"
