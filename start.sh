@@ -4,9 +4,13 @@
 #        ./start.sh 8080     (starts on custom port)
 #        DEV=1 ./start.sh    (use Flask dev server)
 
-PORT="${1:-5000}"
-WEBUI_VENV="$HOME/.hermes/.venv"
-APP_DIR="$HOME/hermes-web-ui"
+PORT="${1:-${PORT:-5000}}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_DIR="${APP_DIR:-$SCRIPT_DIR}"
+WEBUI_VENV="${WEBUI_VENV:-$HOME/.hermes/.venv}"
+PYTHON_BIN="$WEBUI_VENV/bin/python"
+FLASK_BIN="$WEBUI_VENV/bin/flask"
+GUNICORN_BIN="$WEBUI_VENV/bin/gunicorn"
 
 echo "=========================================="
 echo "  Hermes Agent Web UI"
@@ -15,6 +19,13 @@ echo "=========================================="
 echo ""
 
 cd "$APP_DIR" || exit 1
+
+if [ ! -x "$PYTHON_BIN" ]; then
+    echo "  Python runtime not found at $PYTHON_BIN"
+    echo "  Set WEBUI_VENV to the Hermes/web UI virtualenv and try again."
+    echo "=========================================="
+    exit 1
+fi
 
 # Check if already running on this port
 if curl -s "http://127.0.0.1:$PORT/" > /dev/null 2>&1; then
@@ -33,14 +44,31 @@ fi
 # Use gunicorn for production, Flask dev server only if DEV=1
 if [ "${DEV}" = "1" ]; then
     echo "  [DEV MODE] Using Flask development server"
-    FLASK_APP="$APP_DIR/app.py" "$WEBUI_VENV/bin/flask" run --host 127.0.0.1 --port "$PORT" &
+    if [ -x "$FLASK_BIN" ]; then
+        FLASK_APP="$APP_DIR/app.py" "$FLASK_BIN" run --host 127.0.0.1 --port "$PORT" &
+    else
+        FLASK_APP="$APP_DIR/app.py" "$PYTHON_BIN" -m flask run --host 127.0.0.1 --port "$PORT" &
+    fi
     SERVER_PID=$!
 else
     echo "  [PRODUCTION] Using gunicorn"
-    GUNICORN_TIMEOUT="${GUNICORN_TIMEOUT:-330}"
-    "$WEBUI_VENV/bin/gunicorn" \
+    CHAT_TIMEOUT="${HERMES_CHAT_TIMEOUT:-300}"
+    GUNICORN_TIMEOUT="${GUNICORN_TIMEOUT:-$((CHAT_TIMEOUT + 30))}"
+    if [ -d /dev/shm ]; then
+        GUNICORN_WORKER_TMP="${GUNICORN_WORKER_TMP:-/dev/shm}"
+    else
+        GUNICORN_WORKER_TMP="${GUNICORN_WORKER_TMP:-/tmp}"
+    fi
+    if [ -x "$GUNICORN_BIN" ]; then
+        GUNICORN_CMD=("$GUNICORN_BIN")
+    else
+        GUNICORN_CMD=("$PYTHON_BIN" -m gunicorn)
+    fi
+    "${GUNICORN_CMD[@]}" \
         --bind "127.0.0.1:$PORT" \
         --workers 2 \
+        --chdir "$APP_DIR" \
+        --worker-tmp-dir "$GUNICORN_WORKER_TMP" \
         --timeout "$GUNICORN_TIMEOUT" \
         --access-logfile - \
         --error-logfile - \

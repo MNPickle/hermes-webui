@@ -11,6 +11,10 @@ function setToken(token) {
     localStorage.setItem('hermes_webui_token', token);
 }
 
+function clearToken() {
+    localStorage.removeItem('hermes_webui_token');
+}
+
 // AuthRequired sentinel — thrown only when user cancels the token prompt
 // (api() retries internally after prompt; this is for the cancel path only)
 class AuthRequired extends Error {
@@ -42,62 +46,74 @@ function promptForToken() {
     }
 }
 
-async function api(method, path, body, signal) {
-    const token = getToken();
-    const opts = {
-        method,
-        headers: {
-            'Content-Type': 'application/json',
-            ...(token && { 'Authorization': 'Bearer ' + token })
-        }
+async function authFetch(path, options = {}, signal) {
+    const fetchWithToken = async (tokenValue) => {
+        const headers = new Headers(options.headers || {});
+        if (tokenValue && !headers.has('Authorization')) headers.set('Authorization', 'Bearer ' + tokenValue);
+        return fetch(API.base + path, { ...options, headers, signal });
     };
-    if (body !== undefined && body !== null) opts.body = JSON.stringify(body);
-    const resp = await fetch(API.base + path, { ...opts, signal });
-    if (!resp.ok) {
-        if (resp.status === 401) {
-            if (!token) {
-                if (_tokenPromptActive) {
-                    // Another request is prompting — wait for the result, then retry
-                    const savedToken = await _tokenPromptDeferred;
-                    if (savedToken) {
-                        const retryOpts = {
-                            method,
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'Authorization': 'Bearer ' + savedToken
-                            }
-                        };
-                        if (body !== undefined && body !== null) retryOpts.body = JSON.stringify(body);
-                        const retryResp = await fetch(API.base + path, retryOpts);
-                        if (retryResp.ok) return retryResp.json();
-                        if (retryResp.status === 401) throw new Error('Authentication failed: check your token');
-                    }
-                    throw new AuthRequired();
-                }
-                // No prompt in progress — prompt now, then retry once
-                const savedToken = promptForToken();
-                if (savedToken) {
-                    const retryOpts = {
-                        method,
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Authorization': 'Bearer ' + savedToken
-                        }
-                    };
-                    if (body !== undefined && body !== null) retryOpts.body = JSON.stringify(body);
-                    const retryResp = await fetch(API.base + path, retryOpts);
-                    if (retryResp.ok) return retryResp.json();
-                    if (retryResp.status === 401) throw new Error('Authentication failed: check your token');
-                }
-                throw new AuthRequired();
-            }
-            // Stored token was rejected
-            let errMsg = 'Authentication failed';
-            try { const d = await resp.json(); errMsg = d.error || d.message || errMsg; } catch {}
+    const readAuthError = async (resp) => {
+        let errMsg = 'Authentication failed';
+        try {
+            const d = await resp.clone().json();
+            errMsg = d.error || d.message || errMsg;
+        } catch {}
+        return errMsg;
+    };
+
+    let token = getToken();
+    let resp = await fetchWithToken(token);
+    if (!resp.ok && resp.status === 401) {
+        let errMsg = await readAuthError(resp);
+        if (/not configured/i.test(errMsg)) {
             throw new Error(errMsg);
         }
+        if (token) clearToken();
+
+        let savedToken = null;
+        if (_tokenPromptActive) {
+            savedToken = await _tokenPromptDeferred;
+        } else {
+            savedToken = promptForToken();
+        }
+        if (!savedToken) throw new AuthRequired();
+
+        resp = await fetchWithToken(savedToken);
+        if (resp.ok) return resp;
+        if (resp.status === 401) {
+            clearToken();
+            errMsg = await readAuthError(resp);
+            throw new Error(errMsg || 'Authentication failed: check your token');
+        }
+    }
+    return resp;
+}
+
+async function api(method, path, body, signal) {
+    const headers = { 'Content-Type': 'application/json' };
+    const opts = { method, headers };
+    if (body !== undefined && body !== null) opts.body = JSON.stringify(body);
+    const resp = await authFetch(path, opts, signal);
+    if (!resp.ok) {
+        if (resp.status === 499) {
+            let cancelled = false;
+            let errMsg = 'Request cancelled';
+            try {
+                const d = await resp.json();
+                cancelled = !!d.cancelled;
+                errMsg = d.error || d.message || errMsg;
+            } catch {}
+            if (cancelled) {
+                const err = new Error(errMsg);
+                err.name = 'AbortError';
+                throw err;
+            }
+        }
         let errMsg = 'Request failed';
-        try { const d = await resp.json(); errMsg = d.error || d.message || errMsg; } catch {}
+        try {
+            const d = await resp.json();
+            errMsg = d.error || d.message || (Array.isArray(d.details) ? d.details.join('; ') : errMsg);
+        } catch {}
         throw new Error(errMsg);
     }
     return resp.json();
@@ -207,9 +223,9 @@ const ThemeManager = {
 function screenTitle(s) {
     return {
         dashboard: 'Dashboard', settings: 'Settings', 'env-vars': 'Environment Variables',
-        service: 'Service Controls', providers: 'Providers', models: 'Models',
+        folders: 'Folders', service: 'Service Controls', providers: 'Providers', models: 'Models',
         agents: 'Agents', skills: 'Skills', channels: 'Channels',
-        hooks: 'Hooks / Webhooks', sessions: 'Session Reset', logs: 'Log File Tail', chat: 'Chat'
+        hooks: 'Hooks / Webhooks', cron: 'Cron Jobs', sessions: 'Session Reset', logs: 'Log File Tail', chat: 'Chat'
     }[s] || s;
 }
 
@@ -217,6 +233,9 @@ function navigate(screen) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     const navItem = document.querySelector('[data-screen="' + screen + '"]');
     if (navItem) navItem.classList.add('active');
+    if (screen === 'chat') {
+        chatGoHome();
+    }
     const content = document.getElementById('content');
     content.style.padding = screen === 'chat' ? '0' : '';
     content.style.overflow = screen === 'chat' ? 'hidden' : '';
@@ -226,6 +245,7 @@ function navigate(screen) {
     document.getElementById('topbar').classList.toggle('hidden-by-chat', screen === 'chat');
     if (Screens[screen]) Screens[screen]();
     else content.innerHTML = '<div class="empty-state"><div class="empty-icon">\u2753</div><h3>Screen not found</h3></div>';
+    setTimeout(() => { if (window.renderSidebarFoldersTree) renderSidebarFoldersTree(); }, 0);
 }
 
 let _healthCache = null, _healthTs = 0;
@@ -578,16 +598,49 @@ Screens.service = async function () {
 Screens.providers = async function () {
     const content = document.getElementById('content');
     try {
-        const data = await api('GET', '/api/providers');
+        const [data, chatStatus] = await Promise.all([
+            api('GET', '/api/providers'),
+            api('GET', '/api/chat/status').catch(() => null),
+        ]);
         const def = data.default || {};
         const custom = data.custom || [];
         const aux = data.auxiliary || {};
+        const readiness = chatStatus?.readiness || {};
+        const screenshotReady = !!readiness.screenshots_ready;
+        const screenshotReason = screenshotReady
+            ? 'Pasted screenshots can be sent through the configured vision chat path.'
+            : (chatStatus?.capability_reasons?.image_attachments || readiness.vision_reason || 'A vision model and reachable OpenAI-compatible API are required before screenshot paste can work.');
+        const visionCfg = aux.vision || {};
 
         let html = '<div class="section-header"><span>Default Provider</span></div>';
         html += '<div class="card mb-16"><div class="card-body"><div class="form-row">';
         html += '<div class="form-group"><label class="form-label">Provider</label><div class="font-mono text-sm">' + escH(def.provider || '?') + '</div></div>';
         html += '<div class="form-group"><label class="form-label">Model</label><div class="font-mono text-sm">' + escH(def.model || '?') + '</div></div>';
         html += '<div class="form-group"><label class="form-label">Base URL</label><div class="font-mono text-sm">' + escH(def.base_url || '?') + '</div></div></div></div></div>';
+
+        html += '<div class="section-header"><span>Vision Chat Readiness</span></div>';
+        html += '<div class="card mb-16"><div class="card-header"><span>Screenshot Paste</span><span class="badge ' + (screenshotReady ? 'badge-success' : 'badge-danger') + '">' + (screenshotReady ? 'Ready' : 'Not Ready') + '</span></div><div class="card-body">';
+        html += '<p class="text-sm text-secondary mb-16">' + escH(screenshotReason) + '</p>';
+        html += '<div class="form-row">';
+        html += '<div class="form-group"><label class="form-label">Vision Provider</label><div class="font-mono text-sm">' + escH(visionCfg.provider || 'auto') + '</div></div>';
+        html += '<div class="form-group"><label class="form-label">Vision Model</label><div class="font-mono text-sm">' + escH(readiness.vision_model || visionCfg.model || '(not set)') + '</div></div>';
+        html += '<div class="form-group"><label class="form-label">Vision API URL</label><div class="font-mono text-sm">' + escH(readiness.vision_api_url || chatStatus?.api_url || '(not set)') + '</div></div>';
+        html += '</div>';
+        html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+        html += '<button class="btn btn-primary" onclick="editAuxProvider(\'vision\')">Configure Vision Model</button>';
+        html += '<button class="btn" onclick="navigate(\'env-vars\')">Open Env Vars</button>';
+        html += '<button class="btn" onclick="chatRefreshCapabilities(); Screens.providers();">Refresh Readiness</button>';
+        html += '</div></div></div>';
+        if (!screenshotReady) {
+            html += '<div class="card mb-16"><div class="card-header"><span>Quick Setup</span></div><div class="card-body">';
+            html += '<p class="text-sm text-secondary mb-16">Pick the vision backend you want to use locally, then save a model and key.</p>';
+            html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+            html += '<button class="btn btn-primary" onclick="startVisionWizard(\'openrouter\')">OpenRouter</button>';
+            html += '<button class="btn" onclick="startVisionWizard(\'openai\')">OpenAI</button>';
+            html += '<button class="btn" onclick="startVisionWizard(\'local\')">Local API</button>';
+            html += '<button class="btn" onclick="editAuxProvider(\'vision\')">Manual</button>';
+            html += '</div></div></div>';
+        }
 
         html += '<div class="section-header"><span>Custom Providers</span><button class="btn btn-primary" onclick="addProvider()">+ Add Provider</button></div>';
         if (custom.length === 0) {
@@ -670,6 +723,96 @@ window.testProvider = async function (btn, name) {
         toast(r.ok ? 'Connection OK (' + (r.latency_ms || '?') + 'ms)' : 'Connection failed: ' + (r.error || ''), r.ok ? 'success' : 'error');
     } catch (e) { toast('Test failed: ' + e.message, 'error'); }
     finally { setBtnLoading(btn, false); }
+};
+
+function visionPresetConfig(kind) {
+    const presets = {
+        openrouter: {
+            title: 'OpenRouter',
+            intro: 'Use OpenRouter as the OpenAI-compatible vision backend. Add your OpenRouter API key if it is not already set in Env Vars.',
+            provider: 'openrouter',
+            model: '',
+            base_url: 'https://openrouter.ai/api/v1',
+        },
+        openai: {
+            title: 'OpenAI',
+            intro: 'Use OpenAI as the vision backend. Add your OpenAI API key if it is not already set in Env Vars.',
+            provider: 'openai',
+            model: '',
+            base_url: 'https://api.openai.com/v1',
+        },
+        local: {
+            title: 'Local OpenAI-Compatible API',
+            intro: 'Use a local OpenAI-compatible server that supports image inputs. Replace the example URL and model with your local server details.',
+            provider: 'auto',
+            model: '',
+            base_url: 'http://127.0.0.1:8000/v1',
+        },
+    };
+    return presets[kind] || null;
+}
+
+window.startVisionWizard = function (kind) {
+    navigate('providers');
+    setTimeout(function () {
+        if (window.editAuxProvider) window.editAuxProvider('vision', kind);
+    }, 50);
+};
+
+window.editAuxProvider = async function (purpose, presetKind = null) {
+    try {
+        const aux = await api('GET', '/api/config/auxiliary');
+        const current = aux[purpose] || {};
+        const preset = visionPresetConfig(presetKind);
+        const merged = {
+            provider: preset ? preset.provider : (current.provider || 'auto'),
+            model: current.model || (preset ? preset.model : ''),
+            base_url: current.base_url || (preset ? preset.base_url : ''),
+            api_key: current.api_key || '',
+        };
+        const title = preset ? ('Configure ' + purpose + ' via ' + preset.title) : ('Configure ' + purpose);
+        const intro = preset
+            ? preset.intro
+            : 'Use this for Hermes auxiliary providers like vision. Leave base URL and API key blank to inherit the app-level API settings.';
+        showModal(
+            title,
+            '<p class="text-sm text-secondary mb-16">' + escH(intro) + '</p>' +
+            '<div class="form-group"><label class="form-label">Provider</label>' + inputH('aux-provider', merged.provider || 'auto', 'text', 'auto or provider name') + '</div>' +
+            '<div class="form-group"><label class="form-label">Model</label>' + inputH('aux-model', merged.model || '', 'text', 'Enter your image-capable model ID') + '</div>' +
+            '<div class="form-group"><label class="form-label">Base URL</label>' + inputH('aux-base-url', merged.base_url || '', 'url', 'Optional OpenAI-compatible base URL') + '</div>' +
+            '<div class="form-group"><label class="form-label">API Key</label>' + inputH('aux-api-key', '', 'password', merged.api_key ? 'Leave blank to keep current secret' : 'Optional API key') + '</div>',
+            '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn" onclick="disableAuxProvider(\'' + escA(purpose) + '\')">Disable</button><button class="btn btn-primary" onclick="saveAuxProvider(\'' + escA(purpose) + '\')">Save</button>'
+        );
+    } catch (e) { toast('Error: ' + e.message, 'error'); }
+};
+
+window.saveAuxProvider = async function (purpose) {
+    const provider = document.getElementById('aux-provider').value.trim() || 'auto';
+    const model = document.getElementById('aux-model').value.trim();
+    const base_url = document.getElementById('aux-base-url').value.trim();
+    const api_key = document.getElementById('aux-api-key').value;
+    const payload = {};
+    payload[purpose] = { provider, model, base_url };
+    if (api_key) payload[purpose].api_key = api_key;
+    try {
+        await api('PUT', '/api/config/auxiliary', payload);
+        toast('Saved ' + purpose + ' config', 'success');
+        closeModal();
+        await chatRefreshCapabilities();
+        Screens.providers();
+    } catch (e) { toast('Error: ' + e.message, 'error'); }
+};
+
+window.disableAuxProvider = async function (purpose) {
+    const payload = {};
+    payload[purpose] = { provider: 'auto', model: '', base_url: '', api_key: '' };
+    try {
+        await api('PUT', '/api/config/auxiliary', payload);
+        toast('Disabled ' + purpose + ' config', 'success');
+        closeModal();
+        await chatRefreshCapabilities();
+        Screens.providers();
+    } catch (e) { toast('Error: ' + e.message, 'error'); }
 };
 
 // ── MODELS ─────────────────────────────────────────────────
@@ -1004,6 +1147,7 @@ window.copyLogs = function () {
 const chatState = {
     currentSessionId: null,
     currentRequestId: null,
+    currentRequestCancelSupported: false,
     isThinking: false,
     pendingFiles: [],
     mediaRecorder: null,
@@ -1012,8 +1156,11 @@ const chatState = {
     micStoppedByUser: false,  // track if user manually stopped
     recognition: null,
     speechSupported: false,
-    historyOpen: true,
+    historyOpen: false,
     localMessages: [],  // messages for the current viewed session
+    folders: [],
+    selectedFolderId: '',
+    draftFolderId: '',
     voiceBaseText: '',
     voiceFinalTranscript: '',
     capabilities: {
@@ -1025,6 +1172,18 @@ const chatState = {
         imageAttachments: '',
         audioAttachments: '',
     },
+    apiServerEnabled: false,
+    currentTransport: null,
+    currentContinuity: null,
+    currentTransportNotice: '',
+    currentFolderId: '',
+    currentFolderTitle: '',
+    currentWorkspaceRoots: [],
+    currentSourceDocs: [],
+    currentFolderWorkspaceRoots: [],
+    currentFolderSourceDocs: [],
+    lastSubmission: null,
+    cancelRequested: false,
 };
 
 function makeRequestId() {
@@ -1079,6 +1238,21 @@ function chatDescribeUnsupportedFile(file) {
     return `${name} is a binary file type that Hermes chat cannot read as text.`;
 }
 
+function chatOpenVisionSetup(sourceLabel = 'screenshots') {
+    const reason = chatState.capabilityReasons.imageAttachments || 'A vision model and reachable OpenAI-compatible API are required before screenshots can be used in chat.';
+    showModal(
+        'Enable Screenshot Support',
+        '<p class="text-sm text-secondary mb-16">' + escH(sourceLabel + ' are not ready yet. ' + reason) + '</p>' +
+        '<p class="text-sm text-secondary">Choose a vision model in Providers, then add any needed API URL or key in Env Vars if your model endpoint requires them.</p>',
+        '<button class="btn" onclick="closeModal()">Not now</button>' +
+        '<button class="btn" onclick="closeModal(); navigate(\'env-vars\')">Open Env Vars</button>' +
+        '<button class="btn" onclick="closeModal(); startVisionWizard(\'local\')">Local API</button>' +
+        '<button class="btn" onclick="closeModal(); startVisionWizard(\'openai\')">OpenAI</button>' +
+        '<button class="btn" onclick="closeModal(); startVisionWizard(\'openrouter\')">OpenRouter</button>' +
+        '<button class="btn btn-primary" onclick="closeModal(); navigate(\'providers\'); setTimeout(function(){ if (window.editAuxProvider) editAuxProvider(\'vision\'); }, 50)">Manual Setup</button>'
+    );
+}
+
 function chatAcceptedFileTypes() {
     const accepted = [
         'text/*', '.txt', '.md', '.markdown', '.rst', '.log', '.csv', '.tsv', '.json', '.yaml', '.yml',
@@ -1091,6 +1265,219 @@ function chatAcceptedFileTypes() {
 
 function chatCanUseMicButton() {
     return !!(chatState.speechSupported && chatState.recognition) || !!chatState.capabilities.audioAttachments;
+}
+
+function chatClonePendingFile(file) {
+    return {
+        ...file,
+        preview_url: file.preview_url || null,
+    };
+}
+
+function chatReleasePendingFile(file) {
+    const previewUrl = file?.preview_url || '';
+    if (previewUrl.startsWith('blob:')) {
+        URL.revokeObjectURL(previewUrl);
+    }
+}
+
+function chatReplacePendingFiles(files) {
+    (chatState.pendingFiles || []).forEach(chatReleasePendingFile);
+    chatState.pendingFiles = (files || []).map(chatClonePendingFile);
+    chatRenderFileBar();
+    chatSyncSendButton();
+}
+
+function chatResetComposerAfterRequest() {
+    chatState.isThinking = false;
+    chatState.currentRequestId = null;
+    chatState.chatAbortController = null;
+    chatState.currentRequestCancelSupported = false;
+    chatState.cancelRequested = false;
+    const dotsEl = document.getElementById('chat-thinking-dots');
+    if (dotsEl) dotsEl.remove();
+    const sendBtn = document.getElementById('chat-send-btn');
+    if (sendBtn) {
+        sendBtn.classList.remove('chat-stop-state');
+        sendBtn.onclick = chatSend;
+        const svg = sendBtn.querySelector('svg');
+        if (svg) svg.innerHTML = '<path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>';
+    }
+    chatSyncSendButton();
+}
+
+function chatApplySessionMetadata(meta = null) {
+    const session = meta || {};
+    chatState.currentTransport = session.transport_mode || null;
+    chatState.currentContinuity = session.continuity_mode || null;
+    chatState.currentTransportNotice = session.transport_notice || '';
+    chatState.currentFolderId = session.folder_id || '';
+    chatState.currentFolderTitle = session.folder_title || session.folder_id || '';
+    chatState.currentWorkspaceRoots = Array.isArray(session.workspace_roots) ? session.workspace_roots.slice() : [];
+    chatState.currentSourceDocs = Array.isArray(session.source_docs) ? session.source_docs.slice() : [];
+    chatState.currentFolderWorkspaceRoots = Array.isArray(session.folder_workspace_roots) ? session.folder_workspace_roots.slice() : [];
+    chatState.currentFolderSourceDocs = Array.isArray(session.folder_source_docs) ? session.folder_source_docs.slice() : [];
+    if (chatState.currentFolderId) {
+        chatState.selectedFolderId = chatState.currentFolderId;
+        chatState.draftFolderId = chatState.currentFolderId;
+    } else if (!meta) {
+        chatState.selectedFolderId = '';
+        chatState.draftFolderId = '';
+    }
+    chatRenderSessionBanner();
+    chatRenderContextPanel();
+}
+
+function chatGoHome() {
+    chatState.currentSessionId = null;
+    chatState.localMessages = [];
+    chatState.lastSubmission = null;
+    chatState.selectedFolderId = '';
+    chatState.draftFolderId = '';
+    chatReplacePendingFiles([]);
+    chatApplySessionMetadata(null);
+    const input = document.getElementById('chat-input');
+    if (input) {
+        input.value = '';
+        chatAutoResize(input);
+        input.focus();
+    }
+    chatShowWelcome();
+    chatLoadHistory();
+    renderSidebarFoldersTree();
+}
+
+function chatFolderCollapseState() {
+    try {
+        return JSON.parse(localStorage.getItem('chat-folder-collapse') || '{}') || {};
+    } catch (e) {
+        return {};
+    }
+}
+
+function chatIsFolderCollapsed(folderId) {
+    return !!chatFolderCollapseState()[folderId];
+}
+
+function chatSetFolderCollapsed(folderId, collapsed) {
+    const state = chatFolderCollapseState();
+    if (collapsed) state[folderId] = true;
+    else delete state[folderId];
+    localStorage.setItem('chat-folder-collapse', JSON.stringify(state));
+}
+
+function chatFindFolder(folderId) {
+    return (chatState.folders || []).find(folder => folder.id === folderId) || null;
+}
+
+function chatCurrentFolderSummary() {
+    const folderId = chatState.currentFolderId || chatState.selectedFolderId || chatState.draftFolderId || '';
+    const folder = folderId ? chatFindFolder(folderId) : null;
+    if (folder) return folder;
+    if (!folderId && !(chatState.currentFolderTitle || chatState.currentFolderSourceDocs.length || chatState.currentFolderWorkspaceRoots.length)) return null;
+    return {
+        id: folderId,
+        title: chatState.currentFolderTitle || folderId || 'Folder',
+        source_docs: chatState.currentFolderSourceDocs.slice(),
+        workspace_roots: chatState.currentFolderWorkspaceRoots.slice(),
+        sessions: [],
+        chat_count: 0,
+    };
+}
+
+function chatPathLabel(path) {
+    if (!path) return '';
+    const clean = String(path).replace(/[\\/]+$/, '');
+    const parts = clean.split(/[\\/]/);
+    return parts[parts.length - 1] || clean;
+}
+
+function chatSourceLabel(path) {
+    return chatPathLabel(path) || 'Source';
+}
+
+function chatRenderContextPanel() {
+    const panel = document.getElementById('chat-context-panel');
+    if (!panel) return;
+    const folder = chatCurrentFolderSummary();
+    if (!folder) {
+        panel.className = 'chat-context-panel hidden';
+        panel.innerHTML = '';
+        return;
+    }
+    const sourceDocs = Array.isArray(folder.source_docs) ? folder.source_docs : [];
+    const workspaceRoots = Array.isArray(folder.workspace_roots) ? folder.workspace_roots : [];
+    const folderChats = Array.isArray(folder.sessions) ? folder.sessions : [];
+    let html = '<div class="chat-context-panel-header"><div>' +
+        '<button class="chat-folder-heading-btn" onclick="chatShowFolderOverview(\'' + escA(folder.id || '') + '\')">' + escH(folder.title || 'Folder') + '</button>' +
+        '<div class="chat-context-panel-subtitle">' +
+        (sourceDocs.length
+            ? 'Sources live at the folder level and guide every chat in this folder.'
+            : 'No sources added yet. Use Add Source to attach docs to this folder.') +
+        '</div></div>' +
+        '<div class="chat-folder-toolbar">' +
+        '<button class="btn btn-sm" onclick="chatNewSession(\'' + escA(folder.id || '') + '\')">New Chat</button>' +
+        '<button class="btn btn-sm" onclick="chatAddFolderSources(\'' + escA(folder.id || '') + '\')">Add Source</button>' +
+        '<button class="btn btn-sm" onclick="chatOpenFolderEditor(\'' + escA(folder.id || '') + '\')">Edit Folder</button>' +
+        (chatState.currentSessionId && folder.id && chatState.currentFolderId === folder.id
+            ? '<button class="btn btn-sm" onclick="chatUseCurrentChatAsSource(\'' + escA(folder.id) + '\')">Use Chat As Source</button>'
+            : '') +
+        '</div></div>';
+    html += '<div class="chat-context-section"><div class="chat-context-label">Sources</div>';
+    if (sourceDocs.length > 0) {
+        html += '<div class="chat-context-chip-list">' + sourceDocs.map(doc =>
+            '<span class="chat-context-chip" title="' + escA(doc) + '">' + escH(chatPathLabel(doc)) + '</span>'
+        ).join('') + '</div>';
+    } else {
+        html += '<div class="chat-context-empty">Add files or create a chat-derived source for this folder.</div>';
+    }
+    html += '</div>';
+    if (workspaceRoots.length > 0) {
+        html += '<div class="chat-context-section"><div class="chat-context-label">Detected workspace roots</div><div class="chat-context-chip-list">' + workspaceRoots.map(root =>
+            '<span class="chat-context-chip" title="' + escA(root) + '">' + escH(chatPathLabel(root)) + '</span>'
+        ).join('') + '</div></div>';
+    }
+    if (folderChats.length > 0) {
+        html += '<div class="chat-context-section"><div class="chat-context-label">Chats in this folder</div><div class="chat-folder-chatlist">' + folderChats.slice(0, 6).map(renderFolderSessionChip).join('') + '</div></div>';
+    }
+    panel.className = 'chat-context-panel';
+    panel.innerHTML = html;
+}
+
+function chatExpectedTransport() {
+    if (chatState.currentTransport === 'api') return 'api';
+    const hasPendingImages = chatState.pendingFiles.some(f => (f.type || '').toLowerCase().startsWith('image/'));
+    if (chatState.currentTransport === 'cli') {
+        return hasPendingImages && chatState.capabilities.imageAttachments ? 'api' : 'cli';
+    }
+    if (chatState.apiServerEnabled) return 'api';
+    if (hasPendingImages && chatState.capabilities.imageAttachments) return 'api';
+    return 'cli';
+}
+
+function chatExpectedCancelSupport() {
+    return chatExpectedTransport() === 'cli';
+}
+
+function chatRenderSessionBanner() {
+    const banner = document.getElementById('chat-session-banner');
+    if (!banner) return;
+    let text = '';
+    let cls = 'info';
+    if (chatState.currentContinuity === 'local_replay') {
+        text = 'This chat is using API memory mode instead of Hermes CLI resume.';
+        cls = 'warning';
+    } else if (chatState.currentContinuity === 'cli_without_resume') {
+        text = 'Hermes did not return a resumable session id for this chat yet, so follow-up continuity may be limited.';
+        cls = 'warning';
+    }
+    if (!text) {
+        banner.className = 'chat-session-banner hidden';
+        banner.textContent = '';
+        return;
+    }
+    banner.className = 'chat-session-banner ' + cls;
+    banner.textContent = text;
 }
 
 function chatApplyComposerCapabilities() {
@@ -1114,12 +1501,12 @@ function chatApplyComposerCapabilities() {
     if (hint) {
         hint.textContent = chatState.capabilities.imageAttachments
             ? 'Enter to send, Shift+Enter for new line, Ctrl+V to paste image'
-            : 'Enter to send, Shift+Enter for new line, text files only in this mode';
+            : 'Enter to send, Shift+Enter for new line. Configure Vision in Providers to enable screenshot paste.';
     }
     if (welcomeHint) {
         welcomeHint.textContent = chatState.capabilities.imageAttachments
             ? 'Tip: Paste screenshots directly with Ctrl+V'
-            : 'Tip: You can send a text file even without typing a message';
+            : 'Tip: Open Providers to choose a vision model before pasting screenshots';
     }
     if (micBtn) {
         const enabled = chatCanUseMicButton();
@@ -1129,6 +1516,7 @@ function chatApplyComposerCapabilities() {
             ? 'Voice input (click to start/stop)'
             : 'Voice input is unavailable here because this browser cannot transcribe speech and Hermes does not support audio uploads';
     }
+    chatRenderSessionBanner();
 }
 
 async function chatRefreshCapabilities() {
@@ -1136,6 +1524,7 @@ async function chatRefreshCapabilities() {
         const data = await api('GET', '/api/chat/status');
         const caps = data.capabilities || {};
         const reasons = data.capability_reasons || {};
+        chatState.apiServerEnabled = !!data.api_server;
         chatState.capabilities = {
             textAttachments: caps.text_attachments !== false,
             imageAttachments: !!caps.image_attachments,
@@ -1146,6 +1535,7 @@ async function chatRefreshCapabilities() {
             audioAttachments: reasons.audio_attachments || '',
         };
     } catch (e) {
+        chatState.apiServerEnabled = false;
         chatState.capabilities = {
             textAttachments: true,
             imageAttachments: false,
@@ -1167,7 +1557,7 @@ async function chatHandlePaste(e) {
         if (item.type.startsWith('image/')) {
             e.preventDefault();
             if (!chatState.capabilities.imageAttachments) {
-                toast(chatState.capabilityReasons.imageAttachments || 'Image paste is unavailable in the current Hermes configuration.', 'warning');
+                chatOpenVisionSetup('Pasted screenshots');
                 continue;
             }
             const blob = item.getAsFile();
@@ -1179,23 +1569,22 @@ async function chatHandlePaste(e) {
             reader.onload = async () => {
                 try {
                     const b64data = reader.result;
-                    const resp = await fetch('/api/upload/base64', {
+                    const resp = await authFetch('/api/upload/base64', {
                         method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Authorization': 'Bearer ' + getToken(),
-                        },
+                        headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ data: b64data, ext }),
                     });
                     if (resp.ok) {
                         const data = await resp.json();
+                        data.preview_url = URL.createObjectURL(blob);
                         chatState.pendingFiles.push(data);
                         chatRenderFileBar();
                         document.getElementById('chat-send-btn').disabled = false;
                         toast('Image pasted', 'success', 2000);
                     } else {
                         const err = await resp.json();
-                        toast('Paste failed: ' + err.error, 'error');
+                        const detail = Array.isArray(err.details) ? ' ' + err.details.join(' ') : '';
+                        toast('Paste failed: ' + (err.error || 'Request failed') + detail, 'error');
                     }
                 } catch (ex) { toast('Upload error: ' + ex.message, 'error'); }
             };
@@ -1232,6 +1621,8 @@ Screens.chat = function () {
 
         <!-- Chat Main Area -->
         <div class="chat-main">
+            <div class="chat-session-banner hidden" id="chat-session-banner"></div>
+            <div class="chat-context-panel hidden" id="chat-context-panel"></div>
             <div class="chat-transcript" id="chat-messages" role="log" aria-live="polite"></div>
 
             <div class="chat-file-bar hidden" id="chat-file-bar">
@@ -1288,6 +1679,10 @@ Screens.chat = function () {
     layout.addEventListener('dragover', (e) => { e.preventDefault(); layout.classList.add('drag-over'); });
     layout.addEventListener('dragleave', (e) => { if (!layout.contains(e.relatedTarget)) layout.classList.remove('drag-over'); });
     layout.addEventListener('drop', (e) => { e.preventDefault(); layout.classList.remove('drag-over'); Array.from(e.dataTransfer.files).forEach(f => chatUploadFile(f)); });
+    const historyOverlay = document.getElementById('chat-history-overlay');
+    if (historyOverlay) historyOverlay.addEventListener('click', () => {
+        if (chatState.historyOpen) chatToggleHistory();
+    });
 
     // Setup speech recognition
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -1325,6 +1720,7 @@ Screens.chat = function () {
         };
     }
 
+    chatRenderFileBar();
     chatApplyComposerCapabilities();
     chatRefreshCapabilities();
 
@@ -1334,36 +1730,370 @@ Screens.chat = function () {
     // Render current session or welcome
     if (chatState.currentSessionId) {
         chatRenderMessages();
+    } else if (chatState.selectedFolderId) {
+        const folder = chatFindFolder(chatState.selectedFolderId);
+        if (folder) chatRenderFolderOverview(folder);
+        else chatShowWelcome();
     } else {
         chatShowWelcome();
     }
 };
 
+function foldersScreenCollapseState() {
+    try {
+        return JSON.parse(localStorage.getItem('folders-screen-collapse') || '{}') || {};
+    } catch (e) {
+        return {};
+    }
+}
+
+function foldersScreenSetCollapsed(folderId, collapsed) {
+    const state = foldersScreenCollapseState();
+    state[folderId] = !!collapsed;
+    localStorage.setItem('folders-screen-collapse', JSON.stringify(state));
+}
+
+window.toggleFoldersScreenFolder = function (folderId) {
+    const currentCollapsed = foldersScreenCollapseState()[folderId] !== false;
+    foldersScreenSetCollapsed(folderId, !currentCollapsed);
+    Screens.folders();
+};
+
+Screens.folders = async function () {
+    const content = document.getElementById('content');
+    try {
+        const [folderData, sessionData] = await Promise.all([
+            api('GET', '/api/chat/folders'),
+            api('GET', '/api/chat/sessions'),
+        ]);
+        const folders = folderData.folders || [];
+        const sessions = sessionData.sessions || [];
+        const ungrouped = sessions.filter(session => !(session.session?.folder_id));
+        const collapsedState = foldersScreenCollapseState();
+        content.innerHTML = `
+        <div class="card">
+            <div class="card-header">
+                <span>Folders</span>
+                <div class="flex gap-8">
+                    <button class="btn btn-sm" onclick="chatCreateFolderPrompt()">New Folder</button>
+                </div>
+            </div>
+            <div class="card-body">
+                <p class="text-sm text-secondary">Folders hold shared sources and the chats that belong to that work area. Drag chats onto folders from Chat, or manage them here.</p>
+            </div>
+        </div>
+        ${folders.map(folder => {
+            const collapsed = collapsedState[folder.id] !== false;
+            return `<div class="card folder-admin-card">
+                <div class="card-header folder-admin-header">
+                    <button class="folder-admin-main" onclick="toggleFoldersScreenFolder('${escA(folder.id)}')" aria-expanded="${collapsed ? 'false' : 'true'}">
+                        <span class="folder-admin-toggle">
+                            <svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transform:${collapsed ? 'rotate(-90deg)' : 'rotate(0deg)'}"><polyline points="6 9 12 15 18 9"/></svg>
+                        </span>
+                        <span class="folder-admin-title">${escH(folder.title || 'Folder')}</span>
+                        <span class="folder-admin-summary">
+                            <span class="badge">${escH(String(folder.chat_count || 0))} chats</span>
+                            <span class="badge">${escH(String((folder.source_docs || []).length))} sources</span>
+                        </span>
+                    </button>
+                    <div class="flex gap-8 folder-admin-actions">
+                        <button class="btn btn-sm" onclick="event.stopPropagation(); chatOpenFolderAddMenu('${escA(folder.id)}')">Add</button>
+                        <button class="btn btn-sm" onclick="event.stopPropagation(); chatOpenFolderEditor('${escA(folder.id)}')">Edit</button>
+                        <button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); chatConfirmDeleteFolder('${escA(folder.id)}')">Delete</button>
+                    </div>
+                </div>
+                <div class="card-body ${collapsed ? 'hidden' : ''}">
+                    <div class="folder-admin-grid">
+                        <div>
+                            <div class="folder-admin-subtitle">Sources</div>
+                            ${(folder.source_docs || []).length
+                                ? '<div class="chat-context-chip-list">' + folder.source_docs.map(doc => `<span class="chat-context-chip" title="${escA(doc)}">${escH(chatSourceLabel(doc))}</span>`).join('') + '</div>'
+                                : '<div class="text-sm text-secondary">No sources yet.</div>'}
+                        </div>
+                        <div>
+                            <div class="folder-admin-subtitle">Chats</div>
+                            ${(folder.sessions || []).length
+                                ? '<div class="chat-folder-overview-chatlist">' + folder.sessions.map(renderFolderSessionChip).join('') + '</div>'
+                                : '<div class="text-sm text-secondary">No chats in this folder yet.</div>'}
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        }).join('')}
+        <div class="card">
+            <div class="card-header"><span>Ungrouped Chats</span></div>
+            <div class="card-body">
+                ${ungrouped.length
+                    ? '<div class="chat-folder-overview-chatlist">' + ungrouped.map(renderFolderSessionChip).join('') + '</div>'
+                    : '<div class="text-sm text-secondary">All current chats are already assigned to folders.</div>'}
+            </div>
+        </div>`;
+    } catch (e) {
+        content.innerHTML = '<div class="empty-state"><div class="empty-icon">⚠️</div><h3>Error loading folders</h3><p>' + escH(e.message) + '</p></div>';
+    }
+};
+
+Screens.cron = async function () {
+    const content = document.getElementById('content');
+    try {
+        const data = await api('GET', '/api/cron/jobs');
+        const jobs = data.jobs || [];
+        content.innerHTML = `
+        <div class="card">
+            <div class="card-header">
+                <span>Cron Jobs</span>
+                <button class="btn btn-sm" onclick="cronOpenEditor()">New Job</button>
+            </div>
+            <div class="card-body">
+                <p class="text-sm text-secondary">Managed cron jobs write to your user crontab and preserve non-Hermes entries. Use standard five-field cron expressions.</p>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-header"><span>Scheduled Jobs</span></div>
+            <div class="table-container">
+                <table class="table">
+                    <thead><tr><th>Name</th><th>Schedule</th><th>Command</th><th>Status</th><th>Actions</th></tr></thead>
+                    <tbody>
+                        ${jobs.length ? jobs.map(job => `
+                            <tr>
+                                <td>${escH(job.name || 'Cron Job')}</td>
+                                <td><span class="font-mono text-sm">${escH(job.schedule || '')}</span></td>
+                                <td><span class="font-mono text-xs">${escH(job.command || '')}</span></td>
+                                <td>${job.enabled ? '<span class="badge badge-success">Enabled</span>' : '<span class="badge">Disabled</span>'}</td>
+                                <td>
+                                    <div class="flex gap-8">
+                                        <button class="btn btn-sm" onclick="cronOpenEditor('${escA(job.id)}')">Edit</button>
+                                        <button class="btn btn-sm btn-danger" onclick="cronDeleteJob('${escA(job.id)}')">Delete</button>
+                                    </div>
+                                </td>
+                            </tr>
+                        `).join('') : '<tr><td colspan="5" class="text-sm text-secondary">No managed cron jobs yet.</td></tr>'}
+                    </tbody>
+                </table>
+            </div>
+        </div>`;
+    } catch (e) {
+        content.innerHTML = '<div class="empty-state"><div class="empty-icon">⚠️</div><h3>Error loading cron jobs</h3><p>' + escH(e.message) + '</p></div>';
+    }
+};
+
+window.cronOpenEditor = async function (jobId = '') {
+    let job = null;
+    if (jobId) {
+        const data = await api('GET', '/api/cron/jobs');
+        job = (data.jobs || []).find(item => item.id === jobId) || null;
+    }
+    showModal(
+        job ? 'Edit Cron Job' : 'New Cron Job',
+        '<div class="form-group"><label class="form-label">Name</label>' + inputH('cron-name', job?.name || '', 'text', 'Nightly report') + '</div>' +
+        '<div class="form-group"><label class="form-label">Schedule</label>' + inputH('cron-schedule', job?.schedule || '0 9 * * 1-5', 'text', '0 9 * * 1-5') + '<div class="text-xs text-secondary mt-8">Standard cron format: minute hour day month weekday.</div></div>' +
+        '<div class="form-group"><label class="form-label">Command</label><textarea id="cron-command" class="form-input" rows="4" placeholder="cd /home/pickle/hermes-web-ui && ./start.sh 5055">' + escH(job?.command || '') + '</textarea></div>' +
+        '<div class="form-group"><label class="form-label">Enabled</label><label class="chat-modal-source-row"><input type="checkbox" id="cron-enabled" ' + ((job?.enabled ?? true) ? 'checked' : '') + '> <span>Run this schedule</span></label></div>',
+        '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="cronSaveJob(\'' + escA(jobId) + '\')">Save</button>'
+    );
+};
+
+window.cronSaveJob = async function (jobId = '') {
+    const payload = {
+        name: document.getElementById('cron-name').value.trim(),
+        schedule: document.getElementById('cron-schedule').value.trim(),
+        command: document.getElementById('cron-command').value.trim(),
+        enabled: !!document.getElementById('cron-enabled').checked,
+    };
+    try {
+        if (jobId) await api('PUT', '/api/cron/jobs/' + jobId, payload);
+        else await api('POST', '/api/cron/jobs', payload);
+        closeModal();
+        Screens.cron();
+        toast('Cron job saved', 'success', 1500);
+    } catch (e) {
+        toast(e.message || 'Failed to save cron job', 'error');
+    }
+};
+
+window.cronDeleteJob = async function (jobId) {
+    try {
+        await api('DELETE', '/api/cron/jobs/' + jobId);
+        Screens.cron();
+        toast('Cron job deleted', 'success', 1500);
+    } catch (e) {
+        toast(e.message || 'Failed to delete cron job', 'error');
+    }
+};
+
+function sidebarFoldersExpanded() {
+    return localStorage.getItem('sidebar-folders-open') === '1';
+}
+
+function setSidebarFoldersExpanded(open) {
+    localStorage.setItem('sidebar-folders-open', open ? '1' : '0');
+    const tree = document.getElementById('sidebar-folders-tree');
+    if (tree) tree.classList.toggle('hidden', !open);
+}
+
+function sidebarFolderNodeCollapseState() {
+    try {
+        return JSON.parse(localStorage.getItem('sidebar-folder-node-collapse') || '{}') || {};
+    } catch (e) {
+        return {};
+    }
+}
+
+function setSidebarFolderNodeCollapsed(folderId, collapsed) {
+    const state = sidebarFolderNodeCollapseState();
+    if (collapsed) state[folderId] = true;
+    else delete state[folderId];
+    localStorage.setItem('sidebar-folder-node-collapse', JSON.stringify(state));
+}
+
+window.toggleSidebarFolders = async function (forceOpen = null) {
+    const next = typeof forceOpen === 'boolean' ? forceOpen : !sidebarFoldersExpanded();
+    setSidebarFoldersExpanded(next);
+    if (next) await renderSidebarFoldersTree();
+};
+
+window.toggleSidebarFolderNode = function (folderId) {
+    const current = !!sidebarFolderNodeCollapseState()[folderId];
+    setSidebarFolderNodeCollapsed(folderId, !current);
+    renderSidebarFoldersTree();
+};
+
+window.sidebarOpenFolder = function (folderId) {
+    setSidebarFoldersExpanded(true);
+    setSidebarFolderNodeCollapsed(folderId, false);
+    renderSidebarFoldersTree();
+    navigate('chat');
+    chatShowFolderOverview(folderId);
+};
+
+window.sidebarOpenChat = function (sessionId) {
+    setSidebarFoldersExpanded(true);
+    navigate('chat');
+    chatLoadSession(sessionId);
+};
+
+window.sidebarOpenUngrouped = function () {
+    setSidebarFoldersExpanded(true);
+    navigate('chat');
+    chatGoHome();
+};
+
+async function renderSidebarFoldersTree() {
+    const tree = document.getElementById('sidebar-folders-tree');
+    if (!tree) return;
+    const sidebar = document.getElementById('sidebar');
+    if (sidebar && sidebar.classList.contains('collapsed')) {
+        tree.classList.add('hidden');
+        tree.innerHTML = '';
+        return;
+    }
+    if (!sidebarFoldersExpanded()) {
+        tree.classList.add('hidden');
+        tree.innerHTML = '';
+        return;
+    }
+    tree.classList.remove('hidden');
+    try {
+        const [folderData, sessionData] = await Promise.all([
+            api('GET', '/api/chat/folders'),
+            api('GET', '/api/chat/sessions'),
+        ]);
+        const folders = folderData.folders || [];
+        const sessions = sessionData.sessions || [];
+        chatState.folders = folders.slice();
+        const collapsed = sidebarFolderNodeCollapseState();
+        const ungrouped = sessions.filter(session => !(session.session?.folder_id));
+        tree.innerHTML =
+            folders.map(folder => {
+                const hidden = !!collapsed[folder.id];
+                const chats = folder.sessions || [];
+                return '<div class="sidebar-folder-node">' +
+                    '<div class="sidebar-folder-node-row" ondragover="chatFolderDragOver(event,\'' + escA(folder.id) + '\')" ondrop="chatDropSessionOnFolder(event,\'' + escA(folder.id) + '\')">' +
+                    '<button class="sidebar-folder-toggle" onclick="event.stopPropagation(); toggleSidebarFolderNode(\'' + escA(folder.id) + '\')" title="' + (hidden ? 'Expand' : 'Collapse') + '">' +
+                    '<svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transform:' + (hidden ? 'rotate(-90deg)' : 'rotate(0deg)') + '"><polyline points="6 9 12 15 18 9"/></svg>' +
+                    '</button>' +
+                    '<button class="sidebar-folder-node-target' + (((chatState.selectedFolderId || chatState.currentFolderId) === folder.id && !chatState.currentSessionId) ? ' active' : '') + '" onclick="sidebarOpenFolder(\'' + escA(folder.id) + '\')">' +
+                    '<span class="sidebar-folder-name">' + escH(folder.title || 'Folder') + '</span>' +
+                    '<span class="sidebar-folder-count">' + escH(String(folder.chat_count || chats.length || 0)) + '</span>' +
+                    '</button>' +
+                    '<div class="sidebar-folder-actions">' +
+                    '<button class="btn-icon" title="Add to folder" onclick="event.stopPropagation(); chatOpenFolderAddMenu(\'' + escA(folder.id) + '\')" style="width:20px;height:20px"><svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>' +
+                    '</div></div>' +
+                    '<div class="sidebar-folder-children' + (hidden ? ' hidden' : '') + '">' +
+                    chats.map(session => renderSidebarFolderSessionItem(session)).join('') +
+                    '</div></div>';
+            }).join('') +
+            (ungrouped.length ? '<div class="sidebar-folder-node"><div class="sidebar-folder-node-row"><button class="sidebar-folder-node-target' + (!chatState.currentSessionId && !chatState.selectedFolderId ? ' active' : '') + '" onclick="sidebarOpenUngrouped()"><span class="sidebar-folder-name">Ungrouped</span><span class="sidebar-folder-count">' + escH(String(ungrouped.length)) + '</span></button></div><div class="sidebar-folder-children">' + ungrouped.map(session => renderSidebarFolderSessionItem(session, 'sidebar-folder-ungrouped-btn')).join('') + '</div></div>' : '');
+    } catch (e) {
+        tree.innerHTML = '<div class="text-xs text-secondary" style="padding:8px 10px">Unable to load folders.</div>';
+    }
+}
+
+window.renderSidebarFoldersTree = renderSidebarFoldersTree;
+
 // ── CHAT HISTORY ─────────────────────────────────────────
 
 async function chatLoadHistory() {
     try {
-        const data = await api('GET', '/api/chat/sessions');
+        const [folderData, sessionData] = await Promise.all([
+            api('GET', '/api/chat/folders'),
+            api('GET', '/api/chat/sessions'),
+        ]);
         const list = document.getElementById('chat-history-list');
         if (!list) return;
-        const sessions = data.sessions || [];
-        if (sessions.length === 0) {
+        const folders = folderData.folders || [];
+        const sessions = sessionData.sessions || [];
+        chatState.folders = folders.slice();
+        const ungrouped = sessions.filter(s => !(s.session && s.session.folder_id));
+        if (folders.length === 0 && ungrouped.length === 0) {
             list.innerHTML = '<div class="chat-history-empty">No chats yet.<br>Click + to start one.</div>';
+            chatRenderContextPanel();
             return;
         }
-        list.innerHTML = sessions.map(s => {
+        const renderSessionItem = (s) => {
             const isActive = s.id === chatState.currentSessionId;
-            const msgCount = s.message_count || 0;
             const preview = s.last_message ? escH(s.last_message) : 'Empty';
-            return '<div class="chat-history-item' + (isActive ? ' active' : '') + '" data-sid="' + escA(s.id) + '" onclick="chatLoadSession(\'' + escA(s.id) + '\')">' +
+            return '<div class="chat-history-item' + (isActive ? ' active' : '') + '" data-sid="' + escA(s.id) + '" draggable="true" ondragstart="chatDragSession(event,\'' + escA(s.id) + '\')" onclick="chatLoadSession(\'' + escA(s.id) + '\')">' +
                 '<div class="chat-history-item-title">' + escH(s.title || 'Untitled') + '</div>' +
                 '<div class="chat-history-item-preview">' + preview + '</div>' +
-                '<div class="chat-history-item-meta">' + msgCount + ' msgs</div>' +
+                '<div class="chat-history-item-meta">' + escH((s.message_count || 0) + ' msgs') + '</div>' +
                 '<div class="chat-history-item-actions">' +
                 '<button class="btn-icon" title="Rename" onclick="event.stopPropagation();chatRenameSessionPrompt(\'' + escA(s.id) + '\', \'' + escA(s.title || 'Untitled') + '\')" style="width:22px;height:22px"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg></button>' +
                 '<button class="btn-icon" title="Delete" onclick="event.stopPropagation();chatDeleteSession(\'' + escA(s.id) + '\')" style="width:22px;height:22px"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>' +
                 '</div></div>';
-        }).join('');
+        };
+        let html = '';
+        if (folders.length > 0) {
+            html += folders.map(folder => {
+                const collapsed = chatIsFolderCollapsed(folder.id);
+                const isSelected = folder.id === chatState.selectedFolderId;
+                const chats = folder.sessions || [];
+                return '<div class="chat-folder-tree">' +
+                    '<div class="chat-folder-row' + (isSelected ? ' active' : '') + '" ondragover="chatFolderDragOver(event,\'' + escA(folder.id) + '\')" ondrop="chatDropSessionOnFolder(event,\'' + escA(folder.id) + '\')">' +
+                    '<button class="chat-folder-toggle" onclick="event.stopPropagation();chatToggleFolderGroup(\'' + escA(folder.id) + '\')" title="' + (collapsed ? 'Expand' : 'Collapse') + '">' +
+                    '<svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="transform:' + (collapsed ? 'rotate(-90deg)' : 'rotate(0deg)') + '"><polyline points="6 9 12 15 18 9"/></svg>' +
+                    '</button>' +
+                    '<button class="chat-folder-main" onclick="chatShowFolderOverview(\'' + escA(folder.id) + '\')">' +
+                    '<div class="chat-folder-name">' + escH(folder.title || 'Folder') + '</div>' +
+                    '<div class="chat-folder-meta">' + escH((folder.chat_count || chats.length || 0) + ' chats') + (folder.source_docs && folder.source_docs.length ? ' • ' + escH(folder.source_docs.length + ' sources') : '') + '</div>' +
+                    '</button>' +
+                    '<div class="chat-folder-actions">' +
+                    '<button class="btn-icon" title="Add to folder" onclick="event.stopPropagation();chatOpenFolderAddMenu(\'' + escA(folder.id) + '\')" style="width:22px;height:22px"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>' +
+                    '<button class="btn-icon" title="Edit folder" onclick="event.stopPropagation();chatOpenFolderEditor(\'' + escA(folder.id) + '\')" style="width:22px;height:22px"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg></button>' +
+                    '</div></div>' +
+                    '<div class="chat-folder-children' + (collapsed ? ' hidden' : '') + '">' + chats.map(renderSessionItem).join('') + '</div></div>';
+            }).join('');
+        }
+        if (ungrouped.length > 0) {
+            html += '<div class="chat-history-group"><button class="chat-history-group-title-btn" onclick="chatGoHome()">Ungrouped</button>' + ungrouped.map(renderSessionItem).join('') + '</div>';
+        }
+        list.innerHTML = html || '<div class="chat-history-empty">No chats yet.<br>Click + to start one.</div>';
+        chatRenderContextPanel();
+        if (!chatState.currentSessionId && chatState.selectedFolderId) {
+            const folder = chatFindFolder(chatState.selectedFolderId);
+            if (folder) chatRenderFolderOverview(folder);
+        }
+        renderSidebarFoldersTree();
     } catch (e) {
         const list = document.getElementById('chat-history-list');
         if (list) list.innerHTML = '<div class="chat-history-empty">Error loading chats</div>';
@@ -1371,10 +2101,11 @@ async function chatLoadHistory() {
 }
 
 window.chatLoadSession = async function (sid) {
-    chatState.currentSessionId = sid;
     try {
         const data = await api('GET', '/api/chat/sessions/' + sid + '/messages');
+        chatState.currentSessionId = sid;
         chatState.localMessages = data.messages || [];
+        chatApplySessionMetadata(data.session || null);
         chatRenderMessages();
     } catch (e) {
         toast('Failed to load session', 'error');
@@ -1383,15 +2114,36 @@ window.chatLoadSession = async function (sid) {
 };
 
 window.chatDeleteSession = async function (sid) {
+    const activeScreen = document.querySelector('.nav-item.active')?.dataset.screen || 'chat';
     try {
         await api('POST', '/api/chat/sessions/' + sid + '/delete');
         toast('Chat deleted', 'success', 2000);
         if (chatState.currentSessionId === sid) {
             chatState.currentSessionId = null;
             chatState.localMessages = [];
-            chatShowWelcome();
+            chatState.lastSubmission = null;
+            if (chatState.selectedFolderId) {
+                const folder = chatFindFolder(chatState.selectedFolderId);
+                chatApplySessionMetadata({
+                    folder_id: folder ? folder.id : chatState.selectedFolderId,
+                    folder_title: folder ? folder.title : chatState.currentFolderTitle,
+                    folder_workspace_roots: folder ? (folder.workspace_roots || []) : [],
+                    folder_source_docs: folder ? (folder.source_docs || []) : [],
+                    workspace_roots: folder ? (folder.workspace_roots || []) : [],
+                    source_docs: folder ? (folder.source_docs || []) : [],
+                });
+                if (folder) chatRenderFolderOverview(folder);
+                else chatShowWelcome();
+            } else {
+                chatApplySessionMetadata(null);
+                chatShowWelcome();
+            }
+        }
+        if (activeScreen === 'folders') {
+            await Screens.folders();
         }
         chatLoadHistory();
+        renderSidebarFoldersTree();
     } catch (e) { toast('Delete failed', 'error'); }
 };
 
@@ -1403,16 +2155,151 @@ window.chatRenameSessionPrompt = async function (sid, currentTitle) {
         await api('POST', '/api/chat/sessions/' + sid + '/rename', { title: newTitle.trim() });
         toast('Chat renamed', 'success', 1500);
         chatLoadHistory();
+        renderSidebarFoldersTree();
     } catch (e) { toast('Rename failed', 'error'); }
+};
+
+window.chatToggleFolderGroup = function (folderId) {
+    const collapsed = !chatIsFolderCollapsed(folderId);
+    chatSetFolderCollapsed(folderId, collapsed);
+    chatLoadHistory();
+};
+
+window.chatDragSession = function (event, sessionId) {
+    event.dataTransfer.setData('text/plain', sessionId);
+    event.dataTransfer.effectAllowed = 'move';
+};
+
+window.chatFolderDragOver = function (event, folderId) {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+};
+
+window.chatDropSessionOnFolder = async function (event, folderId) {
+    event.preventDefault();
+    const sessionId = event.dataTransfer.getData('text/plain');
+    if (!sessionId || !folderId) return;
+    try {
+        await api('PUT', '/api/chat/sessions/' + sessionId + '/folder', { folder_id: folderId });
+        if (chatState.currentSessionId === sessionId) {
+            const folder = chatFindFolder(folderId);
+            if (folder) {
+                chatState.selectedFolderId = folderId;
+                chatState.draftFolderId = folderId;
+            }
+        }
+        await chatLoadHistory();
+        renderSidebarFoldersTree();
+        toast('Chat moved to folder', 'success', 1500);
+    } catch (e) {
+        toast(e.message || 'Failed to move chat', 'error');
+    }
+};
+
+window.chatOpenFolderAddMenu = async function (folderId = '') {
+    const folder = chatFindFolder(folderId || chatState.selectedFolderId || chatState.currentFolderId || '');
+    if (!folder) {
+        toast('Select a folder first', 'warning');
+        return;
+    }
+    let sessions = [];
+    try {
+        const resp = await api('GET', '/api/chat/sessions');
+        sessions = resp.sessions || [];
+    } catch (e) {}
+    const movable = sessions.filter(session => (session.session?.folder_id || '') !== folder.id);
+    const currentInFolder = chatState.currentSessionId && chatState.currentFolderId === folder.id;
+    showModal(
+        'Add To ' + (folder.title || 'Folder'),
+        '<p class="text-sm text-secondary mb-16">Add files as sources, start a new chat here, move existing chats in, or turn selected chats into reusable source docs.</p>' +
+        '<div class="chat-folder-add-actions">' +
+        '<button class="btn btn-primary" onclick="closeModal(); chatNewSession(\'' + escA(folder.id) + '\')">New Chat In Folder</button>' +
+        '<button class="btn" onclick="closeModal(); chatAddFolderSources(\'' + escA(folder.id) + '\')">Add Source Files</button>' +
+        (currentInFolder ? '<button class="btn" onclick="closeModal(); chatUseCurrentChatAsSource(\'' + escA(folder.id) + '\')">Use Current Chat As Source</button>' : '') +
+        '</div>' +
+        '<div class="form-group mt-16"><label class="form-label">Move existing chats into this folder</label>' +
+        (movable.length
+            ? '<div class="chat-modal-chip-list">' + movable.map(session =>
+                '<label class="chat-modal-source-row"><input class="chat-folder-session-choice" type="checkbox" value="' + escA(session.id) + '"> <span><strong>' + escH(session.title || 'Untitled') + '</strong><br><span class="text-xs text-secondary">' + escH((session.session?.folder_title || session.session?.folder_id || 'Ungrouped')) + '</span></span></label>'
+            ).join('') + '</div>'
+            : '<div class="text-sm text-secondary">No other chats are available to move right now.</div>') +
+        '</div>',
+        '<button class="btn" onclick="closeModal()">Close</button>' +
+        (movable.length ? '<button class="btn" onclick="chatAddSelectedSessionsAsSources(\'' + escA(folder.id) + '\')">Use Selected Chats As Sources</button><button class="btn btn-primary" onclick="chatMoveSelectedSessionsToFolder(\'' + escA(folder.id) + '\')">Move Selected Chats</button>' : '')
+    );
+};
+
+window.chatMoveSelectedSessionsToFolder = async function (folderId) {
+    const selected = Array.from(document.querySelectorAll('.chat-folder-session-choice:checked')).map(input => input.value);
+    if (selected.length === 0) {
+        toast('Select at least one chat', 'warning');
+        return;
+    }
+    try {
+        for (const sessionId of selected) {
+            await api('PUT', '/api/chat/sessions/' + sessionId + '/folder', { folder_id: folderId });
+        }
+        closeModal();
+        await chatLoadHistory();
+        renderSidebarFoldersTree();
+        if ((chatState.selectedFolderId || chatState.currentFolderId) === folderId) {
+            chatShowFolderOverview(folderId);
+        }
+        toast('Chats moved to folder', 'success', 1500);
+    } catch (e) {
+        toast(e.message || 'Failed to move chats', 'error');
+    }
+};
+
+window.chatAddSelectedSessionsAsSources = async function (folderId) {
+    const selected = Array.from(document.querySelectorAll('.chat-folder-session-choice:checked')).map(input => input.value);
+    if (selected.length === 0) {
+        toast('Select at least one chat', 'warning');
+        return;
+    }
+    try {
+        for (const sessionId of selected) {
+            await api('POST', '/api/chat/folders/' + folderId + '/sources/from-chat', { session_id: sessionId });
+        }
+        closeModal();
+        await chatLoadHistory();
+        renderSidebarFoldersTree();
+        if ((chatState.selectedFolderId || chatState.currentFolderId) === folderId) {
+            chatShowFolderOverview(folderId);
+        }
+        toast('Selected chats added as sources', 'success', 1500);
+    } catch (e) {
+        toast(e.message || 'Failed to add chat sources', 'error');
+    }
+};
+
+window.chatShowFolderOverview = async function (folderId) {
+    const folder = chatFindFolder(folderId);
+    if (!folder) return;
+    setSidebarFoldersExpanded(true);
+    chatState.selectedFolderId = folderId;
+    chatState.draftFolderId = folderId;
+    chatState.currentSessionId = null;
+    chatState.localMessages = [];
+    chatApplySessionMetadata({
+        folder_id: folder.id,
+        folder_title: folder.title,
+        folder_workspace_roots: folder.workspace_roots || [],
+        folder_source_docs: folder.source_docs || [],
+        workspace_roots: folder.workspace_roots || [],
+        source_docs: folder.source_docs || [],
+    });
+    chatRenderFolderOverview(folder);
+    chatLoadHistory();
 };
 
 window.chatToggleHistory = function () {
     chatState.historyOpen = !chatState.historyOpen;
     const el = document.getElementById('chat-history');
+    const overlay = document.getElementById('chat-history-overlay');
     if (el) el.classList.toggle('collapsed', !chatState.historyOpen);
     if (el) el.classList.toggle('mobile-open', chatState.historyOpen);
-    // Re-render chat to show/hide toggle button in header
-    if (document.getElementById('chat-layout')) Screens.chat();
+    if (overlay) overlay.classList.toggle('active', chatState.historyOpen && window.innerWidth <= 768);
 };
 
 function chatShowWelcome() {
@@ -1447,12 +2334,45 @@ function chatShowWelcome() {
     </div>`;
 }
 
+function chatRenderFolderOverview(folder) {
+    const msgs = document.getElementById('chat-messages');
+    if (!msgs) return;
+    const sources = folder.source_docs || [];
+    const chats = folder.sessions || [];
+    msgs.innerHTML = `
+    <div class="chat-folder-overview">
+        <div class="chat-folder-overview-title">${escH(folder.title || 'Folder')}</div>
+        <div class="chat-folder-overview-subtitle">This folder groups chats and shared source docs. New chats started here will automatically inherit these sources.</div>
+        <div class="chat-folder-overview-actions">
+            <button class="btn btn-primary" onclick="chatNewSession('${escA(folder.id)}')">New Chat In Folder</button>
+            <button class="btn" onclick="chatAddFolderSources('${escA(folder.id)}')">Add Source</button>
+            <button class="btn" onclick="chatOpenFolderEditor('${escA(folder.id)}')">Edit Folder</button>
+            <button class="btn btn-danger" onclick="chatConfirmDeleteFolder('${escA(folder.id)}')">Delete Folder</button>
+        </div>
+        <div class="chat-folder-overview-grid">
+            <div class="chat-folder-overview-card">
+                <div class="chat-folder-overview-card-title">Sources</div>
+                ${sources.length ? '<div class="chat-context-chip-list">' + sources.map(doc => '<span class="chat-context-chip" title="' + escA(doc) + '">' + escH(chatPathLabel(doc)) + '</span>').join('') + '</div>' : '<div class="chat-context-empty">No sources yet.</div>'}
+            </div>
+            <div class="chat-folder-overview-card">
+                <div class="chat-folder-overview-card-title">Chats</div>
+                ${chats.length ? '<div class="chat-folder-overview-chatlist">' + chats.map(renderFolderSessionChip).join('') + '</div>' : '<div class="chat-context-empty">No chats in this folder yet.</div>'}
+            </div>
+        </div>
+    </div>`;
+}
+
 function chatRenderMessages() {
     const msgs = document.getElementById('chat-messages');
     if (!msgs) return;
     msgs.innerHTML = '';
     const messages = chatState.localMessages;
     if (!messages || messages.length === 0) {
+        const folder = chatCurrentFolderSummary();
+        if (folder && (chatState.selectedFolderId || chatState.currentFolderId)) {
+            chatRenderFolderOverview(folder);
+            return;
+        }
         chatShowWelcome();
         return;
     }
@@ -1502,26 +2422,286 @@ function chatEnhanceCodeBlocks() {
     });
 }
 
-window.chatNewSession = function () {
+function chatOpenSessionFromAnyView(sessionId) {
+    const activeScreen = document.querySelector('.nav-item.active')?.dataset.screen || 'chat';
+    if (activeScreen !== 'chat') navigate('chat');
+    chatLoadSession(sessionId);
+}
+
+function renderFolderSessionChip(session) {
+    const isActive = session.id === chatState.currentSessionId;
+    return '<span class="chat-folder-chat-entry">' +
+        '<button class="chat-folder-chat-pill' + (isActive ? ' active' : '') + '" onclick="chatOpenSessionFromAnyView(\'' + escA(session.id) + '\')" title="' + escA(session.title || 'Untitled') + '">' + escH(session.title || 'Untitled') + '</button>' +
+        '<button class="btn-icon chat-folder-chat-delete" title="Delete chat" onclick="event.stopPropagation(); chatDeleteSession(\'' + escA(session.id) + '\')" style="width:22px;height:22px"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>' +
+        '</span>';
+}
+
+function renderSidebarFolderSessionItem(session, extraClass = 'sidebar-folder-chat') {
+    const active = chatState.currentSessionId === session.id ? ' active' : '';
+    return '<div class="sidebar-folder-chat-row">' +
+        '<button class="' + extraClass + active + '" draggable="true" ondragstart="chatDragSession(event,\'' + escA(session.id) + '\')" onclick="sidebarOpenChat(\'' + escA(session.id) + '\')" title="' + escA(session.title || 'Untitled') + '">' + escH(session.title || 'Untitled') + '</button>' +
+        '<button class="btn-icon sidebar-folder-chat-delete" title="Delete chat" onclick="event.stopPropagation(); chatDeleteSession(\'' + escA(session.id) + '\')" style="width:20px;height:20px"><svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>' +
+        '</div>';
+}
+
+window.chatNewSession = function (folderId = '') {
     chatState.currentSessionId = null;
     chatState.localMessages = [];
-    chatState.pendingFiles = [];
-    chatRenderFileBar();
-    chatShowWelcome();
+    chatState.lastSubmission = null;
+    chatReplacePendingFiles([]);
+    chatState.selectedFolderId = folderId || chatState.selectedFolderId || '';
+    chatState.draftFolderId = folderId || chatState.selectedFolderId || '';
+    if (chatState.selectedFolderId) {
+        const folder = chatFindFolder(chatState.selectedFolderId);
+        chatApplySessionMetadata({
+            folder_id: folder ? folder.id : chatState.selectedFolderId,
+            folder_title: folder ? folder.title : chatState.currentFolderTitle,
+            folder_workspace_roots: folder ? (folder.workspace_roots || []) : [],
+            folder_source_docs: folder ? (folder.source_docs || []) : [],
+            workspace_roots: folder ? (folder.workspace_roots || []) : [],
+            source_docs: folder ? (folder.source_docs || []) : [],
+        });
+        if (folder) chatRenderFolderOverview(folder);
+        else chatShowWelcome();
+    } else {
+        chatApplySessionMetadata(null);
+        chatShowWelcome();
+    }
     chatLoadHistory();
     const input = document.getElementById('chat-input');
     if (input) { input.value = ''; input.focus(); }
     toast('New session', 'info', 1500);
 };
 
+async function chatEnsureSessionRecord() {
+    if (chatState.currentSessionId) return chatState.currentSessionId;
+    const resp = await api('POST', '/api/chat/sessions', {
+        folder_id: chatState.draftFolderId || chatState.selectedFolderId || '',
+    });
+    chatState.currentSessionId = resp.session_id;
+    chatState.localMessages = [];
+    chatApplySessionMetadata(resp.session || null);
+    chatLoadHistory();
+    return chatState.currentSessionId;
+}
+
+window.chatCreateFolderPrompt = function () {
+    showModal(
+        'New Folder',
+        '<p class="text-sm text-secondary mb-16">Create a folder to group related chats and shared sources.</p>' +
+        '<div class="form-group"><label class="form-label">Folder name</label>' + inputH('chat-folder-title', '', 'text', 'Example: Hermes audit') + '</div>',
+        '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="chatCreateFolder()">Create</button>'
+    );
+    const input = document.getElementById('chat-folder-title');
+    if (input) {
+        input.focus();
+        input.addEventListener('keydown', function (event) {
+            if (event.key !== 'Enter') return;
+            event.preventDefault();
+            chatCreateFolder();
+        });
+    }
+};
+
+window.chatCreateFolder = async function () {
+    const title = document.getElementById('chat-folder-title').value.trim();
+    if (!title) {
+        toast('Folder name is required', 'warning');
+        return;
+    }
+    try {
+        const resp = await api('POST', '/api/chat/folders', { title });
+        closeModal();
+        setSidebarFoldersExpanded(true);
+        await chatLoadHistory();
+        renderSidebarFoldersTree();
+        chatShowFolderOverview(resp.folder.id);
+        toast('Folder created', 'success', 1500);
+    } catch (e) {
+        toast(e.message || 'Failed to create folder', 'error');
+    }
+};
+
+window.chatOpenFolderEditor = async function (folderId = '') {
+    const folder = chatFindFolder(folderId || chatState.selectedFolderId || chatState.currentFolderId || '');
+    if (!folder) {
+        toast('Select a folder first', 'warning');
+        return;
+    }
+    showModal(
+        'Edit Folder',
+        '<p class="text-sm text-secondary mb-16">Rename the folder and choose which shared sources should stay attached to it.</p>' +
+        '<div class="form-group"><label class="form-label">Folder name</label>' + inputH('chat-folder-edit-title', folder.title || '', 'text', 'Folder name') + '</div>' +
+        '<div class="form-group"><label class="form-label">Current sources</label>' +
+        ((folder.source_docs || []).length
+            ? '<div class="chat-modal-chip-list">' + folder.source_docs.map(doc =>
+                '<label class="chat-modal-source-row"><input type="checkbox" value="' + escA(doc) + '" checked> <span title="' + escA(doc) + '">' + escH(chatSourceLabel(doc)) + '</span></label>'
+            ).join('') + '</div>'
+            : '<div class="text-sm text-secondary">No sources yet.</div>') +
+        '</div>',
+        '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn" onclick="closeModal(); chatOpenFolderAddMenu(\'' + escA(folder.id) + '\')">Add To Folder</button><button class="btn btn-danger" onclick="closeModal(); chatConfirmDeleteFolder(\'' + escA(folder.id) + '\')">Delete Folder</button><button class="btn btn-primary" onclick="chatSaveFolder(\'' + escA(folder.id) + '\')">Save</button>'
+    );
+};
+
+window.chatSaveFolder = async function (folderId) {
+    const selected = Array.from(document.querySelectorAll('.chat-modal-source-row input:checked')).map(input => input.value);
+    const payload = {
+        title: document.getElementById('chat-folder-edit-title').value.trim(),
+        source_docs: Array.from(new Set(selected)),
+    };
+    try {
+        await api('PUT', '/api/chat/folders/' + folderId, payload);
+        closeModal();
+        await chatLoadHistory();
+        renderSidebarFoldersTree();
+        if ((chatState.selectedFolderId || chatState.currentFolderId) === folderId) {
+            chatShowFolderOverview(folderId);
+        }
+        toast('Folder updated', 'success', 1500);
+    } catch (e) {
+        toast(e.message || 'Failed to save folder', 'error');
+    }
+};
+
+window.chatConfirmDeleteFolder = function (folderId = '') {
+    const folder = chatFindFolder(folderId || chatState.selectedFolderId || chatState.currentFolderId || '');
+    if (!folder) {
+        toast('Select a folder first', 'warning');
+        return;
+    }
+    const chatCount = (folder.sessions || []).length || folder.chat_count || 0;
+    const sourceCount = (folder.source_docs || []).length;
+    showModal(
+        'Delete Folder',
+        '<p class="text-sm text-secondary mb-16">Delete <strong>' + escH(folder.title || 'this folder') + '</strong>?</p>' +
+        '<p class="text-sm text-secondary mb-16">' +
+        (chatCount
+            ? 'Chats in this folder will be moved back to Ungrouped. The chats themselves will not be deleted.'
+            : 'This will remove the folder and its shared folder-level context.') +
+        '</p>' +
+        (sourceCount
+            ? '<p class="text-xs text-secondary">Shared source references will be removed from the folder, but the underlying files will stay on disk.</p>'
+            : ''),
+        '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-danger" onclick="chatDeleteFolder(\'' + escA(folder.id) + '\')">Delete Folder</button>'
+    );
+};
+
+window.chatDeleteFolder = async function (folderId = '') {
+    const folder = chatFindFolder(folderId || chatState.selectedFolderId || chatState.currentFolderId || '');
+    if (!folder) {
+        toast('Folder not found', 'warning');
+        return;
+    }
+    const activeScreen = document.querySelector('.nav-item.active')?.dataset.screen || 'chat';
+    const currentSessionId = chatState.currentSessionId || '';
+    const currentChatInFolder = !!currentSessionId && chatState.currentFolderId === folder.id;
+    try {
+        const resp = await api('DELETE', '/api/chat/folders/' + encodeURIComponent(folder.id));
+        closeModal();
+        chatState.folders = (chatState.folders || []).filter(item => item.id !== folder.id);
+        if (chatState.selectedFolderId === folder.id) chatState.selectedFolderId = '';
+        if (chatState.draftFolderId === folder.id) chatState.draftFolderId = '';
+        if (chatState.currentFolderId === folder.id) {
+            chatState.currentFolderId = '';
+            chatState.currentFolderTitle = '';
+            chatState.currentFolderWorkspaceRoots = [];
+            chatState.currentFolderSourceDocs = [];
+        }
+        renderSidebarFoldersTree();
+        if (currentChatInFolder && currentSessionId) {
+            chatState.selectedFolderId = '';
+            chatState.draftFolderId = '';
+            await chatLoadSession(currentSessionId);
+        } else if (activeScreen === 'folders') {
+            await Screens.folders();
+        } else {
+            chatGoHome();
+        }
+        toast(
+            (resp.moved_session_count || 0)
+                ? 'Folder deleted. Chats moved to Ungrouped.'
+                : 'Folder deleted.',
+            'success',
+            2000,
+        );
+    } catch (e) {
+        toast(e.message || 'Failed to delete folder', 'error');
+    }
+};
+
+window.chatAddFolderSources = function (folderId = '') {
+    const targetFolderId = folderId || chatState.selectedFolderId || chatState.currentFolderId || '';
+    if (!targetFolderId) {
+        toast('Create or select a folder first', 'warning');
+        return;
+    }
+    const input = document.getElementById('global-folder-source-input') || document.getElementById('chat-folder-source-input');
+    if (!input) return;
+    input.dataset.folderId = targetFolderId;
+    input.value = '';
+    input.click();
+};
+
+window.chatHandleFolderSources = async function (event) {
+    const input = event.target;
+    const folderId = input.dataset.folderId || '';
+    const files = Array.from(input.files || []);
+    if (!folderId || files.length === 0) return;
+    try {
+        const uploads = [];
+        for (const file of files) {
+            const form = new FormData();
+            form.append('file', file);
+            const resp = await authFetch('/api/upload', { method: 'POST', body: form });
+            const body = await resp.json();
+            if (!resp.ok) throw new Error(body.error || 'Upload failed');
+            uploads.push(body.stored_as);
+        }
+        await api('PUT', '/api/chat/folders/' + folderId, { source_uploads: uploads });
+        closeModal();
+        await chatLoadHistory();
+        renderSidebarFoldersTree();
+        if ((chatState.selectedFolderId || chatState.currentFolderId) === folderId) {
+            chatShowFolderOverview(folderId);
+        }
+        toast('Sources added', 'success', 1500);
+    } catch (e) {
+        toast(e.message || 'Failed to add sources', 'error');
+    } finally {
+        input.value = '';
+    }
+};
+
+window.chatUseCurrentChatAsSource = async function (folderId = '') {
+    const targetFolderId = folderId || chatState.currentFolderId || '';
+    if (!targetFolderId || !chatState.currentSessionId) {
+        toast('Open a chat in a folder first', 'warning');
+        return;
+    }
+    try {
+        await api('POST', '/api/chat/folders/' + targetFolderId + '/sources/from-chat', { session_id: chatState.currentSessionId });
+        await chatLoadHistory();
+        renderSidebarFoldersTree();
+        chatRenderContextPanel();
+        toast('Chat added as a source', 'success', 1500);
+    } catch (e) {
+        toast(e.message || 'Failed to add chat as source', 'error');
+    }
+};
+
 window.chatClearCurrent = function () {
     if (!chatState.currentSessionId) return;
     chatState.isThinking = true;
-    api('POST', '/api/chat/sessions/' + chatState.currentSessionId + '/clear').then(() => {
+    api('POST', '/api/chat/sessions/' + chatState.currentSessionId + '/clear').then((resp) => {
         chatState.localMessages = [];
+        chatState.lastSubmission = null;
+        chatApplySessionMetadata(resp.session || null);
         chatRenderMessages();
         chatLoadHistory();
+        chatState.isThinking = false;
         toast('Chat cleared', 'info', 1500);
+        const input = document.getElementById('chat-input');
+        if (input) input.focus();
     }).catch(e => { chatState.isThinking = false; toast('Error: ' + e.message, 'error'); });
 };
 
@@ -1533,15 +2713,22 @@ window.chatQuick = function (text) {
 
 // ── ABORT ─────────────────────────────────────────────────
 window.chatAbort = async function () {
-    if (!chatState.currentRequestId || !chatState.chatAbortController) return;
+    if (!chatState.currentRequestId || !chatState.currentRequestCancelSupported || chatState.cancelRequested) return;
+    const requestId = chatState.currentRequestId;
+    const controller = chatState.chatAbortController;
+    chatState.cancelRequested = true;
     try {
-        const resp = await api('POST', '/api/chat/cancel', { request_id: chatState.currentRequestId });
+        const resp = await api('POST', '/api/chat/cancel', { request_id: requestId });
         if (!resp.cancelled) {
+            chatState.cancelRequested = false;
             toast(resp.detail || 'Unable to cancel request', 'warning');
             return;
         }
-        chatState.chatAbortController.abort();
+        if (controller && !controller.signal.aborted) {
+            controller.abort();
+        }
     } catch (e) {
+        chatState.cancelRequested = false;
         toast('Unable to cancel request: ' + e.message, 'warning');
     }
 };
@@ -1549,8 +2736,8 @@ window.chatAbort = async function () {
 // ── REGENERATE ─────────────────────────────────────────────
 window.chatRegenerate = async function () {
     if (chatState.isThinking) return;
-    const last = chatState.lastUserMessage;
-    if (!last) { toast('Nothing to regenerate', 'warning'); return; }
+    const last = chatState.lastSubmission;
+    if (!last || (!last.message && !(last.files || []).length)) { toast('Nothing to regenerate', 'warning'); return; }
     // Clear last assistant response
     const container = document.getElementById('chat-messages');
     if (container) {
@@ -1560,7 +2747,11 @@ window.chatRegenerate = async function () {
     chatState.localMessages.pop();
     // Re-send
     const input = document.getElementById('chat-input');
-    if (input) { input.value = last; }
+    if (input) {
+        input.value = last.message || '';
+        chatAutoResize(input);
+    }
+    chatReplacePendingFiles(last.files || []);
     await chatSend();
 };
 
@@ -1575,10 +2766,13 @@ window.chatSend = async function () {
     if (welcome) welcome.remove();
 
     chatState.isThinking = true;
-
-    // Store for regeneration
-    chatState.lastUserMessage = message;
-    chatState.lastUserFiles = chatState.pendingFiles.map(f => f.stored_as);
+    chatState.currentRequestCancelSupported = chatExpectedCancelSupport();
+    chatState.cancelRequested = false;
+    const pendingUploads = chatState.pendingFiles.map(chatClonePendingFile);
+    chatState.lastSubmission = {
+        message,
+        files: pendingUploads.map(f => ({ ...f, preview_url: null })),
+    };
 
     // Show thinking indicator
     const existing = document.getElementById('chat-thinking-dots');
@@ -1587,26 +2781,28 @@ window.chatSend = async function () {
     const dots = document.createElement('div');
     dots.id = 'chat-thinking-dots';
     dots.className = 'chat-thinking';
-    dots.innerHTML = '<div class="chat-thinking-bubble"><span class="chat-thinking-icon"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></span><span class="chat-thinking-text">Hermes is thinking<span class="chat-thinking-ellipsis"></span></span><button class="chat-stop-btn" id="chat-stop-btn" onclick="chatAbort()" title="Stop"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button></div>';
+    dots.innerHTML = '<div class="chat-thinking-bubble"><span class="chat-thinking-icon"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></span><span class="chat-thinking-text">Hermes is thinking<span class="chat-thinking-ellipsis"></span></span>' + (chatState.currentRequestCancelSupported ? '<button class="chat-stop-btn" id="chat-stop-btn" onclick="chatAbort()" title="Stop"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>' : '') + '</div>';
     if (msgs) msgs.appendChild(dots);
 
     // Swap send button to stop
     const sendBtn = document.getElementById('chat-send-btn');
-    if (sendBtn) {
+    if (sendBtn && chatState.currentRequestCancelSupported) {
         sendBtn.classList.add('chat-stop-state');
         sendBtn.onclick = chatAbort;
         const svg = sendBtn.querySelector('svg');
         if (svg) svg.innerHTML = '<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>';
+    } else if (sendBtn) {
+        sendBtn.disabled = true;
     }
 
-    const files = chatState.pendingFiles.map(f => f.name);
+    const files = pendingUploads.map(f => f.name);
     // Optimistically add user message to local
     const userMsg = { role: 'user', content: message, files, timestamp: new Date().toISOString() };
     chatState.localMessages.push(userMsg);
     chatAppendMsg('user', message, files);
     input.value = '';
     chatAutoResize(input);
-    document.getElementById('chat-send-btn').disabled = true;
+    document.getElementById('chat-send-btn').disabled = !chatState.currentRequestCancelSupported;
 
     // AbortController for cancellation
     const controller = new AbortController();
@@ -1616,18 +2812,22 @@ window.chatSend = async function () {
     try {
         const resp = await api('POST', '/api/chat', {
             message, session_id: chatState.currentSessionId,
+            folder_id: chatState.currentSessionId ? '' : (chatState.draftFolderId || chatState.selectedFolderId || ''),
             request_id: chatState.currentRequestId,
-            files: chatState.pendingFiles.map(f => f.stored_as),
+            files: pendingUploads.map(f => ({ stored_as: f.stored_as, name: f.name })),
         }, controller.signal);
         chatState.currentSessionId = resp.session_id;
+        chatApplySessionMetadata(resp.session || null);
         const assistantMsg = { role: 'assistant', content: resp.response, timestamp: new Date().toISOString() };
         chatState.localMessages.push(assistantMsg);
         chatAppendMsg('assistant', resp.response);
     } catch (e) {
-        // Restore send button if stopped
-        if (e.name === 'AbortError') {
-            const dotsEl = document.getElementById('chat-thinking-dots');
-            if (dotsEl) dotsEl.remove();
+        input.value = message;
+        chatAutoResize(input);
+        chatRenderFileBar();
+        chatSyncSendButton();
+
+        if (e.name === 'AbortError' || chatState.cancelRequested) {
             chatState.localMessages.pop();
             const container = document.getElementById('chat-messages');
             if (container) {
@@ -1635,25 +2835,14 @@ window.chatSend = async function () {
                 const last = uls[uls.length - 1];
                 if (last) last.remove();
             }
-            chatState.isThinking = false;
-            const sb = document.getElementById('chat-send-btn');
-            if (sb) {
-                sb.classList.remove('chat-stop-state');
-                sb.onclick = chatSend;
-                sb.disabled = false;
-                const svg = sb.querySelector('svg');
-                if (svg) svg.innerHTML = '<path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>';
-            }
-            chatState.currentRequestId = null;
-            chatState.chatAbortController = null;
+            chatResetComposerAfterRequest();
+            chatLoadHistory();
+            toast('Request cancelled', 'info', 2000);
             input.focus();
             return;
         }
         // Roll back the optimistic user message — it was never processed
         chatState.localMessages.pop(); // remove failed user msg from state
-        // Remove thinking dots first (they were appended last in the DOM)
-        const dots = document.getElementById('chat-thinking-dots');
-        if (dots) dots.remove();
         // Now find and remove the user bubble (always the last .user in the container)
         const container = document.getElementById('chat-messages');
         if (container) {
@@ -1661,26 +2850,15 @@ window.chatSend = async function () {
             const lastUser = userBubbles[userBubbles.length - 1];
             if (lastUser) lastUser.remove();
         }
-        const errMsg = { role: 'assistant', content: 'Connection error: ' + e.message, timestamp: new Date().toISOString() };
-        chatState.localMessages.push(errMsg);
-        chatAppendMsg('assistant', 'Connection error: ' + e.message);
+        chatResetComposerAfterRequest();
+        chatLoadHistory();
+        toast(e.message || 'Request failed', 'error', 5000);
+        input.focus();
+        return;
     }
 
-    chatClearFiles();
-    chatState.isThinking = false;
-    chatState.currentRequestId = null;
-    chatState.chatAbortController = null;
-    const dotsEl = document.getElementById('chat-thinking-dots');
-    if (dotsEl) dotsEl.remove();
-    // Reset send button
-    const sb = document.getElementById('chat-send-btn');
-    if (sb) {
-        sb.classList.remove('chat-stop-state');
-        sb.onclick = chatSend;
-        sb.disabled = false;
-        const svg = sb.querySelector('svg');
-        if (svg) svg.innerHTML = '<path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>';
-    }
+    chatReplacePendingFiles([]);
+    chatResetComposerAfterRequest();
     input.focus();
     // Refresh history to update title and order
     chatLoadHistory();
@@ -1786,15 +2964,13 @@ function chatRenderMd(text) {
     h = h.replace(/^## (.+)$/gm, '<h2>$1</h2>');
     h = h.replace(/^# (.+)$/gm, '<h1>$1</h1>');
 
-    // 2. Unordered lists -> <ul>.
-    h = h.replace(/^[-*] (.+)$/gm, '<li>$1</li>');
-    h = h.replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>');
+    // 2. Preserve list numbering/bullets instead of collapsing values like "269."
+    h = h.replace(/^[-*] (.+)$/gm, '<li data-list="ul">$1</li>');
+    h = h.replace(/((?:<li data-list="ul">.*?<\/li>\n*)+)/g, '<ul>$1</ul>');
 
-    // 3. Ordered lists -> <ol> (separate from unordered to avoid cross-contamination).
-    h = h.replace(/^(\d+)\. (.+)$/gm, '<li>$2</li>');
-    h = h.replace(/(<li>.*<\/li>\n?)+/g, function(match) {
-        return '<ol>' + match + '</ol>';
-    });
+    // 3. Ordered lists -> <ol>, preserving explicit numeric values.
+    h = h.replace(/^(\d+)\. (.+)$/gm, '<li data-list="ol" value="$1">$2</li>');
+    h = h.replace(/((?:<li data-list="ol"(?: value="[^"]+")?>.*?<\/li>\n*)+)/g, '<ol>$1</ol>');
 
     // 4. Consecutive blockquote lines -> single <blockquote> block.
     h = h.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
@@ -1841,25 +3017,30 @@ window.chatAutoResize = function (el) {
 async function chatUploadFile(file) {
     const unsupportedReason = chatDescribeUnsupportedFile(file);
     if (unsupportedReason) {
+        if ((file.type || '').toLowerCase().startsWith('image/') && !chatState.capabilities.imageAttachments) {
+            chatOpenVisionSetup(file.name || 'This image');
+            return;
+        }
         toast(unsupportedReason, 'warning', 5000);
         return;
     }
     const fd = new FormData();
     fd.append('file', file);
     try {
-        const resp = await fetch('/api/upload', {
+        const resp = await authFetch('/api/upload', {
             method: 'POST',
-            headers: { 'Authorization': 'Bearer ' + getToken() },
             body: fd,
         });
         if (resp.ok) {
             const data = await resp.json();
+            data.preview_url = (file.type || '').toLowerCase().startsWith('image/') ? URL.createObjectURL(file) : null;
             chatState.pendingFiles.push(data);
             chatRenderFileBar();
             document.getElementById('chat-send-btn').disabled = false;
         } else {
             const err = await resp.json();
-            toast('Upload failed: ' + err.error, 'error');
+            const detail = Array.isArray(err.details) ? ' ' + err.details.join(' ') : '';
+            toast('Upload failed: ' + (err.error || 'Request failed') + detail, 'error');
         }
     } catch (e) { toast('Upload error: ' + e.message, 'error'); }
 }
@@ -1876,7 +3057,11 @@ function chatRenderFileBar() {
     if (chatState.pendingFiles.length === 0) { bar.classList.add('hidden'); return; }
     bar.classList.remove('hidden');
     previews.innerHTML = chatState.pendingFiles.map((f, i) =>
-        '<div class="chat-file-item"><span>' + chatFileIcon(f.type) + '</span><span>' + escH(f.name) + '</span><span style="color:var(--text-muted);font-size:11px">' + chatFmtSize(f.size) + '</span><button class="remove-file" onclick="chatRemoveFile(' + i + ')">\u2715</button></div>'
+        '<div class="chat-file-item">' +
+        ((f.preview_url && (f.type || '').toLowerCase().startsWith('image/'))
+            ? '<img class="chat-file-thumb" src="' + escA(f.preview_url) + '" alt="' + escA(f.name) + '">' :
+            '<span>' + chatFileIcon(f.type) + '</span>') +
+        '<span>' + escH(f.name) + '</span><span style="color:var(--text-muted);font-size:11px">' + chatFmtSize(f.size) + '</span><button class="remove-file" onclick="chatRemoveFile(' + i + ')">\u2715</button></div>'
     ).join('');
 }
 
@@ -1891,14 +3076,13 @@ function chatSyncSendButton() {
 }
 
 window.chatRemoveFile = function (i) {
+    chatReleasePendingFile(chatState.pendingFiles[i]);
     chatState.pendingFiles.splice(i, 1);
     chatRenderFileBar();
     chatSyncSendButton();
 };
 window.chatClearFiles = function () {
-    chatState.pendingFiles = [];
-    chatRenderFileBar();
-    chatSyncSendButton();
+    chatReplacePendingFiles([]);
 };
 
 // ── VOICE (continuous mode) ───────────────────────────────
@@ -1978,7 +3162,15 @@ document.addEventListener('DOMContentLoaded', () => {
     ThemeManager.init();
 
     document.querySelectorAll('.nav-item').forEach(item => {
-        item.addEventListener('click', () => navigate(item.dataset.screen));
+        item.addEventListener('click', () => {
+            if (item.dataset.screen === 'folders') {
+                const wasActive = item.classList.contains('active');
+                navigate('folders');
+                toggleSidebarFolders(wasActive ? !sidebarFoldersExpanded() : true);
+                return;
+            }
+            navigate(item.dataset.screen);
+        });
     });
 
     document.getElementById('modal-close').addEventListener('click', closeModal);
@@ -1999,6 +3191,7 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('sidebar-collapse').addEventListener('click', () => {
         document.getElementById('sidebar').classList.toggle('collapsed');
         document.getElementById('main-wrapper').classList.toggle('sidebar-collapsed');
+        renderSidebarFoldersTree();
     });
 
     document.getElementById('btn-reload-config').addEventListener('click', reloadConfig);
@@ -2014,6 +3207,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const hash = window.location.hash.replace('#', '');
     const direct = params.get('go') || hash || '';
     navigate(direct && Screens[direct] ? direct : 'chat');
+    renderSidebarFoldersTree();
     // Listen for hash changes
     window.addEventListener('hashchange', () => {
         const h = window.location.hash.replace('#', '');

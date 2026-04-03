@@ -19,6 +19,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from functools import wraps
+from contextlib import contextmanager
 
 import yaml
 from dotenv import dotenv_values, load_dotenv, set_key, unset_key
@@ -56,6 +57,40 @@ def _load_runtime_env() -> Path:
 
 REPO_ENV_PATH = _load_runtime_env()
 
+
+def _repo_env_values() -> dict:
+    if REPO_ENV_PATH.exists():
+        return {
+            key: value for key, value in dotenv_values(str(REPO_ENV_PATH)).items()
+            if value is not None
+        }
+    return {}
+
+
+def _hermes_env_values() -> dict:
+    if ENV_PATH.exists():
+        return {
+            key: value for key, value in dotenv_values(str(ENV_PATH)).items()
+            if value is not None
+        }
+    return {}
+
+
+def _runtime_env_value(key: str, default: str = "", allow_repo_env: bool = True) -> str:
+    value = os.environ.get(key)
+    if value not in (None, ""):
+        return value
+    if allow_repo_env:
+        repo_value = _repo_env_values().get(key)
+        if repo_value not in (None, ""):
+            return str(repo_value)
+    hermes_env_path = globals().get("ENV_PATH")
+    if hermes_env_path:
+        hermes_value = _hermes_env_values().get(key)
+        if hermes_value not in (None, ""):
+            return str(hermes_value)
+    return default
+
 HERMES_HOME = Path.home() / ".hermes"
 CONFIG_PATH = HERMES_HOME / "config.yaml"
 ENV_PATH = HERMES_HOME / ".env"
@@ -83,49 +118,622 @@ UPLOADS_DIR = Path.home() / "hermes-web-ui" / "uploads"
 UPLOAD_FOLDER = APP_ROOT / "uploads"
 UPLOAD_FOLDER.mkdir(exist_ok=True)
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB
-HERMES_API_URL = os.environ.get("HERMES_API_URL", "http://127.0.0.1:8642")
+HERMES_API_URL = _runtime_env_value("HERMES_API_URL", "http://127.0.0.1:8642")
 BACKUP_DIR = HERMES_HOME / "backups"
 
 # Chat session storage (persisted to disk)
 CHAT_DATA_DIR = APP_ROOT / "chat_data"
 CHAT_DATA_DIR.mkdir(exist_ok=True)
+CHAT_DATA_LOCK = CHAT_DATA_DIR / ".lock"
+CHAT_FOLDERS_PATH = CHAT_DATA_DIR / ".folders.json"
 CHAT_REQUEST_DIR = APP_ROOT / "run" / "chat_requests"
 CHAT_REQUEST_DIR.mkdir(parents=True, exist_ok=True)
-CHAT_REQUEST_TIMEOUT = int(os.environ.get("HERMES_CHAT_TIMEOUT", "300"))
+CHAT_REQUEST_TIMEOUT = int(_runtime_env_value("HERMES_CHAT_TIMEOUT", "300"))
 CHAT_CANCEL_POLL_INTERVAL = 0.25
 CHAT_CANCEL_GRACE_SECONDS = 5.0
+CHAT_CONTEXT_SOURCE_DOC_LIMIT = 64 * 1024
+CHAT_CONTEXT_SOURCE_DOC_TOTAL_LIMIT = 128 * 1024
+CHAT_FOLDER_SOURCE_DIR = CHAT_DATA_DIR / "sources"
+CHAT_FOLDER_SOURCE_DIR.mkdir(exist_ok=True)
+CRON_JOBS_PATH = APP_ROOT / "run" / "cron_jobs.json"
+CRON_JOB_MARKER = "hermes-web-ui-job"
 
 chat_sessions: dict = {}  # runtime cache: sid -> session dict
+chat_folders: dict = {}  # runtime cache: folder_id -> folder dict
+
+CHAT_TRANSPORT_CLI = "cli"
+CHAT_TRANSPORT_API = "api"
+CHAT_CONTINUITY_HERMES = "hermes_resume"
+CHAT_CONTINUITY_LOCAL = "local_replay"
+CHAT_CONTINUITY_LIMITED = "cli_without_resume"
+
+
+@contextmanager
+def _chat_data_lock(shared: bool = False):
+    """Serialize chat session file access across gunicorn workers."""
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    CHAT_DATA_LOCK.touch(exist_ok=True)
+    with CHAT_DATA_LOCK.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _chat_session_path(session_id: str) -> Path:
+    return CHAT_DATA_DIR / f"{secure_filename(session_id)}.json"
+
+
+def _normalize_chat_session(session: dict) -> dict:
+    transport_mode = session.get("transport_mode")
+    continuity_mode = session.get("continuity_mode")
+    if transport_mode == CHAT_TRANSPORT_CLI and not continuity_mode:
+        continuity_mode = CHAT_CONTINUITY_HERMES if session.get("hermes_session_id") else CHAT_CONTINUITY_LIMITED
+    elif transport_mode == CHAT_TRANSPORT_API and not continuity_mode:
+        continuity_mode = CHAT_CONTINUITY_LOCAL
+    folder_id = session.get("folder_id")
+    if not isinstance(folder_id, str):
+        folder_id = ""
+    session.setdefault("transport_mode", transport_mode)
+    session.setdefault("continuity_mode", continuity_mode)
+    session.setdefault("transport_notice", "")
+    session["folder_id"] = folder_id.strip()
+    session["workspace_roots"] = _clean_string_list(session.get("workspace_roots"))
+    session["source_docs"] = _clean_string_list(session.get("source_docs"))
+    return session
+
+
+def _clean_string_list(values) -> list[str]:
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, list):
+        return []
+    cleaned = []
+    seen = set()
+    for item in values:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        cleaned.append(text)
+    return cleaned
+
+
+def _normalize_context_path(raw_path: str) -> Path:
+    path = Path(str(raw_path).strip()).expanduser()
+    if not path.is_absolute():
+        path = (APP_ROOT / path)
+    try:
+        return path.resolve(strict=False)
+    except Exception:
+        return path.absolute()
+
+
+def _validated_context_paths(values, *, expect: str) -> tuple[list[str], list[str]]:
+    normalized = []
+    errors = []
+    seen = set()
+    for raw_value in _clean_string_list(values):
+        path = _normalize_context_path(raw_value)
+        path_str = str(path)
+        if path_str in seen:
+            continue
+        if not path.exists():
+            errors.append(f"{raw_value} does not exist")
+            continue
+        if expect == "dir" and not path.is_dir():
+            errors.append(f"{raw_value} is not a directory")
+            continue
+        if expect == "file" and not path.is_file():
+            errors.append(f"{raw_value} is not a file")
+            continue
+        seen.add(path_str)
+        normalized.append(path_str)
+    return normalized, errors
+
+
+def _parse_chat_context_update(data: dict) -> tuple[dict, list[str]]:
+    folder_id = str(data.get("folder_id") or "").strip()
+    if len(folder_id) > 120:
+        folder_id = folder_id[:120].rstrip()
+    workspace_roots, root_errors = _validated_context_paths(data.get("workspace_roots"), expect="dir")
+    source_docs, doc_errors = _validated_context_paths(data.get("source_docs"), expect="file")
+    errors = root_errors + doc_errors
+    return {
+        "folder_id": folder_id,
+        "workspace_roots": workspace_roots,
+        "source_docs": source_docs,
+    }, errors
+
+
+def _merge_unique_strings(*groups) -> list[str]:
+    merged = []
+    seen = set()
+    for group in groups:
+        for item in _clean_string_list(group):
+            if item in seen:
+                continue
+            seen.add(item)
+            merged.append(item)
+    return merged
+
+
+def _folder_workspace_roots_for_docs(source_docs) -> list[str]:
+    roots = []
+    seen = set()
+    for source_doc in _clean_string_list(source_docs):
+        path = _normalize_context_path(source_doc)
+        parent = str(path.parent)
+        if parent in seen:
+            continue
+        seen.add(parent)
+        roots.append(parent)
+    return roots
+
+
+def _parse_folder_update(data: dict, existing: dict | None = None) -> tuple[dict, list[str]]:
+    existing = existing or {}
+    title = str(data.get("title") if "title" in data else existing.get("title") or "").strip()
+    if not title:
+        title = "Untitled Folder"
+    if len(title) > 120:
+        title = title[:120].rstrip()
+
+    source_values = data.get("source_docs") if "source_docs" in data else existing.get("source_docs", [])
+    source_docs, doc_errors = _validated_context_paths(source_values, expect="file")
+    upload_refs = data.get("source_uploads") or []
+    for upload_ref in _clean_string_list(upload_refs):
+        upload_path = UPLOAD_FOLDER / upload_ref
+        if not upload_path.exists() or not upload_path.is_file():
+            doc_errors.append(f"{upload_ref} is not an uploaded source file")
+            continue
+        source_docs.append(str(upload_path.resolve()))
+    source_docs = _merge_unique_strings(source_docs)
+
+    workspace_values = data.get("workspace_roots") if "workspace_roots" in data else existing.get("workspace_roots", [])
+    workspace_roots, root_errors = _validated_context_paths(workspace_values, expect="dir")
+    workspace_roots = _merge_unique_strings(workspace_roots, _folder_workspace_roots_for_docs(source_docs))
+    return {
+        "title": title,
+        "source_docs": source_docs,
+        "workspace_roots": workspace_roots,
+    }, doc_errors + root_errors
+
+
+def _folder_title_key(title: str) -> str:
+    return str(title or "").strip().casefold()
+
+
+def _folders_matching_title(title: str, folders: dict | None = None) -> list[dict]:
+    folders = folders if folders is not None else _load_all_folders()
+    title_key = _folder_title_key(title)
+    if not title_key:
+        return []
+    matches = []
+    for folder in folders.values():
+        normalized = _normalize_chat_folder(folder)
+        if _folder_title_key(normalized.get("title")) == title_key:
+            matches.append(normalized)
+    matches.sort(key=lambda folder: (
+        folder.get("created") or "",
+        folder.get("id") or "",
+    ))
+    return matches
+
+
+def _unique_folder_for_title(title: str, folders: dict | None = None) -> dict | None:
+    matches = _folders_matching_title(title, folders=folders)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _folder_title_conflict(title: str, *, exclude_folder_id: str = "", folders: dict | None = None) -> dict | None:
+    folders = folders if folders is not None else _load_all_folders()
+    title_key = _folder_title_key(title)
+    if not title_key:
+        return None
+    exclude_folder_id = str(exclude_folder_id or "").strip()
+    for folder_id, folder in folders.items():
+        if folder_id == exclude_folder_id:
+            continue
+        normalized = _normalize_chat_folder(folder)
+        if _folder_title_key(normalized.get("title")) == title_key:
+            return normalized
+    return None
+
+
+def _legacy_folder_from_sessions(folder_id: str, sessions: dict) -> dict | None:
+    folder_id = str(folder_id or "").strip()
+    if not folder_id:
+        return None
+    grouped = [session for session in sessions.values() if (session.get("folder_id") or "").strip() == folder_id]
+    if not grouped:
+        return None
+    newest = max(grouped, key=lambda session: session.get("updated") or session.get("created") or "")
+    source_docs = _merge_unique_strings(*(session.get("source_docs") or [] for session in grouped))
+    workspace_roots = _merge_unique_strings(*(session.get("workspace_roots") or [] for session in grouped))
+    return _normalize_chat_folder({
+        "id": folder_id,
+        "title": folder_id,
+        "created": newest.get("created"),
+        "updated": newest.get("updated") or newest.get("created"),
+        "source_docs": source_docs,
+        "workspace_roots": workspace_roots,
+    })
+
+
+def _resolve_folder_reference(folder_id: str, sessions: dict | None = None, folders: dict | None = None, include_legacy: bool = True) -> dict | None:
+    folder_id = str(folder_id or "").strip()
+    if not folder_id:
+        return None
+    folders = folders if folders is not None else _load_all_folders()
+    direct = folders.get(folder_id)
+    if direct:
+        return _normalize_chat_folder(direct)
+    by_title = _unique_folder_for_title(folder_id, folders=folders)
+    if by_title:
+        return by_title
+    if not include_legacy:
+        return None
+    sessions = sessions if sessions is not None else _load_all_sessions()
+    return _legacy_folder_from_sessions(folder_id, sessions)
+
+
+def _folder_with_fallback(folder_id: str, sessions: dict | None = None) -> dict | None:
+    return _resolve_folder_reference(folder_id, sessions=sessions)
+
+
+def _ensure_folder_exists(folder_id: str) -> dict | None:
+    folder_id = str(folder_id or "").strip()
+    if not folder_id:
+        return None
+    existing = _folder_with_fallback(folder_id)
+    if existing:
+        return existing
+    now = datetime.now().isoformat()
+    return _write_folder({
+        "id": folder_id,
+        "title": folder_id,
+        "created": now,
+        "updated": now,
+        "workspace_roots": [],
+        "source_docs": [],
+    })
+
+
+def _folder_summaries(sessions: dict | None = None) -> list[dict]:
+    sessions = sessions if sessions is not None else _load_all_sessions()
+    folders = _load_all_folders()
+    folder_map = {folder_id: _normalize_chat_folder(folder) for folder_id, folder in folders.items()}
+    grouped_sessions: dict[str, list[dict]] = {folder_id: [] for folder_id in folder_map}
+    legacy_refs = set()
+
+    for session in sessions.values():
+        folder_ref = (session.get("folder_id") or "").strip()
+        if not folder_ref:
+            continue
+        resolved = _resolve_folder_reference(folder_ref, sessions=sessions, folders=folder_map, include_legacy=False)
+        if resolved and resolved["id"] in folder_map:
+            grouped_sessions.setdefault(resolved["id"], []).append(session)
+            continue
+        legacy_refs.add(folder_ref)
+
+    for folder_ref in sorted(legacy_refs, key=lambda value: value.casefold()):
+        legacy = _legacy_folder_from_sessions(folder_ref, sessions)
+        if legacy:
+            folder_map[folder_ref] = legacy
+            grouped_sessions[folder_ref] = [
+                session for session in sessions.values()
+                if (session.get("folder_id") or "").strip() == folder_ref
+            ]
+
+    summaries = []
+    for folder_id, folder in folder_map.items():
+        related_sessions = list(grouped_sessions.get(folder_id) or [])
+        related_sessions.sort(key=lambda session: session.get("updated") or session.get("created") or "", reverse=True)
+        summaries.append({
+            "id": folder["id"],
+            "title": folder["title"],
+            "created": folder["created"],
+            "updated": max([folder.get("updated")] + [s.get("updated") or s.get("created") for s in related_sessions if isinstance(s, dict)]),
+            "source_docs": folder.get("source_docs") or [],
+            "workspace_roots": folder.get("workspace_roots") or [],
+            "chat_count": len(related_sessions),
+            "sessions": [{
+                "id": s["id"],
+                "title": s.get("title", "Untitled"),
+                "message_count": len(s.get("messages", [])),
+                "updated": s.get("updated", s.get("created")),
+                "last_message": s["messages"][-1]["content"][:100] if s.get("messages") else "",
+            } for s in related_sessions],
+        })
+    summaries.sort(key=lambda folder: (
+        (folder.get("title") or "").casefold(),
+        folder.get("created") or "",
+        folder.get("id") or "",
+    ))
+    return summaries
+
+
+def _effective_session_context(session: dict) -> dict:
+    normalized = _normalize_chat_session(copy.deepcopy(session))
+    folder_ref = normalized.get("folder_id") or ""
+    folder = _folder_with_fallback(folder_ref) if folder_ref else None
+    folder_id = folder.get("id") if folder else folder_ref
+    folder_title = folder.get("title") if folder else ""
+    workspace_roots = _merge_unique_strings(
+        (folder or {}).get("workspace_roots"),
+        normalized.get("workspace_roots"),
+    )
+    source_docs = _merge_unique_strings(
+        (folder or {}).get("source_docs"),
+        normalized.get("source_docs"),
+    )
+    return {
+        "folder_id": folder_id,
+        "folder_title": folder_title or folder_id,
+        "folder_source_docs": (folder or {}).get("source_docs") or [],
+        "folder_workspace_roots": (folder or {}).get("workspace_roots") or [],
+        "workspace_roots": workspace_roots,
+        "source_docs": source_docs,
+    }
+
+
+def _session_from_file(path: Path):
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and data.get("id"):
+        return _normalize_chat_session(data)
+    raise ValueError(f"Invalid session payload in {path.name}")
 
 
 def _load_all_sessions():
     """Load all persisted chat sessions from disk into memory."""
+    loaded_sessions = {}
+    with _chat_data_lock(shared=True):
+        for f in sorted(CHAT_DATA_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            if f == CHAT_FOLDERS_PATH:
+                continue
+            try:
+                data = _session_from_file(f)
+                loaded_sessions[data["id"]] = data
+            except Exception as exc:
+                logger.warning("Failed to load session file %s: %s", f.name, exc)
     chat_sessions.clear()
-    for f in sorted(CHAT_DATA_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+    chat_sessions.update(loaded_sessions)
+    return copy.deepcopy(loaded_sessions)
+
+
+def _load_session(session_id):
+    """Load a single persisted session from disk into the runtime cache."""
+    path = _chat_session_path(session_id)
+    with _chat_data_lock(shared=True):
+        if not path.exists():
+            chat_sessions.pop(session_id, None)
+            return None
         try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-            chat_sessions[data["id"]] = data
+            data = _session_from_file(path)
         except Exception as exc:
-            logger.warning("Failed to load session file %s: %s", f.name, exc)
+            logger.warning("Failed to load session file %s: %s", path.name, exc)
+            chat_sessions.pop(session_id, None)
+            return None
+    chat_sessions[session_id] = data
+    return copy.deepcopy(data)
 
 
-def _save_session(session_id):
-    """Persist a single session to disk."""
-    if session_id in chat_sessions:
-        path = CHAT_DATA_DIR / f"{session_id}.json"
-        path.write_text(json.dumps(chat_sessions[session_id], ensure_ascii=False, indent=2), encoding="utf-8")
+def _write_session(session):
+    """Persist a single session atomically and refresh the runtime cache."""
+    session = _normalize_chat_session(session)
+    session_id = session["id"]
+    path = _chat_session_path(session_id)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    payload = json.dumps(session, ensure_ascii=False, indent=2)
+    with _chat_data_lock():
+        tmp_path.write_text(payload, encoding="utf-8")
+        os.replace(tmp_path, path)
+    chat_sessions[session_id] = copy.deepcopy(session)
 
 
 def _delete_session_from_disk(session_id):
     """Remove a session from memory and disk."""
     chat_sessions.pop(session_id, None)
-    path = CHAT_DATA_DIR / f"{session_id}.json"
-    if path.exists():
-        path.unlink()
+    path = _chat_session_path(session_id)
+    with _chat_data_lock():
+        if path.exists():
+            path.unlink()
+
+
+def _normalize_chat_folder(folder: dict) -> dict:
+    normalized = {
+        "id": str(folder.get("id") or "").strip(),
+        "title": str(folder.get("title") or "").strip() or "Untitled Folder",
+        "created": folder.get("created") or datetime.now().isoformat(),
+        "updated": folder.get("updated") or datetime.now().isoformat(),
+        "workspace_roots": _clean_string_list(folder.get("workspace_roots")),
+        "source_docs": _clean_string_list(folder.get("source_docs")),
+    }
+    return normalized
+
+
+def _folders_from_file() -> dict:
+    if not CHAT_FOLDERS_PATH.exists():
+        return {}
+    data = json.loads(CHAT_FOLDERS_PATH.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        return {}
+    folders = {}
+    for key, value in data.items():
+        if not isinstance(value, dict):
+            continue
+        value = dict(value)
+        value.setdefault("id", key)
+        normalized = _normalize_chat_folder(value)
+        if normalized["id"]:
+            folders[normalized["id"]] = normalized
+    return folders
+
+
+def _write_all_folders(folders: dict) -> dict:
+    serializable = {}
+    for folder_id, folder in (folders or {}).items():
+        normalized = _normalize_chat_folder(folder)
+        if normalized["id"]:
+            serializable[folder_id] = normalized
+    payload = json.dumps(serializable, ensure_ascii=False, indent=2)
+    tmp_path = CHAT_FOLDERS_PATH.with_suffix(CHAT_FOLDERS_PATH.suffix + ".tmp")
+    with _chat_data_lock():
+        tmp_path.write_text(payload, encoding="utf-8")
+        os.replace(tmp_path, CHAT_FOLDERS_PATH)
+    chat_folders.clear()
+    chat_folders.update(copy.deepcopy(serializable))
+    return copy.deepcopy(serializable)
+
+
+def _load_all_folders() -> dict:
+    with _chat_data_lock(shared=True):
+        folders = _folders_from_file()
+    chat_folders.clear()
+    chat_folders.update(copy.deepcopy(folders))
+    return copy.deepcopy(folders)
+
+
+def _load_folder(folder_id: str) -> dict | None:
+    folder_id = str(folder_id or "").strip()
+    if not folder_id:
+        return None
+    folders = _load_all_folders()
+    return folders.get(folder_id)
+
+
+def _write_folder(folder: dict) -> dict:
+    folder = _normalize_chat_folder(folder)
+    folders = _load_all_folders()
+    folders[folder["id"]] = folder
+    return _write_all_folders(folders)[folder["id"]]
+
+
+def _delete_folder(folder_id: str) -> None:
+    folder_id = str(folder_id or "").strip()
+    if not folder_id:
+        return
+    folders = _load_all_folders()
+    if folder_id in folders:
+        folders.pop(folder_id, None)
+        _write_all_folders(folders)
+
+
+def _crontab_available() -> bool:
+    return shutil.which("crontab") is not None
+
+
+def _load_cron_jobs() -> dict:
+    if not CRON_JOBS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(CRON_JOBS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    jobs = {}
+    for job_id, job in data.items():
+        if not isinstance(job, dict):
+            continue
+        jobs[job_id] = {
+            "id": str(job.get("id") or job_id).strip(),
+            "name": str(job.get("name") or "").strip() or "Cron Job",
+            "schedule": str(job.get("schedule") or "").strip(),
+            "command": str(job.get("command") or "").strip(),
+            "enabled": bool(job.get("enabled", True)),
+            "created": job.get("created") or datetime.now().isoformat(),
+            "updated": job.get("updated") or datetime.now().isoformat(),
+        }
+    return jobs
+
+
+def _write_cron_jobs(jobs: dict) -> dict:
+    payload = json.dumps(jobs or {}, ensure_ascii=False, indent=2)
+    tmp_path = CRON_JOBS_PATH.with_suffix(CRON_JOBS_PATH.suffix + ".tmp")
+    tmp_path.write_text(payload, encoding="utf-8")
+    os.replace(tmp_path, CRON_JOBS_PATH)
+    return copy.deepcopy(jobs)
+
+
+def _validate_cron_job_payload(data: dict) -> tuple[dict, list[str]]:
+    name = str(data.get("name") or "").strip() or "Cron Job"
+    schedule = str(data.get("schedule") or "").strip()
+    command = str(data.get("command") or "").strip()
+    enabled = bool(data.get("enabled", True))
+    errors = []
+    if len(schedule.split()) != 5:
+        errors.append("Cron schedule must have exactly five fields")
+    if not command:
+        errors.append("Command is required")
+    return {
+        "name": name[:120].rstrip(),
+        "schedule": schedule,
+        "command": command,
+        "enabled": enabled,
+    }, errors
+
+
+def _read_crontab_lines() -> list[str]:
+    if not _crontab_available():
+        raise ChatBackendError("crontab is not installed", status_code=501)
+    proc = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip().lower()
+        if "no crontab for" in stderr:
+            return []
+        raise ChatBackendError(proc.stderr.strip() or "Unable to read crontab", status_code=500)
+    return [line.rstrip("\n") for line in proc.stdout.splitlines()]
+
+
+def _write_crontab_lines(lines: list[str]) -> None:
+    if not _crontab_available():
+        raise ChatBackendError("crontab is not installed", status_code=501)
+    text = "\n".join(lines).rstrip()
+    if text:
+        text += "\n"
+    proc = subprocess.run(["crontab", "-"], input=text, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise ChatBackendError(proc.stderr.strip() or "Unable to update crontab", status_code=500)
+
+
+def _cron_job_line(job: dict) -> str:
+    return f'{job["schedule"]} {job["command"]} # {CRON_JOB_MARKER}:{job["id"]}'
+
+
+def _sync_cron_jobs_to_system(jobs: dict | None = None) -> None:
+    jobs = jobs if jobs is not None else _load_cron_jobs()
+    current_lines = _read_crontab_lines()
+    preserved = [line for line in current_lines if CRON_JOB_MARKER not in line]
+    managed = [_cron_job_line(job) for job in jobs.values() if job.get("enabled") and job.get("schedule") and job.get("command")]
+    _write_crontab_lines(preserved + managed)
 
 
 class ChatRequestCancelled(Exception):
     """Raised when an in-flight chat request is cancelled by the client."""
+
+
+class ChatBackendError(Exception):
+    """Raised when Hermes cannot produce a usable response for the request."""
+
+    def __init__(self, message: str, *, status_code: int = 502):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class ChatRequestTimeout(ChatBackendError):
+    """Raised when a chat request exceeds the configured timeout."""
+
+    def __init__(self, message: str):
+        super().__init__(message, status_code=504)
 
 
 def _request_control_path(request_id: str) -> Path:
@@ -150,11 +758,19 @@ def _write_request_control(request_id: str, payload: dict) -> None:
     tmp.replace(path)
 
 
-def _register_chat_request(request_id: str, session_id: str | None) -> None:
+def _register_chat_request(
+    request_id: str,
+    session_id: str | None,
+    *,
+    transport: str,
+    cancel_supported: bool,
+) -> None:
     _write_request_control(request_id, {
         "request_id": request_id,
         "session_id": session_id,
         "status": "running",
+        "transport": transport,
+        "cancel_supported": cancel_supported,
         "created_at": datetime.now().isoformat(),
         "updated_at": datetime.now().isoformat(),
         "pid": None,
@@ -211,6 +827,8 @@ def _cancel_chat_request(request_id: str) -> tuple[bool, str]:
     payload = _read_request_control(request_id)
     if payload is None:
         return False, "Request not found"
+    if not payload.get("cancel_supported", False):
+        return False, "This request is using the API/vision path and cannot be cancelled server-side"
     if payload.get("status") == "completed":
         return False, "Request already completed"
     if payload.get("status") == "cancelled":
@@ -249,6 +867,7 @@ def _cancel_chat_request(request_id: str) -> tuple[bool, str]:
 
 # Load sessions on startup
 _load_all_sessions()
+_load_all_folders()
 
 # ---------------------------------------------------------------------------
 # Flask app
@@ -271,13 +890,18 @@ CORS(app, resources={
 # ---------------------------------------------------------------------------
 # Authentication
 # ---------------------------------------------------------------------------
-HERMES_WEBUI_TOKEN = os.environ.get("HERMES_WEBUI_TOKEN")
+def _current_webui_token() -> str:
+    return _runtime_env_value("HERMES_WEBUI_TOKEN", "")
+
+
+HERMES_WEBUI_TOKEN = _current_webui_token()
 
 def require_token(f):
     """Decorator to require HERMES_WEBUI_TOKEN for API endpoints."""
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if not HERMES_WEBUI_TOKEN:
+        expected_token = _current_webui_token()
+        if not expected_token:
             logger.warning("Authentication not configured - rejecting API request")
             # Fail closed: if no token is configured, deny access
             return jsonify({"ok": False, "error": "API authentication not configured"}), 401
@@ -289,7 +913,7 @@ def require_token(f):
             return jsonify({"ok": False, "error": "Missing or invalid Authorization header"}), 401
         
         provided_token = auth_header[7:]  # Remove "Bearer " prefix
-        if provided_token != HERMES_WEBUI_TOKEN:
+        if provided_token != expected_token:
             logger.warning("API authentication failed - invalid token from %s", request.remote_addr)
             return jsonify({"ok": False, "error": "Invalid token"}), 401
         
@@ -1297,6 +1921,80 @@ def api_logs_get():
         return _http_error(str(exc))
 
 
+@app.route("/api/cron/jobs", methods=["GET"])
+@require_token
+def api_cron_jobs():
+    try:
+        if not _crontab_available():
+            return jsonify({"available": False, "jobs": [], "error": "crontab is not installed"}), 501
+        jobs = sorted(_load_cron_jobs().values(), key=lambda job: job.get("updated", ""), reverse=True)
+        return jsonify({"available": True, "jobs": jobs})
+    except ChatBackendError as exc:
+        return jsonify({"error": str(exc)}), exc.status_code
+
+
+@app.route("/api/cron/jobs", methods=["POST"])
+@require_token
+def api_cron_jobs_create():
+    try:
+        payload, errors = _validate_cron_job_payload(request.get_json() or {})
+        if errors:
+            return jsonify({"error": "Invalid cron job", "details": errors}), 400
+        jobs = _load_cron_jobs()
+        now = datetime.now().isoformat()
+        job_id = str(uuid.uuid4())[:8]
+        jobs[job_id] = {
+            "id": job_id,
+            "name": payload["name"],
+            "schedule": payload["schedule"],
+            "command": payload["command"],
+            "enabled": payload["enabled"],
+            "created": now,
+            "updated": now,
+        }
+        _write_cron_jobs(jobs)
+        _sync_cron_jobs_to_system(jobs)
+        return jsonify({"ok": True, "job": jobs[job_id]})
+    except ChatBackendError as exc:
+        return jsonify({"error": str(exc)}), exc.status_code
+
+
+@app.route("/api/cron/jobs/<job_id>", methods=["PUT"])
+@require_token
+def api_cron_job_update(job_id):
+    try:
+        jobs = _load_cron_jobs()
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Cron job not found"}), 404
+        payload, errors = _validate_cron_job_payload(request.get_json() or {})
+        if errors:
+            return jsonify({"error": "Invalid cron job", "details": errors}), 400
+        job.update(payload)
+        job["updated"] = datetime.now().isoformat()
+        jobs[job_id] = job
+        _write_cron_jobs(jobs)
+        _sync_cron_jobs_to_system(jobs)
+        return jsonify({"ok": True, "job": job})
+    except ChatBackendError as exc:
+        return jsonify({"error": str(exc)}), exc.status_code
+
+
+@app.route("/api/cron/jobs/<job_id>", methods=["DELETE"])
+@require_token
+def api_cron_job_delete(job_id):
+    try:
+        jobs = _load_cron_jobs()
+        if job_id not in jobs:
+            return jsonify({"error": "Cron job not found"}), 404
+        jobs.pop(job_id, None)
+        _write_cron_jobs(jobs)
+        _sync_cron_jobs_to_system(jobs)
+        return jsonify({"ok": True})
+    except ChatBackendError as exc:
+        return jsonify({"error": str(exc)}), exc.status_code
+
+
 # ===================================================================
 # 30. Tools
 # ===================================================================
@@ -1390,6 +2088,7 @@ def api_service_action(action):
         r = _run_hermes(*cmd_map[action], timeout=30)
         output = (r.stdout + "\n" + r.stderr).strip()
         running_after = _gateway_status()["running"]
+        ok = r.returncode == 0
 
         if action == "restart":
             # After stop, start in background
@@ -1407,8 +2106,13 @@ def api_service_action(action):
             time.sleep(3)
             running_after = _gateway_status()["running"]
             output = "Restarted (running: " + str(running_after) + ")"
+            ok = running_after
+        elif action == "stop":
+            ok = not running_after
+        elif action == "doctor":
+            ok = r.returncode == 0
 
-        return jsonify({"ok": running_after, "output": output, "returncode": r.returncode, "gateway_running": running_after})
+        return jsonify({"ok": ok, "output": output, "returncode": r.returncode, "gateway_running": running_after})
     except subprocess.TimeoutExpired:
         return jsonify({"ok": False, "error": "Command timed out", "gateway_running": _gateway_status()["running"]}), 500
     except Exception as exc:
@@ -1550,29 +2254,55 @@ def _is_text_attachment(path: Path) -> bool:
         return False
 
 
-def _summarize_attachments(files: list[Path], image_support: bool) -> dict:
+def _validate_attachment_selection(files: list[Path], image_support: bool) -> list[str]:
+    errors = []
+    for f in files or []:
+        suffix = f.suffix.lower()
+        if suffix in IMAGE_EXTENSIONS:
+            if not image_support:
+                errors.append(f"{f.name} is an image, but the configured Hermes vision/API path is not ready")
+            continue
+        if suffix in AUDIO_EXTENSIONS:
+            errors.append(f"{f.name} is audio, and audio uploads are not supported in Hermes chat")
+            continue
+        if _is_text_attachment(f):
+            continue
+        errors.append(f"{f.name} is a binary file type Hermes chat cannot read")
+    return errors
+
+
+def _attachment_display_name(path: Path, display_names: dict | None = None) -> str:
+    if display_names:
+        display_name = display_names.get(path.name)
+        if isinstance(display_name, str) and display_name.strip():
+            return display_name.strip()
+    return path.name
+
+
+def _summarize_attachments(files: list[Path], image_support: bool, display_names: dict | None = None) -> dict:
     text_blocks = []
     image_files = []
     unsupported = []
     for f in files or []:
+        display_name = _attachment_display_name(f, display_names)
         suffix = f.suffix.lower()
         if suffix in IMAGE_EXTENSIONS:
             if image_support:
                 image_files.append(f)
             else:
-                unsupported.append(f"{f.name} (image attachments require Hermes gateway/API mode)")
+                unsupported.append(f"{display_name} (image attachments require Hermes gateway/API mode)")
             continue
         if suffix in AUDIO_EXTENSIONS:
-            unsupported.append(f"{f.name} (audio attachments are not supported in Hermes chat)")
+            unsupported.append(f"{display_name} (audio attachments are not supported in Hermes chat)")
             continue
         if _is_text_attachment(f):
             try:
                 content = f.read_text(encoding="utf-8", errors="replace")
-                text_blocks.append(f"File: {f.name}\n```\n{content}\n```")
+                text_blocks.append(f"File: {display_name}\n```\n{content}\n```")
             except Exception:
-                unsupported.append(f"{f.name} (could not read text content)")
+                unsupported.append(f"{display_name} (could not read text content)")
             continue
-        unsupported.append(f"{f.name} (binary attachments cannot be read as text in this chat mode)")
+        unsupported.append(f"{display_name} (binary attachments cannot be read as text in this chat mode)")
     return {
         "text_blocks": text_blocks,
         "image_files": image_files,
@@ -1580,8 +2310,13 @@ def _summarize_attachments(files: list[Path], image_support: bool) -> dict:
     }
 
 
-def _compose_message_with_attachments(message: str, files: list[Path], image_support: bool) -> tuple[str, list[Path]]:
-    summary = _summarize_attachments(files, image_support=image_support)
+def _compose_message_with_attachments(
+    message: str,
+    files: list[Path],
+    image_support: bool,
+    display_names: dict | None = None,
+) -> tuple[str, list[Path]]:
+    summary = _summarize_attachments(files, image_support=image_support, display_names=display_names)
     sections = list(summary["text_blocks"])
     if message:
         sections.append(f"User message: {message}")
@@ -1593,17 +2328,165 @@ def _compose_message_with_attachments(message: str, files: list[Path], image_sup
     return "\n\n".join(sections), summary["image_files"]
 
 
-def _call_hermes_direct(message: str, files: list = None, request_id: str | None = None) -> str:
+def _session_has_image_history(session: dict) -> bool:
+    for message in session.get("messages", []):
+        for file_name in message.get("files", []) or []:
+            if Path(file_name).suffix.lower() in IMAGE_EXTENSIONS:
+                return True
+    return False
+
+
+def _chat_session_meta(session: dict) -> dict:
+    normalized = _normalize_chat_session(copy.deepcopy(session))
+    context = _effective_session_context(normalized)
+    return {
+        "transport_mode": normalized.get("transport_mode"),
+        "continuity_mode": normalized.get("continuity_mode"),
+        "transport_notice": normalized.get("transport_notice") or "",
+        "hermes_session_backed": normalized.get("continuity_mode") == CHAT_CONTINUITY_HERMES,
+        "folder_id": context.get("folder_id") or "",
+        "folder_title": context.get("folder_title") or "",
+        "workspace_roots": context.get("workspace_roots") or [],
+        "source_docs": context.get("source_docs") or [],
+        "folder_workspace_roots": context.get("folder_workspace_roots") or [],
+        "folder_source_docs": context.get("folder_source_docs") or [],
+    }
+
+
+def _format_chat_context_block(session: dict) -> str:
+    context = _effective_session_context(session)
+    folder_title = context.get("folder_title") or ""
+    workspace_roots = context.get("workspace_roots") or []
+    source_docs = context.get("source_docs") or []
+    if not any((folder_title, workspace_roots, source_docs)):
+        return ""
+
+    sections = ["Chat workspace context:"]
+    if folder_title:
+        sections.append(f"Folder: {folder_title}")
+    if workspace_roots:
+        sections.append("Workspace roots:\n" + "\n".join(f"- {root}" for root in workspace_roots))
+    if source_docs:
+        sections.append("Pinned source docs:\n" + "\n".join(f"- {doc}" for doc in source_docs))
+
+    doc_sections = []
+    notes = []
+    total_bytes = 0
+    for source_doc in source_docs:
+        path = Path(source_doc)
+        if not path.exists():
+            notes.append(f"{source_doc} (missing)")
+            continue
+        if not _is_text_attachment(path):
+            notes.append(f"{source_doc} (not a readable text file)")
+            continue
+        try:
+            raw_bytes = path.read_bytes()
+        except Exception as exc:
+            notes.append(f"{source_doc} (could not be read: {exc})")
+            continue
+        remaining = CHAT_CONTEXT_SOURCE_DOC_TOTAL_LIMIT - total_bytes
+        if remaining <= 0:
+            notes.append(f"{source_doc} (skipped because the source-doc context limit was reached)")
+            continue
+        snippet = raw_bytes[:min(CHAT_CONTEXT_SOURCE_DOC_LIMIT, remaining)]
+        total_bytes += len(snippet)
+        text = snippet.decode("utf-8", errors="replace")
+        if len(snippet) < len(raw_bytes):
+            notes.append(f"{source_doc} (truncated to {len(snippet)} bytes for chat context)")
+        doc_sections.append(f"Source doc: {source_doc}\n```\n{text}\n```")
+
+    sections.extend(doc_sections)
+    if notes:
+        sections.append("Source doc notes:\n" + "\n".join(f"- {note}" for note in notes))
+    return "\n\n".join(sections)
+
+
+def _compose_chat_turn_payload(
+    session: dict,
+    message: str,
+    files: list[Path],
+    image_support: bool,
+    display_names: dict | None = None,
+) -> tuple[str, list[Path]]:
+    attachment_text, image_files = _compose_message_with_attachments(
+        message,
+        files,
+        image_support=image_support,
+        display_names=display_names,
+    )
+    context_block = _format_chat_context_block(session)
+    sections = [section for section in (context_block, attachment_text) if section]
+    return "\n\n".join(sections), image_files
+
+
+def _plan_chat_request(session: dict, files: list[Path]) -> dict:
+    normalized = _normalize_chat_session(copy.deepcopy(session))
+    transport_mode = normalized.get("transport_mode")
+    has_image_files = any(f.suffix.lower() in IMAGE_EXTENSIONS for f in files or [])
+    image_support, image_reason = _image_attachment_support_status()
+    api_server_enabled = _check_api_server()
+
+    if transport_mode == CHAT_TRANSPORT_API:
+        transport = CHAT_TRANSPORT_API
+    elif transport_mode == CHAT_TRANSPORT_CLI:
+        transport = CHAT_TRANSPORT_API if has_image_files and image_support else CHAT_TRANSPORT_CLI
+    else:
+        transport = CHAT_TRANSPORT_API if (api_server_enabled or (has_image_files and image_support)) else CHAT_TRANSPORT_CLI
+
+    notice = normalized.get("transport_notice") or ""
+    if transport_mode == CHAT_TRANSPORT_CLI and transport == CHAT_TRANSPORT_API:
+        notice = (
+            "This chat switched to API replay because image attachments require the vision/API path. "
+            "Future turns in this chat will replay local history instead of resuming the Hermes CLI session."
+        )
+
+    return {
+        "transport": transport,
+        "cancel_supported": transport == CHAT_TRANSPORT_CLI,
+        "image_support": image_support,
+        "image_reason": image_reason,
+        "api_server_enabled": api_server_enabled,
+        "transport_notice": notice,
+    }
+
+
+def _parse_hermes_chat_result(output: str) -> tuple[str, str | None]:
+    session_match = re.search(r"(?mi)^session_id:\s*(\S+)\s*$", output)
+    hermes_session_id = session_match.group(1) if session_match else None
+    cleaned = re.sub(r"(?mi)^session_id:\s*\S+\s*$", "", output)
+    cleaned = re.sub(r"(?m)^↻ Resumed session .*$", "", cleaned)
+    cleaned = re.sub(r"(?m)^Resumed session .*$", "", cleaned)
+    return _clean_cli_output(cleaned), hermes_session_id
+
+
+def _call_hermes_direct(
+    session: dict,
+    message: str,
+    files: list = None,
+    request_id: str | None = None,
+    file_display_names: dict | None = None,
+) -> tuple[str, str | None]:
     """Call Hermes via CLI subprocess (fallback when API server is unavailable)."""
-    prompt, _ = _compose_message_with_attachments(message, files or [], image_support=False)
+    prompt, _ = _compose_chat_turn_payload(
+        session,
+        message,
+        files or [],
+        image_support=False,
+        display_names=file_display_names,
+    )
     if request_id:
         state = _read_request_control(request_id)
         if state and state.get("cancel_requested_at"):
             _update_chat_request(request_id, status="cancelled")
             raise ChatRequestCancelled("Request cancelled before Hermes started")
+    cmd = [str(HERMES_BIN), "chat", "-Q"]
+    if session.get("hermes_session_id"):
+        cmd.extend(["--resume", session["hermes_session_id"]])
+    cmd.extend(["-q", prompt])
     try:
         proc = subprocess.Popen(
-            [str(HERMES_BIN), "chat", "-q", prompt],
+            cmd,
             cwd=str(Path.home()),
             env={**os.environ, "NO_COLOR": "1"},
             stdout=subprocess.PIPE,
@@ -1645,30 +2528,53 @@ def _call_hermes_direct(message: str, files: list = None, request_id: str | None
                 _update_chat_request(request_id, status="cancelled")
                 raise ChatRequestCancelled("Request cancelled")
 
+        if proc.returncode != 0:
+            error_output = stderr.strip() or stdout.strip() or f"Hermes CLI exited with status {proc.returncode}"
+            raise ChatBackendError(error_output)
+
         output = stdout.strip()
         if not output:
-            output = stderr.strip() or "(No response)"
+            raise ChatBackendError(stderr.strip() or "Hermes returned an empty response")
         import re as _re
         output = _re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', output)
         output = _re.sub(r'\x1b\].*?\x07', '', output)
-        return _clean_cli_output(output)
+        return _parse_hermes_chat_result(output)
     except ChatRequestCancelled:
         raise
     except subprocess.TimeoutExpired:
-        return f"(Response timed out after {CHAT_REQUEST_TIMEOUT // 60} minutes)"
+        raise ChatRequestTimeout(f"Hermes did not respond within {CHAT_REQUEST_TIMEOUT} seconds")
+    except ChatBackendError:
+        raise
     except Exception as e:
-        return f"(Error calling Hermes: {e})"
+        raise ChatBackendError(f"Error calling Hermes: {e}") from e
 
 
-def _call_api_server(messages: list, session_id: str, files: list = None) -> str:
+def _call_api_server(
+    session: dict,
+    messages: list,
+    session_id: str,
+    files: list = None,
+    prefer_vision: bool = False,
+    file_display_names: dict | None = None,
+) -> str:
     """Call Hermes via its OpenAI-compatible API server. Handles image files as base64."""
-    import urllib.request, base64
+    import base64
+    import socket
+    import urllib.error
+    import urllib.request
+
     msgs = list(messages)
+    use_vision_target = prefer_vision
     if files and msgs and msgs[-1].get("role") == "user":
-        text_content, image_files = _compose_message_with_attachments(
-            msgs[-1].get("content", "") or "", files, image_support=True
+        text_content, image_files = _compose_chat_turn_payload(
+            session,
+            msgs[-1].get("content", "") or "",
+            files,
+            image_support=True,
+            display_names=file_display_names,
         )
         if image_files:
+            use_vision_target = True
             img_content = []
             if text_content:
                 img_content.append({"type": "text", "text": text_content})
@@ -1680,25 +2586,219 @@ def _call_api_server(messages: list, session_id: str, files: list = None) -> str
                     img_content.append({"type": "image_url", "image_url": {"url": f"data:image/{ext};base64,{b64}"}})
                 except Exception:
                     pass
-            if len(img_content) > 1:
+            if img_content:
                 msgs[-1] = {"role": "user", "content": img_content}
         else:
             msgs[-1] = {"role": "user", "content": text_content}
-    payload = {"model": "hermes-agent", "messages": msgs, "stream": False}
-    headers = {"Content-Type": "application/json"}
-    api_key = os.environ.get("HERMES_API_KEY", os.environ.get("API_SERVER_KEY", ""))
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    elif msgs and msgs[-1].get("role") == "user":
+        text_content, _ = _compose_chat_turn_payload(
+            session,
+            msgs[-1].get("content", "") or "",
+            [],
+            image_support=False,
+            display_names=file_display_names,
+        )
+        msgs[-1] = {"role": "user", "content": text_content}
+    target = _resolve_api_target(prefer_vision=use_vision_target)
+    payload = {"model": target["model"] or "hermes-agent", "messages": msgs, "stream": False}
+    headers = _api_server_headers(target.get("api_key"), target.get("provider"))
+    headers["Content-Type"] = "application/json"
     req = urllib.request.Request(
-        f"{HERMES_API_URL}/v1/chat/completions",
+        _build_openai_api_url(target["base_url"], "chat/completions"),
         data=json.dumps(payload).encode(), headers=headers, method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with urllib.request.urlopen(req, timeout=CHAT_REQUEST_TIMEOUT) as resp:
             result = json.loads(resp.read().decode())
-            return result["choices"][0]["message"]["content"]
-    except Exception as e:
-        raise Exception(f"API server error: {e}")
+            if isinstance(result, dict) and result.get("error"):
+                error_payload = result.get("error") or {}
+                if isinstance(error_payload, dict):
+                    error_message = error_payload.get("message") or error_payload.get("code") or "API server returned an error"
+                else:
+                    error_message = str(error_payload)
+                raise ChatBackendError(f"API server error: {error_message}")
+            choices = result.get("choices") or []
+            if not choices:
+                raise ChatBackendError("API server returned no choices")
+            message = choices[0].get("message") or {}
+            content = message.get("content")
+            if isinstance(content, list):
+                content = "\n".join(
+                    item.get("text", "") for item in content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                ).strip()
+            if not isinstance(content, str) or not content.strip():
+                raise ChatBackendError("API server returned an empty message")
+            return content
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+        detail = body or exc.reason or "upstream request failed"
+        raise ChatBackendError(f"API server returned HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        reason_text = str(reason)
+        if isinstance(reason, TimeoutError) or "timed out" in reason_text.lower():
+            raise ChatRequestTimeout(f"API server did not respond within {CHAT_REQUEST_TIMEOUT} seconds") from exc
+        raise ChatBackendError(f"API server is unreachable: {reason_text}") from exc
+    except socket.timeout as exc:
+        raise ChatRequestTimeout(f"API server did not respond within {CHAT_REQUEST_TIMEOUT} seconds") from exc
+    except ChatBackendError:
+        raise
+    except Exception as exc:
+        raise ChatBackendError(f"API server error: {exc}") from exc
+
+
+def _provider_env_api_key(provider: str | None) -> str:
+    provider_name = (provider or "").strip().lower()
+    provider_env_map = {
+        "openrouter": "OPENROUTER_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "openai-codex": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "groq": "GROQ_API_KEY",
+        "google": "GOOGLE_API_KEY",
+        "gemini": "GOOGLE_API_KEY",
+        "mistral": "MISTRAL_API_KEY",
+        "together": "TOGETHER_API_KEY",
+        "fireworks": "FIREWORKS_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+        "cohere": "COHERE_API_KEY",
+    }
+    env_key = provider_env_map.get(provider_name)
+    return _runtime_env_value(env_key, "") if env_key else ""
+
+
+def _resolved_target_api_key(target: dict | None) -> str:
+    target = target or {}
+    explicit_api_key = (target.get("api_key") or "").strip()
+    if explicit_api_key:
+        return explicit_api_key
+    provider_api_key = _provider_env_api_key(target.get("provider"))
+    if provider_api_key:
+        return provider_api_key
+    return _runtime_env_value(
+        "HERMES_API_KEY",
+        _runtime_env_value("API_SERVER_KEY", ""),
+    ).strip()
+
+
+def _api_server_headers(api_key: str | None = None, provider: str | None = None) -> dict:
+    headers = {}
+    resolved_api_key = (api_key or "").strip() if api_key is not None else ""
+    if not resolved_api_key and provider:
+        resolved_api_key = _provider_env_api_key(provider)
+    if not resolved_api_key:
+        resolved_api_key = _runtime_env_value(
+            "HERMES_API_KEY",
+            _runtime_env_value("API_SERVER_KEY", ""),
+        ).strip()
+    if resolved_api_key:
+        headers["Authorization"] = f"Bearer {resolved_api_key}"
+    return headers
+
+
+def _resolve_api_target(prefer_vision: bool = False) -> dict:
+    model_cfg = _normalized_model_config()
+    default_target = {
+        "base_url": (_runtime_env_value("HERMES_API_URL", "") or model_cfg.get("base_url") or HERMES_API_URL or "").strip(),
+        "api_key": (model_cfg.get("api_key") or "").strip(),
+        "model": (model_cfg.get("default_model") or "").strip(),
+        "provider": (model_cfg.get("default_provider") or "").strip(),
+    }
+    default_target["api_key"] = _resolved_target_api_key(default_target)
+    if not prefer_vision:
+        return default_target
+
+    vision_cfg = model_cfg.get("vision")
+    if isinstance(vision_cfg, str) and vision_cfg.strip():
+        merged = dict(default_target)
+        merged["model"] = vision_cfg.strip()
+        return merged
+    if isinstance(vision_cfg, dict):
+        merged = dict(default_target)
+        for key in ("base_url", "api_key", "model", "provider"):
+            if isinstance(vision_cfg.get(key), str) and vision_cfg.get(key).strip():
+                merged[key] = vision_cfg.get(key).strip()
+        merged["api_key"] = _resolved_target_api_key(merged)
+        return merged
+    return default_target
+
+
+def _openrouter_model_supports_images(target: dict, timeout: int = 3) -> tuple[bool | None, str]:
+    import urllib.request
+
+    if (target.get("provider") or "").strip().lower() != "openrouter":
+        return None, ""
+    model_id = (target.get("model") or "").strip()
+    if not model_id:
+        return None, ""
+
+    req = urllib.request.Request(
+        _build_openai_api_url(target.get("base_url") or "", "models"),
+        headers=_api_server_headers(target.get("api_key"), target.get("provider")),
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode())
+    except Exception as exc:
+        return None, f"Could not verify image support for {model_id}: {exc}"
+
+    for item in payload.get("data", []) or []:
+        if item.get("id") != model_id:
+            continue
+        architecture = item.get("architecture") or {}
+        input_modalities = architecture.get("input_modalities") or []
+        if "image" in input_modalities:
+            return True, ""
+        modality = str(architecture.get("modality") or "")
+        if "image" in modality.lower():
+            return True, ""
+        return False, f"The configured OpenRouter model {model_id} does not advertise image input support"
+
+    return None, f"Could not find model metadata for {model_id} on OpenRouter"
+
+
+def _build_openai_api_url(base_url: str, path: str) -> str:
+    base = (base_url or "").rstrip("/")
+    clean_path = path.lstrip("/")
+    if base.endswith("/v1"):
+        return f"{base}/{clean_path}"
+    return f"{base}/v1/{clean_path}"
+
+
+def _api_server_probe(timeout: int = 3, prefer_vision: bool = False) -> tuple[bool, str, dict | None]:
+    import urllib.request
+    import urllib.error
+
+    target = _resolve_api_target(prefer_vision=prefer_vision)
+    base_url = (target.get("base_url") or "").strip()
+    if not base_url:
+        return False, "API base URL is not configured", None
+
+    headers = _api_server_headers(target.get("api_key"), target.get("provider"))
+    probes = [
+        ("health", f"{base_url.rstrip('/')}/health"),
+        ("models", _build_openai_api_url(base_url, "models")),
+    ]
+    last_error = "API endpoint did not respond"
+
+    for probe_name, url in probes:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if 200 <= resp.status < 300:
+                    return True, "", {"probe": probe_name, "url": url, "status": resp.status}
+                last_error = f"{probe_name} probe returned HTTP {resp.status}"
+        except urllib.error.HTTPError as exc:
+            if probe_name == "health" and exc.code == 404:
+                last_error = "health probe returned HTTP 404"
+                continue
+            last_error = f"{probe_name} probe returned HTTP {exc.code}"
+        except Exception as exc:
+            last_error = f"{probe_name} probe failed: {exc}"
+
+    return False, last_error, None
 
 
 def _check_api_server() -> bool:
@@ -1709,8 +2809,7 @@ def _check_api_server() -> bool:
     The API server does not yet support session-level compression.
     Set HERMES_USE_API=true in the environment to re-enable API server mode.
     """
-    import os
-    if os.environ.get("HERMES_USE_API", "").lower() in ("1", "true", "yes"):
+    if _runtime_env_value("HERMES_USE_API", "").lower() in ("1", "true", "yes"):
         try:
             return _api_server_healthcheck()
         except Exception:
@@ -1719,10 +2818,8 @@ def _check_api_server() -> bool:
 
 
 def _api_server_healthcheck(timeout: int = 3) -> bool:
-    import urllib.request
-    req = urllib.request.Request(f"{HERMES_API_URL}/health", method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.status == 200
+    ok, _, _ = _api_server_probe(timeout=timeout)
+    return ok
 
 
 def _vision_configured() -> tuple[bool, str]:
@@ -1744,50 +2841,106 @@ def _image_attachment_support_status() -> tuple[bool, str]:
     vision_ready, vision_reason = _vision_configured()
     if not vision_ready:
         return False, vision_reason
-    gateway = _gateway_status()
-    if not gateway.get("running"):
-        return False, "Hermes gateway is not running"
-    try:
-        if _api_server_healthcheck(timeout=2):
-            return True, ""
-        return False, "Hermes gateway API is not reachable"
-    except Exception:
-        return False, "Hermes gateway API is not reachable"
+    target = _resolve_api_target(prefer_vision=True)
+    api_ok, api_reason, _ = _api_server_probe(timeout=2, prefer_vision=True)
+    if api_ok:
+        image_model_ok, image_model_reason = _openrouter_model_supports_images(target, timeout=3)
+        if image_model_ok is False:
+            return False, image_model_reason
+        return True, ""
+    api_url = target.get("base_url") or HERMES_API_URL
+    return False, f"OpenAI-compatible image chat API is not reachable at {api_url} ({api_reason})"
 
 
 def _get_or_create_chat_session(session_id=None):
+    existing = _load_session(session_id) if session_id else None
+    if existing:
+        return _normalize_chat_session(existing)
     if not session_id:
         session_id = str(uuid.uuid4())[:8]
-    if session_id not in chat_sessions:
-        chat_sessions[session_id] = {
-            "id": session_id, "messages": [],
-            "created": datetime.now().isoformat(),
-            "title": "New Chat",
-            "updated": datetime.now().isoformat(),
-        }
-    return chat_sessions[session_id]
+    now = datetime.now().isoformat()
+    session = {
+        "id": session_id,
+        "messages": [],
+        "created": now,
+        "title": "New Chat",
+        "updated": now,
+        "hermes_session_id": None,
+        "transport_mode": None,
+        "continuity_mode": None,
+        "transport_notice": "",
+        "folder_id": "",
+        "workspace_roots": [],
+        "source_docs": [],
+    }
+    session = _normalize_chat_session(session)
+    _write_session(session)
+    return copy.deepcopy(session)
+
+
+def _rollback_failed_chat_turn(session: dict, session_id: str, user_msg: dict) -> None:
+    if session.get("messages") and session["messages"][-1] == user_msg:
+        session["messages"].pop()
+    if not session.get("messages"):
+        _delete_session_from_disk(session_id)
+        return
+    session["updated"] = datetime.now().isoformat()
+    _write_session(session)
 
 
 @app.route("/api/chat", methods=["POST"])
 @require_token
 @rate_limit
 def api_chat():
-    data = request.get_json()
+    data = request.get_json() or {}
     message = data.get("message", "").strip()
     session_id = data.get("session_id")
+    requested_folder_id = str(data.get("folder_id") or "").strip()
     request_id = (data.get("request_id") or str(uuid.uuid4())).strip()
     files = []
+    file_display_names = {}
     for ref in (data.get("files") or []):
-        fpath = UPLOAD_FOLDER / ref
+        stored_as = None
+        display_name = None
+        if isinstance(ref, str):
+            stored_as = ref
+            display_name = Path(ref).name
+        elif isinstance(ref, dict):
+            stored_as = str(ref.get("stored_as") or "").strip()
+            display_name = str(ref.get("name") or "").strip() or None
+        if not stored_as:
+            continue
+        fpath = UPLOAD_FOLDER / stored_as
         if fpath.exists():
             files.append(fpath)
+            if display_name:
+                file_display_names[fpath.name] = display_name
     if not message and not files:
         return jsonify({"error": "Message or attachment is required"}), 400
     sess = _get_or_create_chat_session(session_id)
+    if requested_folder_id:
+        ensured = _ensure_folder_exists(requested_folder_id)
+        requested_folder_id = ensured["id"] if ensured else requested_folder_id
+    if requested_folder_id and not sess.get("folder_id"):
+        sess["folder_id"] = requested_folder_id
     sid = sess["id"]
-    _register_chat_request(request_id, sid)
-    user_msg = {"role": "user", "content": message,
-                "files": [f.name for f in files], "timestamp": datetime.now().isoformat()}
+    request_plan = _plan_chat_request(sess, files)
+    attachment_errors = _validate_attachment_selection(files, request_plan["image_support"])
+    if attachment_errors:
+        return jsonify({"error": "Unsupported attachment selection", "details": attachment_errors}), 400
+
+    _register_chat_request(
+        request_id,
+        sid,
+        transport=request_plan["transport"],
+        cancel_supported=request_plan["cancel_supported"],
+    )
+    user_msg = {
+        "role": "user",
+        "content": message,
+        "files": [_attachment_display_name(f, file_display_names) for f in files],
+        "timestamp": datetime.now().isoformat(),
+    }
     sess["messages"].append(user_msg)
     # Auto-title from first user message
     if len(sess["messages"]) == 1 and sess.get("title") == "New Chat":
@@ -1799,43 +2952,75 @@ def api_chat():
                 file_label += f" +{len(files) - 2} more"
             sess["title"] = f"Files: {file_label}"
     sess["updated"] = datetime.now().isoformat()
+    _write_session(sess)
     try:
-        has_image_files = any(f.suffix.lower() in IMAGE_EXTENSIONS for f in files)
-        image_support, _ = _image_attachment_support_status()
-        use_api_server = _check_api_server() or (has_image_files and image_support)
+        use_api_server = request_plan["transport"] == CHAT_TRANSPORT_API
         if use_api_server:
+            if sess.get("transport_mode") != CHAT_TRANSPORT_API:
+                sess["transport_mode"] = CHAT_TRANSPORT_API
+                sess["continuity_mode"] = CHAT_CONTINUITY_LOCAL
+                sess["transport_notice"] = request_plan["transport_notice"]
+                sess["hermes_session_id"] = None
             api_msgs = []
             for m in sess["messages"]:
                 msg = {"role": m["role"], "content": m["content"]}
                 if m.get("files"):
                     msg["files"] = m["files"]
                 api_msgs.append(msg)
-            response_text = _call_api_server(api_msgs, sid, files)
+            response_text = _call_api_server(
+                sess,
+                api_msgs,
+                sid,
+                files,
+                prefer_vision=_session_has_image_history(sess) or any(
+                    f.suffix.lower() in IMAGE_EXTENSIONS for f in files
+                ),
+                file_display_names=file_display_names,
+            )
         else:
-            response_text = _call_hermes_direct(message, files, request_id=request_id)
+            response_text, hermes_session_id = _call_hermes_direct(
+                sess,
+                message,
+                files,
+                request_id=request_id,
+                file_display_names=file_display_names,
+            )
+            sess["transport_mode"] = CHAT_TRANSPORT_CLI
+            if hermes_session_id:
+                sess["hermes_session_id"] = hermes_session_id
+                sess["continuity_mode"] = CHAT_CONTINUITY_HERMES
+                sess["transport_notice"] = ""
+            else:
+                sess["continuity_mode"] = CHAT_CONTINUITY_LIMITED
+                sess["transport_notice"] = (
+                    "Hermes CLI did not return a resumable session id for this chat yet. "
+                    "Follow-up turns may not preserve Hermes-side context."
+                )
         _update_chat_request(request_id, status="completed")
     except ChatRequestCancelled:
-        if sess["messages"] and sess["messages"][-1] == user_msg:
-            sess["messages"].pop()
-        if not sess["messages"]:
-            chat_sessions.pop(sid, None)
-        else:
-            sess["updated"] = datetime.now().isoformat()
-            _save_session(sid)
+        _rollback_failed_chat_turn(sess, sid, user_msg)
         _update_chat_request(request_id, status="cancelled")
         return jsonify({"ok": False, "cancelled": True, "session_id": sid}), 499
-    except Exception as e:
-        _update_chat_request(request_id, status="failed", error=str(e))
-        response_text = f"Error: {e}"
+    except ChatBackendError as exc:
+        _rollback_failed_chat_turn(sess, sid, user_msg)
+        _update_chat_request(request_id, status="failed", error=str(exc))
+        return jsonify({"error": str(exc), "request_id": request_id, "session_id": sid}), exc.status_code
+    except Exception as exc:
+        _rollback_failed_chat_turn(sess, sid, user_msg)
+        _update_chat_request(request_id, status="failed", error=str(exc))
+        return jsonify({"error": f"Unexpected chat error: {exc}", "request_id": request_id, "session_id": sid}), 500
     finally:
         _remove_chat_request(request_id)
     assistant_msg = {"role": "assistant", "content": response_text,
                      "timestamp": datetime.now().isoformat()}
     sess["messages"].append(assistant_msg)
     sess["updated"] = datetime.now().isoformat()
-    _save_session(sid)
+    _write_session(sess)
+    session_meta = _chat_session_meta(sess)
     return jsonify({"session_id": sid, "response": response_text,
-                     "message_count": len(sess["messages"]), "title": sess.get("title", "")})
+                     "message_count": len(sess["messages"]), "title": sess.get("title", ""),
+                     "cancel_supported": request_plan["cancel_supported"],
+                     "session": session_meta})
 
 
 @app.route("/api/chat/cancel", methods=["POST"])
@@ -1909,7 +3094,8 @@ def serve_upload(filename):
 @require_token
 def api_chat_sessions():
     sessions = []
-    for sid, s in chat_sessions.items():
+    for sid, s in _load_all_sessions().items():
+        meta = _chat_session_meta(s)
         sessions.append({
             "id": s["id"],
             "title": s.get("title", "Untitled"),
@@ -1917,38 +3103,255 @@ def api_chat_sessions():
             "created": s["created"],
             "updated": s.get("updated", s["created"]),
             "last_message": s["messages"][-1]["content"][:100] if s["messages"] else "",
+            "session": meta,
         })
     # Sort by updated desc
     sessions.sort(key=lambda x: x.get("updated", ""), reverse=True)
     return jsonify({"sessions": sessions})
 
 
+@app.route("/api/chat/folders", methods=["GET"])
+@require_token
+def api_chat_folders():
+    sessions = _load_all_sessions()
+    return jsonify({"folders": _folder_summaries(sessions)})
+
+
+@app.route("/api/chat/folders", methods=["POST"])
+@require_token
+def api_chat_folders_create():
+    data = request.get_json() or {}
+    folder_payload, errors = _parse_folder_update(data)
+    if errors:
+        return jsonify({"error": "Invalid folder", "details": errors}), 400
+    existing = _folder_title_conflict(folder_payload["title"])
+    if existing:
+        return jsonify({"error": "Folder name already exists", "folder": existing}), 409
+    sessions = _load_all_sessions()
+    legacy = _legacy_folder_from_sessions(folder_payload["title"], sessions)
+    if legacy:
+        folder = _write_folder({
+            "id": legacy["id"],
+            "title": folder_payload["title"],
+            "created": legacy.get("created"),
+            "updated": datetime.now().isoformat(),
+            "workspace_roots": folder_payload["workspace_roots"] or legacy.get("workspace_roots") or [],
+            "source_docs": folder_payload["source_docs"] or legacy.get("source_docs") or [],
+        })
+        summary = next((item for item in _folder_summaries(sessions) if item["id"] == folder["id"]), None)
+        return jsonify({"ok": True, "folder": summary or folder})
+    now = datetime.now().isoformat()
+    folder = _write_folder({
+        "id": str(uuid.uuid4())[:8],
+        "title": folder_payload["title"],
+        "created": now,
+        "updated": now,
+        "workspace_roots": folder_payload["workspace_roots"],
+        "source_docs": folder_payload["source_docs"],
+    })
+    return jsonify({"ok": True, "folder": folder})
+
+
+@app.route("/api/chat/folders/<folder_id>", methods=["GET"])
+@require_token
+def api_chat_folder_get(folder_id):
+    folder = _folder_with_fallback(folder_id)
+    if not folder:
+        return jsonify({"error": "Folder not found"}), 404
+    sessions = _load_all_sessions()
+    summary = next((item for item in _folder_summaries(sessions) if item["id"] == folder["id"]), None)
+    return jsonify({"folder": summary or folder})
+
+
+@app.route("/api/chat/folders/<folder_id>", methods=["PUT"])
+@require_token
+def api_chat_folder_update(folder_id):
+    existing = _folder_with_fallback(folder_id)
+    if not existing:
+        return jsonify({"error": "Folder not found"}), 404
+    folder_payload, errors = _parse_folder_update(request.get_json() or {}, existing=existing)
+    if errors:
+        return jsonify({"error": "Invalid folder", "details": errors}), 400
+    conflict = _folder_title_conflict(folder_payload["title"], exclude_folder_id=existing["id"])
+    if conflict:
+        return jsonify({"error": "Folder name already exists", "folder": conflict}), 409
+    folder = _write_folder({
+        "id": existing["id"],
+        "title": folder_payload["title"],
+        "created": existing.get("created"),
+        "updated": datetime.now().isoformat(),
+        "workspace_roots": folder_payload["workspace_roots"],
+        "source_docs": folder_payload["source_docs"],
+    })
+    summary = next((item for item in _folder_summaries() if item["id"] == folder["id"]), None)
+    return jsonify({"ok": True, "folder": summary or folder})
+
+
+@app.route("/api/chat/folders/<folder_id>", methods=["DELETE"])
+@require_token
+def api_chat_folder_delete(folder_id):
+    sessions = _load_all_sessions()
+    folder = _folder_with_fallback(folder_id, sessions)
+    if not folder:
+        return jsonify({"error": "Folder not found"}), 404
+
+    moved_session_ids = []
+    now = datetime.now().isoformat()
+    folders = _load_all_folders()
+    for session in sessions.values():
+        session_folder = _resolve_folder_reference(session.get("folder_id"), sessions=sessions, folders=folders, include_legacy=False)
+        if not session_folder or session_folder["id"] != folder["id"]:
+            continue
+        session["folder_id"] = ""
+        session["updated"] = now
+        _write_session(session)
+        moved_session_ids.append(session["id"])
+
+    _delete_folder(folder_id)
+    return jsonify({
+        "ok": True,
+        "deleted_folder_id": folder_id,
+        "moved_session_count": len(moved_session_ids),
+        "moved_session_ids": moved_session_ids,
+    })
+
+
+@app.route("/api/chat/folders/<folder_id>/sources/from-chat", methods=["POST"])
+@require_token
+def api_chat_folder_source_from_chat(folder_id):
+    folder = _folder_with_fallback(folder_id)
+    if not folder:
+        return jsonify({"error": "Folder not found"}), 404
+    data = request.get_json() or {}
+    session_id = str(data.get("session_id") or "").strip()
+    session = _load_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    lines = [
+        f"# {session.get('title') or 'Chat'}",
+        "",
+        f"Session ID: {session.get('id')}",
+        "",
+    ]
+    for message in session.get("messages", []):
+        role = "User" if message.get("role") == "user" else "Hermes"
+        lines.append(f"## {role}")
+        lines.append("")
+        lines.append(message.get("content") or "")
+        if message.get("files"):
+            lines.append("")
+            lines.append("Attachments: " + ", ".join(message.get("files") or []))
+        lines.append("")
+    safe_name = secure_filename(session.get("title") or session.get("id") or "chat-source") or "chat-source"
+    target_path = CHAT_FOLDER_SOURCE_DIR / f"{folder_id}_{session.get('id')}_{safe_name}.md"
+    target_path.write_text("\n".join(lines), encoding="utf-8")
+    updated_sources = _merge_unique_strings((folder.get("source_docs") or []), [str(target_path.resolve())])
+    updated_workspace_roots = _merge_unique_strings(
+        folder.get("workspace_roots") or [],
+        _folder_workspace_roots_for_docs(updated_sources),
+    )
+    stored = _write_folder({
+        "id": folder["id"],
+        "title": folder["title"],
+        "created": folder.get("created"),
+        "updated": datetime.now().isoformat(),
+        "source_docs": updated_sources,
+        "workspace_roots": updated_workspace_roots,
+    })
+    summary = next((item for item in _folder_summaries() if item["id"] == stored["id"]), None)
+    return jsonify({"ok": True, "folder": summary or stored, "source_path": str(target_path.resolve())})
+
+
+@app.route("/api/chat/sessions", methods=["POST"])
+@require_token
+def api_chat_sessions_create():
+    data = request.get_json() or {}
+    session = _get_or_create_chat_session()
+    context_update, errors = _parse_chat_context_update(data)
+    folder_id = context_update.get("folder_id") or ""
+    if folder_id:
+        ensured = _ensure_folder_exists(folder_id)
+        context_update["folder_id"] = ensured["id"] if ensured else folder_id
+    if errors:
+        _delete_session_from_disk(session["id"])
+        return jsonify({"error": "Invalid chat context", "details": errors}), 400
+    session.update(context_update)
+    session["updated"] = datetime.now().isoformat()
+    _write_session(session)
+    return jsonify({
+        "ok": True,
+        "session_id": session["id"],
+        "title": session.get("title", ""),
+        "session": _chat_session_meta(session),
+    })
+
+
 @app.route("/api/chat/sessions/<session_id>/messages", methods=["GET"])
 @require_token
 def api_chat_messages(session_id):
-    if session_id not in chat_sessions:
+    session = _load_session(session_id)
+    if not session:
         return jsonify({"error": "Session not found"}), 404
-    return jsonify({"messages": chat_sessions[session_id]["messages"],
-                     "title": chat_sessions[session_id].get("title", "")})
+    return jsonify({"messages": session["messages"],
+                     "title": session.get("title", ""),
+                     "session": _chat_session_meta(session)})
 
 
 @app.route("/api/chat/sessions/<session_id>/rename", methods=["POST"])
 @require_token
 def api_chat_rename(session_id):
-    if session_id not in chat_sessions:
+    session = _load_session(session_id)
+    if not session:
         return jsonify({"error": "Session not found"}), 404
     data = request.get_json() or {}
     new_title = data.get("title", "").strip()
     if new_title:
-        chat_sessions[session_id]["title"] = new_title
-        _save_session(session_id)
-    return jsonify({"ok": True, "title": chat_sessions[session_id].get("title", "")})
+        session["title"] = new_title
+        session["updated"] = datetime.now().isoformat()
+        _write_session(session)
+    return jsonify({"ok": True, "title": session.get("title", "")})
+
+
+@app.route("/api/chat/sessions/<session_id>/context", methods=["PUT"])
+@require_token
+def api_chat_context_update(session_id):
+    session = _load_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    context_update, errors = _parse_chat_context_update(request.get_json() or {})
+    folder_id = context_update.get("folder_id") or ""
+    if folder_id:
+        ensured = _ensure_folder_exists(folder_id)
+        context_update["folder_id"] = ensured["id"] if ensured else folder_id
+    if errors:
+        return jsonify({"error": "Invalid chat context", "details": errors}), 400
+    session.update(context_update)
+    session["updated"] = datetime.now().isoformat()
+    _write_session(session)
+    return jsonify({"ok": True, "session": _chat_session_meta(session)})
+
+
+@app.route("/api/chat/sessions/<session_id>/folder", methods=["PUT"])
+@require_token
+def api_chat_session_folder_update(session_id):
+    session = _load_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    data = request.get_json() or {}
+    folder_id = str(data.get("folder_id") or "").strip()
+    if folder_id:
+        ensured = _ensure_folder_exists(folder_id)
+        folder_id = ensured["id"] if ensured else folder_id
+    session["folder_id"] = folder_id
+    session["updated"] = datetime.now().isoformat()
+    _write_session(session)
+    return jsonify({"ok": True, "session": _chat_session_meta(session)})
 
 
 @app.route("/api/chat/sessions/<session_id>/delete", methods=["POST"])
 @require_token
 def api_chat_delete(session_id):
-    if session_id not in chat_sessions:
+    if not _load_session(session_id):
         return jsonify({"ok": False, "error": "Session not found"}), 404
     _delete_session_from_disk(session_id)
     return jsonify({"ok": True})
@@ -1957,21 +3360,35 @@ def api_chat_delete(session_id):
 @app.route("/api/chat/sessions/<session_id>/clear", methods=["POST"])
 @require_token
 def api_chat_clear(session_id):
-    if session_id not in chat_sessions:
+    session = _load_session(session_id)
+    if not session:
         return jsonify({"ok": False, "error": "Session not found"}), 404
-    chat_sessions[session_id]["messages"] = []
-    _save_session(session_id)
-    return jsonify({"ok": True})
+    session["messages"] = []
+    session["updated"] = datetime.now().isoformat()
+    session["hermes_session_id"] = None
+    session["transport_mode"] = None
+    session["continuity_mode"] = None
+    session["transport_notice"] = ""
+    _write_session(session)
+    return jsonify({"ok": True, "session": _chat_session_meta(session)})
 
 
 @app.route("/api/chat/status", methods=["GET"])
 @require_token
 def api_chat_status():
     api_server = _check_api_server()
+    default_api_ok, default_api_reason, default_api_probe = _api_server_probe(timeout=2)
     image_support, image_reason = _image_attachment_support_status()
+    vision_ready, vision_reason = _vision_configured()
+    vision_target = _resolve_api_target(prefer_vision=True)
     return jsonify({
         "api_server": api_server,
-        "api_url": HERMES_API_URL,
+        "api_url": _runtime_env_value("HERMES_API_URL", HERMES_API_URL),
+        "api_probe": {
+            "reachable": default_api_ok,
+            "reason": default_api_reason,
+            "probe": default_api_probe,
+        },
         "capabilities": {
             "text_attachments": True,
             "image_attachments": image_support,
@@ -1979,6 +3396,26 @@ def api_chat_status():
         },
         "capability_reasons": {
             "image_attachments": image_reason,
+        },
+        "request_lifecycle": {
+            "chat_timeout_seconds": CHAT_REQUEST_TIMEOUT,
+            "cancel_supported": {
+                CHAT_TRANSPORT_CLI: True,
+                CHAT_TRANSPORT_API: False,
+            },
+            "continuity": {
+                CHAT_TRANSPORT_CLI: CHAT_CONTINUITY_HERMES,
+                CHAT_TRANSPORT_API: CHAT_CONTINUITY_LOCAL,
+            },
+        },
+        "readiness": {
+            "screenshots_ready": image_support,
+            "vision_configured": vision_ready,
+            "vision_reason": vision_reason,
+            "vision_api_url": vision_target.get("base_url") or _runtime_env_value("HERMES_API_URL", HERMES_API_URL),
+            "vision_model": vision_target.get("model") if vision_ready else "",
+            "api_reachable": default_api_ok,
+            "api_reason": default_api_reason,
         },
     })
 
