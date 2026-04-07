@@ -450,6 +450,10 @@ class HermesWebUISmokeTests(unittest.TestCase):
         self.assertEqual(target["provider"], "openrouter")
         self.assertEqual(target["api_key"], "router-secret")
 
+    def test_frontend_source_does_not_contain_python_unicode_escapes(self):
+        source = (Path(mod.APP_ROOT) / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertNotIn("\\U000", source)
+
     def test_provider_update_preserves_existing_secret_when_masked_value_is_sent(self):
         mod.cfg._config = {
             "custom_providers": [

@@ -1,6 +1,16 @@
 /* Hermes Admin Panel - Main Application JavaScript */
 
 const API = { base: '' };
+const UI_ICONS = {
+    search: '&#128269;',
+    books: '&#128218;',
+    speechBubble: '&#128172;',
+    paperclip: '&#128206;',
+    image: '&#128444;&#65039;',
+    audio: '&#127925;',
+    pdf: '&#128213;',
+    file: '&#128196;',
+};
 
 // Token management
 function getToken() {
@@ -953,13 +963,13 @@ Screens.skills = async function () {
     try {
         const data = await api('GET', '/api/skills');
         const skills = data.skills || [];
-        let html = '<div class="section-header"><span>' + skills.length + ' Skills</span><div class="search-box"><span class="search-icon">\U0001f50d</span><input type="text" class="form-input" id="skill-search" placeholder="Search skills..." oninput="filterSkills()"></div></div>';
+        let html = '<div class="section-header"><span>' + skills.length + ' Skills</span><div class="search-box"><span class="search-icon">' + UI_ICONS.search + '</span><input type="text" class="form-input" id="skill-search" placeholder="Search skills..." oninput="filterSkills()"></div></div>';
 
         const categories = {};
         skills.forEach(s => { const cat = s.category || 'general'; if (!categories[cat]) categories[cat] = []; categories[cat].push(s); });
 
         if (skills.length === 0) {
-            html += '<div class="empty-state"><div class="empty-icon">\U0001f4da</div><h3>No Skills Found</h3><p>Skills directory is empty or no SKILL.md files found.</p></div>';
+            html += '<div class="empty-state"><div class="empty-icon">' + UI_ICONS.books + '</div><h3>No Skills Found</h3><p>Skills directory is empty or no SKILL.md files found.</p></div>';
         } else {
             for (const [cat, catSkills] of Object.entries(categories)) {
                 html += '<div class="card mb-16"><div class="card-header"><span>' + escH(cat) + '</span><span class="badge badge-info">' + catSkills.length + '</span></div>';
@@ -1002,7 +1012,7 @@ Screens.channels = async function () {
         const data = await api('GET', '/api/channels');
         const channels = data.channels || [];
         if (channels.length === 0) {
-            content.innerHTML = '<div class="empty-state"><div class="empty-icon">\U0001f4ac</div><h3>No Channels</h3><p>No messaging channels configured.</p></div>';
+            content.innerHTML = '<div class="empty-state"><div class="empty-icon">' + UI_ICONS.speechBubble + '</div><h3>No Channels</h3><p>No messaging channels configured.</p></div>';
             return;
         }
         let html = '';
@@ -2428,7 +2438,7 @@ function chatRenderMessages() {
             : '<svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>';
         let filesHtml = '';
         if (files && files.length > 0) {
-            filesHtml = '<div class="chat-msg-files">' + files.map(f => '<span class="chat-file-tag"><span>\U0001f4ce</span>' + escH(f) + '</span>').join('') + '</div>';
+            filesHtml = '<div class="chat-msg-files">' + files.map(f => '<span class="chat-file-tag"><span>' + UI_ICONS.paperclip + '</span>' + escH(f) + '</span>').join('') + '</div>';
         }
         const bubbleHtml = content ? '<div class="chat-bubble">' + chatRenderMd(content) + '</div>' : '';
         const div = document.createElement('div');
@@ -2990,7 +3000,7 @@ function chatAppendMsg(role, content, files = []) {
 
     let filesHtml = '';
     if (files && files.length > 0) {
-        filesHtml = '<div class="chat-msg-files">' + files.map(f => '<span class="chat-file-tag"><span>\U0001f4ce</span>' + escH(f) + '</span>').join('') + '</div>';
+        filesHtml = '<div class="chat-msg-files">' + files.map(f => '<span class="chat-file-tag"><span>' + UI_ICONS.paperclip + '</span>' + escH(f) + '</span>').join('') + '</div>';
     }
 
     let bubbleHtml = '';
@@ -3138,7 +3148,15 @@ function chatRenderFileBar() {
     ).join('');
 }
 
-function chatFileIcon(mime) { return mime?.startsWith('image/') ? '\U0001f5bc\ufe0f' : mime?.startsWith('audio/') ? '\U0001f3b5' : mime?.includes('pdf') ? '\U0001f4d5' : '\U0001f4c4'; }
+function chatFileIcon(mime) {
+    return mime?.startsWith('image/')
+        ? UI_ICONS.image
+        : mime?.startsWith('audio/')
+            ? UI_ICONS.audio
+            : mime?.includes('pdf')
+                ? UI_ICONS.pdf
+                : UI_ICONS.file;
+}
 function chatFmtSize(b) { return b < 1024 ? b + ' B' : b < 1048576 ? (b / 1024).toFixed(1) + ' KB' : (b / 1048576).toFixed(1) + ' MB'; }
 
 function chatSyncSendButton() {

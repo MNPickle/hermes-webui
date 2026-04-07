@@ -71,6 +71,14 @@ def current_screen(page) -> str:
     )
 
 
+def assert_screen_has_no_broken_literals(page, screen: str, timeout_ms: int = 5000) -> None:
+    page.evaluate(f"window.navigate('{screen}')")
+    page.wait_for_timeout(1000)
+    text = page.locator("#content").inner_text(timeout=timeout_ms)
+    bad_tokens = [token for token in ("U000", "undefined", "NaN") if token in text]
+    expect(not bad_tokens, f"{screen} screen contains broken UI text: {bad_tokens}")
+
+
 def find_first_folder_with_chats(page):
     cards = page.locator(".folder-admin-card")
     total = cards.count()
@@ -131,6 +139,8 @@ def main() -> int:
         )
         page.evaluate("() => window.chatApplySessionMetadata(null)")
         wait(page, 150)
+        assert_screen_has_no_broken_literals(page, "skills")
+        assert_screen_has_no_broken_literals(page, "channels")
 
         page.click('button[data-screen="folders"]')
         page.wait_for_selector(".folder-admin-card", timeout=10000)
