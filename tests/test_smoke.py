@@ -811,6 +811,13 @@ class HermesWebUISmokeTests(unittest.TestCase):
             jobs = listed.get_json()["jobs"]
             self.assertTrue(any(job["id"] == job_id and job["name"] == "Daily" for job in jobs))
 
+    def test_release_version_marker_matches_first_stable_release(self):
+        template = (mod.APP_ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+        script = (mod.APP_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("UI v1.0.0", template)
+        self.assertIn("const WEB_UI_VERSION = '1.0.0';", script)
+        self.assertNotIn("v0.4.0", template)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 /* Hermes Admin Panel - Main Application JavaScript */
 
 const API = { base: '' };
+const WEB_UI_VERSION = '1.0.0';
 const UI_ICONS = {
     search: '&#128269;',
     books: '&#128218;',
@@ -285,9 +286,14 @@ async function checkHealth() {
         dot.className = 'status-dot ' + (running ? 'online' : 'warning');
         txt.textContent = running ? 'Gateway Running' : 'Gateway Stopped';
         const ver = document.getElementById('sidebar-version');
-        if (ver && d.version) {
-            const firstLine = d.version.split('\n')[0].replace('Hermes Agent ', '');
-            ver.textContent = 'v' + firstLine;
+        if (ver) {
+            ver.textContent = `UI v${WEB_UI_VERSION}`;
+            if (d.version) {
+                const firstLine = d.version.split('\n')[0].replace('Hermes Agent ', '');
+                ver.title = `Hermes Agent ${firstLine}`;
+            } else {
+                ver.removeAttribute('title');
+            }
         }
     } catch (e) {
         document.querySelector('#connection-status .status-dot').className = 'status-dot error';

@@ -235,4 +235,4 @@ If issues occur:
 ---
 
 Generated: 2026-04-07
-Version: 1.1.1 (Deployment Checklist)
+Release: v1.0.0 (Deployment Checklist)
