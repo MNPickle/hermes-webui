@@ -126,14 +126,14 @@ def main() -> int:
             () => {
                 window.chatApplySessionMetadata({
                     continuity_mode: 'local_replay',
-                    transport_notice: 'This chat switched to API replay because image attachments require the vision/API path.',
+                    transport_notice: 'This chat is local replay only and is not attached to a resumable Hermes CLI session.',
                 });
             }
             """
         )
         wait(page, 250)
         expect(
-            "image attachments require the vision/API path"
+            "local replay only"
             in page.locator("#chat-session-banner").inner_text(timeout=3000),
             "Chat banner did not surface the specific transport notice",
         )

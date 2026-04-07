@@ -1,7 +1,7 @@
 /* Hermes Admin Panel - Main Application JavaScript */
 
 const API = { base: '' };
-const WEB_UI_VERSION = '1.0.0';
+const WEB_UI_VERSION = '1.1.0';
 const UI_ICONS = {
     search: '&#128269;',
     books: '&#128218;',
@@ -639,7 +639,7 @@ Screens.providers = async function () {
         const readiness = chatStatus?.readiness || {};
         const screenshotReady = !!readiness.screenshots_ready;
         const screenshotReason = screenshotReady
-            ? 'Pasted screenshots can be sent through the configured vision chat path.'
+            ? 'Pasted screenshots can be analyzed through the configured vision sidecar while Hermes CLI remains the main session.'
             : (chatStatus?.capability_reasons?.image_attachments || readiness.vision_reason || 'A vision model and reachable OpenAI-compatible API are required before screenshot paste can work.');
         const visionCfg = aux.vision || {};
 
@@ -1207,6 +1207,9 @@ const chatState = {
     currentTransport: null,
     currentContinuity: null,
     currentTransportNotice: '',
+    currentHermesSessionBacked: false,
+    lastTurnUsedSidecarVision: false,
+    lastTurnSidecarAssets: [],
     currentFolderId: '',
     currentFolderTitle: '',
     currentWorkspaceRoots: [],
@@ -1342,6 +1345,9 @@ function chatApplySessionMetadata(meta = null) {
     chatState.currentTransport = session.transport_mode || null;
     chatState.currentContinuity = session.continuity_mode || null;
     chatState.currentTransportNotice = session.transport_notice || '';
+    chatState.currentHermesSessionBacked = !!session.hermes_session_backed;
+    chatState.lastTurnUsedSidecarVision = !!session.last_turn_used_sidecar_vision;
+    chatState.lastTurnSidecarAssets = Array.isArray(session.last_turn_sidecar_asset_names) ? session.last_turn_sidecar_asset_names.slice() : [];
     chatState.currentFolderId = session.folder_id || '';
     chatState.currentFolderTitle = session.folder_title || session.folder_id || '';
     chatState.currentWorkspaceRoots = Array.isArray(session.workspace_roots) ? session.workspace_roots.slice() : [];
@@ -1478,12 +1484,8 @@ function chatRenderContextPanel() {
 
 function chatExpectedTransport() {
     if (chatState.currentTransport === 'api') return 'api';
-    const hasPendingImages = chatState.pendingFiles.some(f => (f.type || '').toLowerCase().startsWith('image/'));
-    if (chatState.currentTransport === 'cli') {
-        return hasPendingImages && chatState.capabilities.imageAttachments ? 'api' : 'cli';
-    }
+    if (chatState.currentTransport === 'cli') return 'cli';
     if (chatState.apiServerEnabled) return 'api';
-    if (hasPendingImages && chatState.capabilities.imageAttachments) return 'api';
     return 'cli';
 }
 
@@ -1494,24 +1496,39 @@ function chatExpectedCancelSupport() {
 function chatRenderSessionBanner() {
     const banner = document.getElementById('chat-session-banner');
     if (!banner) return;
+    const badges = [];
     let text = chatState.currentTransportNotice || '';
-    let cls = 'info';
-    if (text) {
-        cls = 'warning';
+    let cls = 'success';
+    if (chatState.currentContinuity === 'hermes_resume') {
+        badges.push('<span class="badge badge-success">Hermes session backed</span>');
+        text = text || 'This chat stays attached to the Hermes CLI session.';
     } else if (chatState.currentContinuity === 'local_replay') {
-        text = 'This chat is using API memory mode instead of Hermes CLI resume.';
+        badges.push('<span class="badge badge-warning">Local replay only</span>');
+        text = text || 'This chat is not attached to a resumable Hermes CLI session.';
         cls = 'warning';
     } else if (chatState.currentContinuity === 'cli_without_resume') {
-        text = 'Hermes did not return a resumable session id for this chat yet, so follow-up continuity may be limited.';
+        badges.push('<span class="badge badge-warning">CLI without resume</span>');
+        text = text || 'Hermes did not return a resumable session id for this chat yet, so follow-up continuity may be limited.';
         cls = 'warning';
     }
-    if (!text) {
+    if (chatState.currentTransport === 'api') {
+        badges.push('<span class="badge badge-warning">API replay transport</span>');
+    } else if (chatState.currentTransport === 'cli') {
+        badges.push('<span class="badge badge-info">Hermes CLI transport</span>');
+    }
+    if (chatState.lastTurnUsedSidecarVision) {
+        badges.push('<span class="badge badge-info">Sidecar vision used</span>');
+        if (!chatState.currentTransportNotice && chatState.lastTurnSidecarAssets.length) {
+            text += ' Latest sidecar assets: ' + chatState.lastTurnSidecarAssets.join(', ') + '.';
+        }
+    }
+    if (!badges.length && !text) {
         banner.className = 'chat-session-banner hidden';
-        banner.textContent = '';
+        banner.innerHTML = '';
         return;
     }
     banner.className = 'chat-session-banner ' + cls;
-    banner.textContent = text;
+    banner.innerHTML = '<div class="chat-session-banner-badges">' + badges.join('') + '</div>' + (text ? '<div class="chat-session-banner-copy">' + escH(text) + '</div>' : '');
 }
 
 function chatApplyComposerCapabilities() {
@@ -2435,25 +2452,47 @@ function chatRenderMessages() {
         return;
     }
     messages.forEach(m => {
-        const role = m.role;
-        const content = m.content;
-        const files = m.files || [];
-        const time = m.timestamp ? new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
-        const avatarSvg = role === 'user'
-            ? '<svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>'
-            : '<svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>';
-        let filesHtml = '';
-        if (files && files.length > 0) {
-            filesHtml = '<div class="chat-msg-files">' + files.map(f => '<span class="chat-file-tag"><span>' + UI_ICONS.paperclip + '</span>' + escH(f) + '</span>').join('') + '</div>';
-        }
-        const bubbleHtml = content ? '<div class="chat-bubble">' + chatRenderMd(content) + '</div>' : '';
-        const div = document.createElement('div');
-        div.className = 'chat-msg ' + role;
-        div.innerHTML = '<div class="chat-msg-inner"><div class="chat-msg-avatar">' + avatarSvg + '</div><div class="chat-msg-body">' + bubbleHtml + filesHtml + (time ? '<div class="chat-msg-time">' + time + '</div>' : '') + '</div></div>';
-        msgs.appendChild(div);
+        msgs.appendChild(chatBuildMessageNode(m));
     });
     msgs.scrollTop = msgs.scrollHeight;
     chatEnhanceCodeBlocks();
+}
+
+function chatMessageBadges(message) {
+    const badges = [];
+    if (message?.sidecar_vision?.used) {
+        badges.push('<span class="badge badge-info">Sidecar vision</span>');
+        if (message.sidecar_vision.reanalysis) {
+            badges.push('<span class="badge">Re-analysis</span>');
+        }
+    }
+    return badges.length ? '<div class="chat-msg-badges">' + badges.join('') + '</div>' : '';
+}
+
+function chatBuildMessageNode(message) {
+    const role = message.role;
+    const content = message.content;
+    const files = message.files || [];
+    const time = message.timestamp ? new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+    const avatarSvg = role === 'user'
+        ? '<svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>'
+        : '<svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>';
+    let filesHtml = '';
+    if (files && files.length > 0) {
+        filesHtml = '<div class="chat-msg-files">' + files.map(f => '<span class="chat-file-tag"><span>' + UI_ICONS.paperclip + '</span>' + escH(f) + '</span>').join('') + '</div>';
+    }
+    let bubbleHtml = '';
+    if (content) {
+        const tmp = document.createElement('div');
+        tmp.innerHTML = chatRenderMd(content);
+        const plainText = tmp.textContent || tmp.innerText || content;
+        const escapedPlain = escH(plainText);
+        bubbleHtml = '<div class="chat-bubble"><div class="chat-bubble-content">' + chatRenderMd(content) + '</div><button class="chat-msg-copy" onclick="chatCopyMsg(this)" data-text="' + escapedPlain + '" title="Copy message"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>';
+    }
+    const div = document.createElement('div');
+    div.className = 'chat-msg ' + role;
+    div.innerHTML = '<div class="chat-msg-inner"><div class="chat-msg-avatar">' + avatarSvg + '</div><div class="chat-msg-body">' + chatMessageBadges(message) + bubbleHtml + filesHtml + (time ? '<div class="chat-msg-time">' + time + '</div>' : '') + '</div></div>';
+    return div;
 }
 
 function chatEnhanceCodeBlocks() {
@@ -2901,9 +2940,12 @@ window.chatSend = async function () {
         }, controller.signal);
         chatState.currentSessionId = resp.session_id;
         chatApplySessionMetadata(resp.session || null);
-        const assistantMsg = { role: 'assistant', content: resp.response, timestamp: new Date().toISOString() };
+        if (resp.user_message && chatState.localMessages.length > 0) {
+            chatState.localMessages[chatState.localMessages.length - 1] = resp.user_message;
+        }
+        const assistantMsg = resp.assistant_message || { role: 'assistant', content: resp.response, timestamp: new Date().toISOString() };
         chatState.localMessages.push(assistantMsg);
-        chatAppendMsg('assistant', resp.response);
+        chatRenderMessages();
     } catch (e) {
         input.value = message;
         chatAutoResize(input);
@@ -2991,36 +3033,16 @@ window.chatExport = function () {
     toast('Chat exported', 'success', 2000);
 };
 
-function chatAppendMsg(role, content, files = []) {
+function chatAppendMsg(role, content, files = [], messageMeta = {}) {
     const container = document.getElementById('chat-messages');
     if (!container) return;
-    const avatarSvg = role === 'user'
-        ? '<svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>'
-        : '<svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>';
-
-    // Date-aware timestamp
-    const now = new Date();
-    const dateStr = now.toLocaleDateString([], { month: 'short', day: 'numeric' });
-    const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    const time = dateStr + ' \u00b7 ' + timeStr;
-
-    let filesHtml = '';
-    if (files && files.length > 0) {
-        filesHtml = '<div class="chat-msg-files">' + files.map(f => '<span class="chat-file-tag"><span>' + UI_ICONS.paperclip + '</span>' + escH(f) + '</span>').join('') + '</div>';
-    }
-
-    let bubbleHtml = '';
-    if (content) {
-        const tmp = document.createElement('div');
-        tmp.innerHTML = chatRenderMd(content);
-        const plainText = tmp.textContent || tmp.innerText || content;
-        const escapedPlain = escH(plainText);
-        bubbleHtml = '<div class="chat-bubble"><div class="chat-bubble-content">' + chatRenderMd(content) + '</div><button class="chat-msg-copy" onclick="chatCopyMsg(this)" data-text="' + escapedPlain + '" title="Copy message"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>';
-    }
-
-    const div = document.createElement('div');
-    div.className = 'chat-msg ' + role;
-    div.innerHTML = '<div class="chat-msg-inner"><div class="chat-msg-avatar">' + avatarSvg + '</div><div class="chat-msg-body">' + bubbleHtml + filesHtml + '<div class="chat-msg-time">' + time + '</div></div></div>';
+    const div = chatBuildMessageNode({
+        role,
+        content,
+        files,
+        timestamp: new Date().toISOString(),
+        ...messageMeta,
+    });
     container.appendChild(div);
     container.scrollTop = container.scrollHeight;
 }

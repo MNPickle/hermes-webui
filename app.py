@@ -160,6 +160,20 @@ CHAT_TRANSPORT_API = "api"
 CHAT_CONTINUITY_HERMES = "hermes_resume"
 CHAT_CONTINUITY_LOCAL = "local_replay"
 CHAT_CONTINUITY_LIMITED = "cli_without_resume"
+VISION_REFERENCE_HINT_RE = re.compile(
+    r"\b("
+    r"screenshot|screen|image|photo|picture|diagram|ui"
+    r")\b.*\b("
+    r"earlier|previous|prior|before|above|same|that|those|attached|last"
+    r")\b"
+    r"|"
+    r"\b("
+    r"earlier|previous|prior|before|above|same|that|those|attached|last"
+    r")\b.*\b("
+    r"screenshot|screen|image|photo|picture|diagram|ui"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 @contextmanager
@@ -196,10 +210,109 @@ def _normalize_chat_session(session: dict) -> dict:
     session.setdefault("transport_mode", transport_mode)
     session.setdefault("continuity_mode", continuity_mode)
     session.setdefault("transport_notice", "")
+    session["messages"] = _normalize_chat_messages(session.get("messages"))
+    session["vision_assets"] = _normalize_vision_assets(session.get("vision_assets"))
     session["folder_id"] = folder_id.strip()
     session["workspace_roots"] = _clean_string_list(session.get("workspace_roots"))
     session["source_docs"] = _clean_string_list(session.get("source_docs"))
     return session
+
+
+def _normalize_chat_messages(messages) -> list[dict]:
+    if not isinstance(messages, list):
+        return []
+    normalized = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        entry = copy.deepcopy(message)
+        entry["role"] = str(entry.get("role") or "").strip() or "user"
+        entry["content"] = str(entry.get("content") or "")
+        entry["files"] = _clean_string_list(entry.get("files"))
+        entry["attachment_refs"] = _normalize_attachment_refs(entry.get("attachment_refs"))
+        sidecar_state = entry.get("sidecar_vision")
+        if isinstance(sidecar_state, dict):
+            entry["sidecar_vision"] = {
+                "used": bool(sidecar_state.get("used")),
+                "status": str(sidecar_state.get("status") or "").strip() or ("ok" if sidecar_state.get("used") else ""),
+                "asset_ids": _clean_string_list(sidecar_state.get("asset_ids")),
+                "summary": str(sidecar_state.get("summary") or "").strip(),
+                "analysis_mode": str(sidecar_state.get("analysis_mode") or "").strip(),
+                "reanalysis": bool(sidecar_state.get("reanalysis")),
+            }
+        elif "sidecar_vision" in entry:
+            entry.pop("sidecar_vision", None)
+        normalized.append(entry)
+    return normalized
+
+
+def _normalize_attachment_refs(values) -> list[dict]:
+    if not isinstance(values, list):
+        return []
+    refs = []
+    seen = set()
+    for item in values:
+        if not isinstance(item, dict):
+            continue
+        stored_as = secure_filename(str(item.get("stored_as") or "").strip())
+        if not stored_as or stored_as in seen:
+            continue
+        seen.add(stored_as)
+        display_name = str(
+            item.get("display_name")
+            or item.get("name")
+            or stored_as
+        ).strip() or stored_as
+        ref = {
+            "stored_as": stored_as,
+            "display_name": display_name,
+        }
+        kind = str(item.get("kind") or "").strip().lower()
+        mime_type = str(item.get("mime_type") or "").strip()
+        if kind:
+            ref["kind"] = kind
+        if mime_type:
+            ref["mime_type"] = mime_type
+        refs.append(ref)
+    return refs
+
+
+def _normalize_vision_assets(values) -> list[dict]:
+    if not isinstance(values, list):
+        return []
+    assets = []
+    seen = set()
+    for item in values:
+        if not isinstance(item, dict):
+            continue
+        asset_id = str(item.get("id") or "").strip()
+        stored_as = secure_filename(str(item.get("stored_as") or "").strip())
+        if not asset_id or not stored_as or asset_id in seen:
+            continue
+        seen.add(asset_id)
+        asset = {
+            "id": asset_id,
+            "stored_as": stored_as,
+            "display_name": str(item.get("display_name") or stored_as).strip() or stored_as,
+            "mime_type": str(item.get("mime_type") or "").strip(),
+            "created_at": str(item.get("created_at") or "").strip(),
+            "source_message_timestamp": str(item.get("source_message_timestamp") or "").strip(),
+        }
+        source_index = item.get("source_message_index")
+        if isinstance(source_index, int):
+            asset["source_message_index"] = source_index
+        last_analysis = item.get("last_analysis")
+        if isinstance(last_analysis, dict):
+            asset["last_analysis"] = {
+                "summary": str(last_analysis.get("summary") or "").strip(),
+                "raw_text": str(last_analysis.get("raw_text") or "").strip(),
+                "focus": str(last_analysis.get("focus") or "").strip(),
+                "analyzed_at": str(last_analysis.get("analyzed_at") or "").strip(),
+                "model": str(last_analysis.get("model") or "").strip(),
+                "provider": str(last_analysis.get("provider") or "").strip(),
+            }
+        assets.append(asset)
+    return assets
 
 
 def _clean_string_list(values) -> list[str]:
@@ -2416,7 +2529,7 @@ def _validate_attachment_selection(files: list[Path], image_support: bool) -> li
         suffix = f.suffix.lower()
         if suffix in IMAGE_EXTENSIONS:
             if not image_support:
-                errors.append(f"{f.name} is an image, but the configured Hermes vision/API path is not ready")
+                errors.append(f"{f.name} is an image, but the configured Hermes vision sidecar is not ready")
             continue
         if suffix in AUDIO_EXTENSIONS:
             errors.append(f"{f.name} is audio, and audio uploads are not supported in Hermes chat")
@@ -2446,7 +2559,7 @@ def _summarize_attachments(files: list[Path], image_support: bool, display_names
             if image_support:
                 image_files.append(f)
             else:
-                unsupported.append(f"{display_name} (image attachments require Hermes gateway/API mode)")
+                unsupported.append(f"{display_name} (image attachments require a ready Hermes vision sidecar)")
             continue
         if suffix in AUDIO_EXTENSIONS:
             unsupported.append(f"{display_name} (audio attachments are not supported in Hermes chat)")
@@ -2492,6 +2605,68 @@ def _session_has_image_history(session: dict) -> bool:
     return False
 
 
+def _build_attachment_refs(files: list[Path], display_names: dict | None = None) -> list[dict]:
+    refs = []
+    for path in files or []:
+        suffix = path.suffix.lower()
+        kind = "image" if suffix in IMAGE_EXTENSIONS else "audio" if suffix in AUDIO_EXTENSIONS else "text" if _is_text_attachment(path) else "binary"
+        refs.append({
+            "stored_as": path.name,
+            "display_name": _attachment_display_name(path, display_names),
+            "kind": kind,
+            "mime_type": _file_mime_type(path),
+        })
+    return refs
+
+
+def _latest_user_turn(session: dict) -> dict | None:
+    for message in reversed(session.get("messages", [])):
+        if isinstance(message, dict) and message.get("role") == "user":
+            return message
+    return None
+
+
+def _latest_sidecar_asset_group(session: dict) -> list[dict]:
+    asset_ids = set()
+    for message in reversed(session.get("messages", [])):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        sidecar = message.get("sidecar_vision") or {}
+        asset_ids = set(_clean_string_list(sidecar.get("asset_ids")))
+        if asset_ids:
+            break
+    if not asset_ids:
+        return []
+    assets = []
+    for asset in session.get("vision_assets", []) or []:
+        if isinstance(asset, dict) and asset.get("id") in asset_ids:
+            assets.append(copy.deepcopy(asset))
+    return assets
+
+
+def _latest_turn_used_sidecar_vision(session: dict) -> bool:
+    latest_user = _latest_user_turn(session)
+    return bool((latest_user or {}).get("sidecar_vision", {}).get("used"))
+
+
+def _latest_turn_sidecar_asset_names(session: dict) -> list[str]:
+    latest_user = _latest_user_turn(session)
+    if not latest_user:
+        return []
+    sidecar = latest_user.get("sidecar_vision") or {}
+    asset_names = []
+    asset_map = {
+        asset.get("id"): asset for asset in session.get("vision_assets", []) or []
+        if isinstance(asset, dict) and asset.get("id")
+    }
+    for asset_id in _clean_string_list(sidecar.get("asset_ids")):
+        asset = asset_map.get(asset_id) or {}
+        label = str(asset.get("display_name") or "").strip()
+        if label:
+            asset_names.append(label)
+    return asset_names
+
+
 def _chat_session_meta(session: dict) -> dict:
     normalized = _normalize_chat_session(copy.deepcopy(session))
     context = _effective_session_context(normalized)
@@ -2500,6 +2675,9 @@ def _chat_session_meta(session: dict) -> dict:
         "continuity_mode": normalized.get("continuity_mode"),
         "transport_notice": normalized.get("transport_notice") or "",
         "hermes_session_backed": normalized.get("continuity_mode") == CHAT_CONTINUITY_HERMES,
+        "last_turn_used_sidecar_vision": _latest_turn_used_sidecar_vision(normalized),
+        "last_turn_sidecar_asset_names": _latest_turn_sidecar_asset_names(normalized),
+        "vision_asset_count": len(normalized.get("vision_assets") or []),
         "folder_id": context.get("folder_id") or "",
         "folder_title": context.get("folder_title") or "",
         "workspace_roots": context.get("workspace_roots") or [],
@@ -2576,6 +2754,459 @@ def _compose_chat_turn_payload(
     return "\n\n".join(sections), image_files
 
 
+def _vision_reanalysis_requested(message: str, session: dict) -> bool:
+    if not message or not _latest_sidecar_asset_group(session):
+        return False
+    return bool(VISION_REFERENCE_HINT_RE.search(message))
+
+
+def _vision_asset_disk_path(asset: dict) -> Path | None:
+    stored_as = secure_filename(str(asset.get("stored_as") or "").strip())
+    if not stored_as:
+        return None
+    path = UPLOAD_FOLDER / stored_as
+    return path if path.exists() else None
+
+
+def _strip_json_fence(text: str) -> str:
+    stripped = str(text or "").strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    return stripped.strip()
+
+
+def _coerce_sidecar_string_list(value) -> list[str]:
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                decoded = json.loads(text)
+            except Exception:
+                decoded = None
+            if isinstance(decoded, list):
+                items = decoded
+            else:
+                items = [part.strip() for part in re.split(r"(?:\r?\n|;\s*)", text) if part.strip()]
+        else:
+            items = [part.strip() for part in re.split(r"(?:\r?\n|;\s*)", text) if part.strip()]
+            if not items:
+                items = [text]
+    else:
+        return []
+    normalized = []
+    seen = set()
+    for item in items:
+        text = str(item or "").strip()
+        text = re.sub(r"^[\-\*\u2022]+\s*", "", text)
+        text = re.sub(r"^\d+[\.\)]\s*", "", text)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        normalized.append(text)
+    return normalized
+
+
+def _find_json_object_candidates(text: str) -> list[str]:
+    raw = str(text or "")
+    candidates = []
+    seen = set()
+
+    def add(candidate: str):
+        snippet = str(candidate or "").strip()
+        if not snippet or snippet in seen:
+            return
+        seen.add(snippet)
+        candidates.append(snippet)
+
+    add(_strip_json_fence(raw))
+    for match in re.finditer(r"```(?:json)?\s*([\s\S]*?)```", raw, re.IGNORECASE):
+        add(match.group(1))
+
+    depth = 0
+    start = None
+    in_string = False
+    escape = False
+    for idx, ch in enumerate(raw):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = idx
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                add(raw[start:idx + 1])
+                start = None
+
+    candidates.sort(key=len, reverse=True)
+    return candidates
+
+
+def _looks_like_sidecar_payload(payload: dict) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    keys = set(payload.keys())
+    return bool({"overall_summary", "images", "follow_up_hints", "visible_text", "details"} & keys)
+
+
+def _extract_sidecar_json_payload(raw_text: str) -> dict | None:
+    for candidate in _find_json_object_candidates(raw_text):
+        try:
+            payload = json.loads(candidate)
+        except Exception:
+            continue
+        if _looks_like_sidecar_payload(payload):
+            return payload
+        if isinstance(payload, dict):
+            for value in payload.values():
+                if _looks_like_sidecar_payload(value):
+                    return value
+            return payload
+    return None
+
+
+def _parse_sidecar_payload(raw_text: str, image_labels: list[str]) -> dict:
+    raw_text = str(raw_text or "").strip()
+    fallback = {
+        "overall_summary": raw_text,
+        "images": [],
+        "follow_up_hints": [],
+        "raw_text": raw_text,
+    }
+    if not raw_text:
+        return fallback
+    payload = _extract_sidecar_json_payload(raw_text)
+    if not payload:
+        return fallback
+    images = payload.get("images")
+    normalized_images = []
+    overall_summary = str(payload.get("overall_summary") or "").strip()
+    if isinstance(images, list):
+        for idx, item in enumerate(images):
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "").strip()
+            if not label:
+                label = image_labels[idx] if idx < len(image_labels) else f"Image {idx + 1}"
+            summary = str(item.get("summary") or "").strip()
+            if not summary:
+                summary = overall_summary
+            normalized_images.append({
+                "label": label,
+                "summary": summary,
+                "visible_text": _coerce_sidecar_string_list(item.get("visible_text")),
+                "details": _coerce_sidecar_string_list(item.get("details")),
+                "follow_up_hints": _coerce_sidecar_string_list(item.get("follow_up_hints")),
+            })
+    if not overall_summary and normalized_images:
+        overall_summary = normalized_images[0].get("summary") or ""
+    if image_labels and not normalized_images:
+        top_level_visible_text = _coerce_sidecar_string_list(payload.get("visible_text"))
+        top_level_details = _coerce_sidecar_string_list(payload.get("details"))
+        top_level_hints = _coerce_sidecar_string_list(payload.get("follow_up_hints"))
+        for idx, label in enumerate(image_labels):
+            normalized_images.append({
+                "label": label,
+                "summary": overall_summary if idx == 0 else "",
+                "visible_text": top_level_visible_text if idx == 0 else [],
+                "details": top_level_details if idx == 0 else [],
+                "follow_up_hints": top_level_hints if idx == 0 else [],
+            })
+    return {
+        "overall_summary": overall_summary,
+        "images": normalized_images,
+        "follow_up_hints": _coerce_sidecar_string_list(payload.get("follow_up_hints")),
+        "raw_text": raw_text,
+    }
+
+
+def _format_sidecar_context_block(sidecar_result: dict) -> str:
+    if not sidecar_result:
+        return ""
+    lines = ["Vision sidecar analysis:"]
+    if sidecar_result.get("reanalysis"):
+        lines.append("This analysis refreshes an earlier screenshot because the user referred back to it.")
+    overall_summary = str(sidecar_result.get("overall_summary") or "").strip()
+    if overall_summary:
+        lines.append(f"Overall summary: {overall_summary}")
+    image_results = sidecar_result.get("images") or []
+    for idx, item in enumerate(image_results, start=1):
+        label = str(item.get("label") or f"Image {idx}").strip()
+        asset_id = str(item.get("asset_id") or "").strip()
+        lines.append(f"{label}{f' [{asset_id}]' if asset_id else ''}:")
+        summary = str(item.get("summary") or "").strip()
+        if summary:
+            lines.append(f"- Summary: {summary}")
+        visible_text = [str(value).strip() for value in (item.get("visible_text") or []) if str(value).strip()]
+        if visible_text:
+            lines.append("- Visible text:")
+            lines.extend(f"  - {value}" for value in visible_text)
+        details = [str(value).strip() for value in (item.get("details") or []) if str(value).strip()]
+        if details:
+            lines.append("- Details:")
+            lines.extend(f"  - {value}" for value in details)
+        follow_up_hints = [str(value).strip() for value in (item.get("follow_up_hints") or []) if str(value).strip()]
+        if follow_up_hints:
+            lines.append("- Follow-up hints:")
+            lines.extend(f"  - {value}" for value in follow_up_hints)
+    return "\n".join(lines)
+
+
+def _update_session_vision_assets(
+    session: dict,
+    image_files: list[Path],
+    parsed_payload: dict,
+    *,
+    source_message_index: int,
+    source_message_timestamp: str,
+    focus_message: str,
+    target: dict,
+) -> list[str]:
+    assets = session.setdefault("vision_assets", [])
+    now = datetime.now().isoformat()
+    asset_ids = []
+    existing_by_stored_as = {
+        asset.get("stored_as"): asset for asset in assets
+        if isinstance(asset, dict) and asset.get("stored_as")
+    }
+    per_image_results = parsed_payload.get("images") or []
+    for idx, image_file in enumerate(image_files):
+        stored_as = image_file.name
+        asset = existing_by_stored_as.get(stored_as)
+        if not asset:
+            asset = {
+                "id": f"vis-{uuid.uuid4().hex[:10]}",
+                "stored_as": stored_as,
+                "display_name": image_file.name,
+                "mime_type": _file_mime_type(image_file),
+                "created_at": now,
+                "source_message_index": source_message_index,
+                "source_message_timestamp": source_message_timestamp,
+            }
+            assets.append(asset)
+            existing_by_stored_as[stored_as] = asset
+        image_result = per_image_results[idx] if idx < len(per_image_results) else {}
+        asset["display_name"] = str(image_result.get("label") or asset.get("display_name") or image_file.name).strip() or image_file.name
+        asset["mime_type"] = _file_mime_type(image_file)
+        asset["source_message_index"] = source_message_index
+        asset["source_message_timestamp"] = source_message_timestamp
+        asset["last_analysis"] = {
+            "summary": str(image_result.get("summary") or parsed_payload.get("overall_summary") or "").strip(),
+            "raw_text": str(parsed_payload.get("raw_text") or "").strip(),
+            "focus": focus_message.strip(),
+            "analyzed_at": now,
+            "model": str(target.get("model") or "").strip(),
+            "provider": str(target.get("provider") or "").strip(),
+        }
+        asset_ids.append(asset["id"])
+        if idx < len(per_image_results):
+            per_image_results[idx]["asset_id"] = asset["id"]
+    return asset_ids
+
+
+def _chat_backend_error_detail(exc: Exception) -> str:
+    message = str(exc or "").strip()
+    message = re.sub(r"^API server returned HTTP \d+:\s*", "", message)
+    message = re.sub(r"^API server error:\s*", "", message)
+    return message.strip()
+
+
+def _chat_backend_error_is_rate_limited(exc: Exception) -> bool:
+    detail = _chat_backend_error_detail(exc).lower()
+    return (
+        "rate limit" in detail
+        or "rate-limit" in detail
+        or "rate limited" in detail
+        or "too many requests" in detail
+        or "http 429" in str(exc).lower()
+    )
+
+
+def _chat_completion_request(target: dict, messages: list[dict]) -> str:
+    import socket
+    import urllib.error
+    import urllib.request
+
+    payload = {"model": target["model"] or "hermes-agent", "messages": messages, "stream": False}
+    headers = _api_server_headers(target.get("api_key"), target.get("provider"))
+    headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(
+        _build_openai_api_url(target["base_url"], "chat/completions"),
+        data=json.dumps(payload).encode(),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=CHAT_REQUEST_TIMEOUT) as resp:
+            result = json.loads(resp.read().decode())
+            if isinstance(result, dict) and result.get("error"):
+                error_payload = result.get("error") or {}
+                if isinstance(error_payload, dict):
+                    error_message = error_payload.get("message") or error_payload.get("code") or "API server returned an error"
+                else:
+                    error_message = str(error_payload)
+                raise ChatBackendError(f"API server error: {error_message}")
+            choices = result.get("choices") or []
+            if not choices:
+                raise ChatBackendError("API server returned no choices")
+            message = choices[0].get("message") or {}
+            content = message.get("content")
+            if isinstance(content, list):
+                content = "\n".join(
+                    item.get("text", "") for item in content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                ).strip()
+            if not isinstance(content, str) or not content.strip():
+                raise ChatBackendError("API server returned an empty message")
+            return content
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+        detail = _summarize_upstream_error_detail(body, str(exc.reason or "upstream request failed"))
+        raise ChatBackendError(f"API server returned HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        reason_text = str(reason)
+        if isinstance(reason, TimeoutError) or "timed out" in reason_text.lower():
+            raise ChatRequestTimeout(f"API server did not respond within {CHAT_REQUEST_TIMEOUT} seconds") from exc
+        raise ChatBackendError(f"API server is unreachable: {reason_text}") from exc
+    except socket.timeout as exc:
+        raise ChatRequestTimeout(f"API server did not respond within {CHAT_REQUEST_TIMEOUT} seconds") from exc
+
+
+def _run_sidecar_vision_analysis(
+    session: dict,
+    message: str,
+    files: list[Path],
+    *,
+    user_message: dict,
+    file_display_names: dict | None = None,
+) -> dict:
+    image_files = [path for path in files or [] if path.suffix.lower() in IMAGE_EXTENSIONS]
+    reanalysis = False
+    if not image_files and _vision_reanalysis_requested(message, session):
+        image_files = [path for path in (
+            _vision_asset_disk_path(asset) for asset in _latest_sidecar_asset_group(session)
+        ) if path is not None]
+        reanalysis = bool(image_files)
+    if not image_files:
+        return {}
+
+    import base64
+
+    image_labels = [
+        _attachment_display_name(path, file_display_names) if path in (files or []) else (path.name if path else "Image")
+        for path in image_files
+    ]
+    user_text = message.strip() or "User attached screenshots without extra text."
+    if reanalysis:
+        analysis_goal = (
+            "The user is asking a follow-up about an earlier screenshot. Refresh the visual analysis with extra focus on "
+            f"this question: {user_text}"
+        )
+    else:
+        analysis_goal = f"The user attached new screenshots. Focus on what matters for this request: {user_text}"
+    content = [{
+        "type": "text",
+        "text": (
+            "You are a sidecar vision interpreter for Hermes CLI. Analyze the images and return JSON only with this schema: "
+            "{\"overall_summary\":\"...\",\"follow_up_hints\":[\"...\"],\"images\":["
+            "{\"label\":\"...\",\"summary\":\"...\",\"visible_text\":[\"...\"],\"details\":[\"...\"],\"follow_up_hints\":[\"...\"]}"
+            "]}. Keep each list concise and preserve exact visible text when it matters.\n"
+            f"{analysis_goal}"
+        ),
+    }]
+    for idx, image_file in enumerate(image_files, start=1):
+        label = image_labels[idx - 1] if idx - 1 < len(image_labels) else image_file.name
+        try:
+            with image_file.open("rb") as handle:
+                b64 = base64.b64encode(handle.read()).decode("utf-8")
+        except Exception as exc:
+            raise ChatBackendError(f"Vision sidecar could not read {image_file.name}: {exc}") from exc
+        ext = image_file.suffix.lower().replace(".", "") or "png"
+        content.append({"type": "text", "text": f"Image {idx}: {label}"})
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/{ext};base64,{b64}"}})
+
+    target = _resolve_api_target(prefer_vision=True)
+    try:
+        raw_text = _chat_completion_request(target, [{"role": "user", "content": content}])
+    except ChatBackendError as exc:
+        model_id = str(target.get("model") or "the configured vision model").strip()
+        detail = _chat_backend_error_detail(exc) or "upstream request failed"
+        if _chat_backend_error_is_rate_limited(exc):
+            raise ChatBackendError(
+                f"Vision sidecar is temporarily rate-limited for {model_id}. Retry shortly or switch the vision model/provider in Providers. Details: {detail}",
+                status_code=503,
+            ) from exc
+        raise ChatBackendError(
+            f"Vision sidecar failed for {model_id}. Details: {detail}",
+            status_code=getattr(exc, "status_code", 502),
+        ) from exc
+    parsed_payload = _parse_sidecar_payload(raw_text, image_labels)
+    asset_ids = _update_session_vision_assets(
+        session,
+        image_files,
+        parsed_payload,
+        source_message_index=len(session.get("messages", [])) - 1,
+        source_message_timestamp=str(user_message.get("timestamp") or ""),
+        focus_message=user_text,
+        target=target,
+    )
+    summary = parsed_payload.get("overall_summary") or parsed_payload.get("raw_text") or ""
+    user_message["sidecar_vision"] = {
+        "used": True,
+        "status": "ok",
+        "asset_ids": asset_ids,
+        "summary": str(summary).strip(),
+        "analysis_mode": "reanalysis" if reanalysis else "sidecar",
+        "reanalysis": reanalysis,
+    }
+    return {
+        "overall_summary": parsed_payload.get("overall_summary") or parsed_payload.get("raw_text") or "",
+        "images": parsed_payload.get("images") or [],
+        "follow_up_hints": parsed_payload.get("follow_up_hints") or [],
+        "raw_text": parsed_payload.get("raw_text") or raw_text.strip(),
+        "asset_ids": asset_ids,
+        "reanalysis": reanalysis,
+        "analysis_mode": "reanalysis" if reanalysis else "sidecar",
+    }
+
+
+def _compose_cli_prompt_with_sidecar(
+    session: dict,
+    message: str,
+    files: list[Path],
+    *,
+    sidecar_result: dict | None = None,
+    file_display_names: dict | None = None,
+) -> str:
+    non_image_files = [path for path in files or [] if path.suffix.lower() not in IMAGE_EXTENSIONS]
+    prompt, _ = _compose_chat_turn_payload(
+        session,
+        message,
+        non_image_files,
+        image_support=False,
+        display_names=file_display_names,
+    )
+    sidecar_block = _format_sidecar_context_block(sidecar_result or {})
+    sections = [section for section in (prompt, sidecar_block) if section]
+    return "\n\n".join(sections)
+
+
 def _plan_chat_request(session: dict, files: list[Path]) -> dict:
     normalized = _normalize_chat_session(copy.deepcopy(session))
     transport_mode = normalized.get("transport_mode")
@@ -2586,16 +3217,11 @@ def _plan_chat_request(session: dict, files: list[Path]) -> dict:
     if transport_mode == CHAT_TRANSPORT_API:
         transport = CHAT_TRANSPORT_API
     elif transport_mode == CHAT_TRANSPORT_CLI:
-        transport = CHAT_TRANSPORT_API if has_image_files and image_support else CHAT_TRANSPORT_CLI
+        transport = CHAT_TRANSPORT_CLI
     else:
-        transport = CHAT_TRANSPORT_API if (api_server_enabled or (has_image_files and image_support)) else CHAT_TRANSPORT_CLI
+        transport = CHAT_TRANSPORT_API if api_server_enabled else CHAT_TRANSPORT_CLI
 
     notice = normalized.get("transport_notice") or ""
-    if transport_mode == CHAT_TRANSPORT_CLI and transport == CHAT_TRANSPORT_API:
-        notice = (
-            "This chat switched to API replay because image attachments require the vision/API path. "
-            "Future turns in this chat will replay local history instead of resuming the Hermes CLI session."
-        )
 
     return {
         "transport": transport,
@@ -2604,6 +3230,7 @@ def _plan_chat_request(session: dict, files: list[Path]) -> dict:
         "image_reason": image_reason,
         "api_server_enabled": api_server_enabled,
         "transport_notice": notice,
+        "use_sidecar_vision": transport == CHAT_TRANSPORT_CLI and has_image_files,
     }
 
 
@@ -2616,21 +3243,13 @@ def _parse_hermes_chat_result(output: str) -> tuple[str, str | None]:
     return _clean_cli_output(cleaned), hermes_session_id
 
 
-def _call_hermes_direct(
+def _call_hermes_prompt(
     session: dict,
-    message: str,
-    files: list = None,
+    prompt: str,
+    *,
     request_id: str | None = None,
-    file_display_names: dict | None = None,
 ) -> tuple[str, str | None]:
-    """Call Hermes via CLI subprocess (fallback when API server is unavailable)."""
-    prompt, _ = _compose_chat_turn_payload(
-        session,
-        message,
-        files or [],
-        image_support=False,
-        display_names=file_display_names,
-    )
+    """Call Hermes CLI subprocess with an already-assembled text prompt."""
     if request_id:
         state = _read_request_control(request_id)
         if state and state.get("cancel_requested_at"):
@@ -2705,6 +3324,24 @@ def _call_hermes_direct(
         raise ChatBackendError(f"Error calling Hermes: {e}") from e
 
 
+def _call_hermes_direct(
+    session: dict,
+    message: str,
+    files: list = None,
+    request_id: str | None = None,
+    file_display_names: dict | None = None,
+) -> tuple[str, str | None]:
+    """Call Hermes via CLI subprocess (fallback when API server is unavailable)."""
+    prompt, _ = _compose_chat_turn_payload(
+        session,
+        message,
+        files or [],
+        image_support=False,
+        display_names=file_display_names,
+    )
+    return _call_hermes_prompt(session, prompt, request_id=request_id)
+
+
 def _call_api_server(
     session: dict,
     messages: list,
@@ -2715,9 +3352,6 @@ def _call_api_server(
 ) -> str:
     """Call Hermes via its OpenAI-compatible API server. Handles image files as base64."""
     import base64
-    import socket
-    import urllib.error
-    import urllib.request
 
     msgs = list(messages)
     use_vision_target = prefer_vision
@@ -2756,48 +3390,8 @@ def _call_api_server(
         )
         msgs[-1] = {"role": "user", "content": text_content}
     target = _resolve_api_target(prefer_vision=use_vision_target)
-    payload = {"model": target["model"] or "hermes-agent", "messages": msgs, "stream": False}
-    headers = _api_server_headers(target.get("api_key"), target.get("provider"))
-    headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(
-        _build_openai_api_url(target["base_url"], "chat/completions"),
-        data=json.dumps(payload).encode(), headers=headers, method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=CHAT_REQUEST_TIMEOUT) as resp:
-            result = json.loads(resp.read().decode())
-            if isinstance(result, dict) and result.get("error"):
-                error_payload = result.get("error") or {}
-                if isinstance(error_payload, dict):
-                    error_message = error_payload.get("message") or error_payload.get("code") or "API server returned an error"
-                else:
-                    error_message = str(error_payload)
-                raise ChatBackendError(f"API server error: {error_message}")
-            choices = result.get("choices") or []
-            if not choices:
-                raise ChatBackendError("API server returned no choices")
-            message = choices[0].get("message") or {}
-            content = message.get("content")
-            if isinstance(content, list):
-                content = "\n".join(
-                    item.get("text", "") for item in content
-                    if isinstance(item, dict) and item.get("type") == "text"
-                ).strip()
-            if not isinstance(content, str) or not content.strip():
-                raise ChatBackendError("API server returned an empty message")
-            return content
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace").strip()
-        detail = _summarize_upstream_error_detail(body, str(exc.reason or "upstream request failed"))
-        raise ChatBackendError(f"API server returned HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        reason = getattr(exc, "reason", exc)
-        reason_text = str(reason)
-        if isinstance(reason, TimeoutError) or "timed out" in reason_text.lower():
-            raise ChatRequestTimeout(f"API server did not respond within {CHAT_REQUEST_TIMEOUT} seconds") from exc
-        raise ChatBackendError(f"API server is unreachable: {reason_text}") from exc
-    except socket.timeout as exc:
-        raise ChatRequestTimeout(f"API server did not respond within {CHAT_REQUEST_TIMEOUT} seconds") from exc
+        return _chat_completion_request(target, msgs)
     except ChatBackendError:
         raise
     except Exception as exc:
@@ -3068,7 +3662,7 @@ def _image_attachment_support_status() -> tuple[bool, str]:
             return False, image_model_reason
         return True, ""
     api_url = target.get("base_url") or HERMES_API_URL
-    return False, f"OpenAI-compatible image chat API is not reachable at {api_url} ({api_reason})"
+    return False, f"OpenAI-compatible vision sidecar API is not reachable at {api_url} ({api_reason})"
 
 
 def _get_or_create_chat_session(session_id=None):
@@ -3168,6 +3762,7 @@ def api_chat():
         "role": "user",
         "content": message,
         "files": [_attachment_display_name(f, file_display_names) for f in files],
+        "attachment_refs": _build_attachment_refs(files, file_display_names),
         "timestamp": datetime.now().isoformat(),
     }
     sess["messages"].append(user_msg)
@@ -3182,6 +3777,8 @@ def api_chat():
             sess["title"] = f"Files: {file_label}"
     sess["updated"] = datetime.now().isoformat()
     _write_session(sess)
+    if sess.get("messages"):
+        user_msg = sess["messages"][-1]
     try:
         use_api_server = request_plan["transport"] == CHAT_TRANSPORT_API
         if use_api_server:
@@ -3207,13 +3804,36 @@ def api_chat():
                 file_display_names=file_display_names,
             )
         else:
-            response_text, hermes_session_id = _call_hermes_direct(
-                sess,
-                message,
-                files,
-                request_id=request_id,
-                file_display_names=file_display_names,
-            )
+            sidecar_result = {}
+            if any(f.suffix.lower() in IMAGE_EXTENSIONS for f in files) or _vision_reanalysis_requested(message, sess):
+                sidecar_result = _run_sidecar_vision_analysis(
+                    sess,
+                    message,
+                    files,
+                    user_message=user_msg,
+                    file_display_names=file_display_names,
+                )
+            if sidecar_result:
+                prompt = _compose_cli_prompt_with_sidecar(
+                    sess,
+                    message,
+                    files,
+                    sidecar_result=sidecar_result,
+                    file_display_names=file_display_names,
+                )
+                response_text, hermes_session_id = _call_hermes_prompt(
+                    sess,
+                    prompt,
+                    request_id=request_id,
+                )
+            else:
+                response_text, hermes_session_id = _call_hermes_direct(
+                    sess,
+                    message,
+                    files,
+                    request_id=request_id,
+                    file_display_names=file_display_names,
+                )
             sess["transport_mode"] = CHAT_TRANSPORT_CLI
             if hermes_session_id:
                 sess["hermes_session_id"] = hermes_session_id
@@ -3276,7 +3896,9 @@ def api_chat():
     return jsonify({"session_id": sid, "response": response_text,
                      "message_count": len(sess["messages"]), "title": sess.get("title", ""),
                      "cancel_supported": request_plan["cancel_supported"],
-                     "session": session_meta})
+                     "session": session_meta,
+                     "user_message": user_msg,
+                     "assistant_message": assistant_msg})
 
 
 @app.route("/api/chat/cancel", methods=["POST"])
@@ -3714,6 +4336,7 @@ def api_chat_status():
         },
         "readiness": {
             "screenshots_ready": image_support,
+            "vision_sidecar_ready": image_support,
             "vision_configured": vision_ready,
             "vision_reason": vision_reason,
             "vision_api_url": vision_target.get("base_url") or _runtime_env_value("HERMES_API_URL", HERMES_API_URL),

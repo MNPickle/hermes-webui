@@ -2520,6 +2520,16 @@ pre code {
   background: var(--bg-secondary);
 }
 
+.chat-session-banner-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chat-session-banner-copy {
+  margin-top: 8px;
+}
+
 .chat-session-banner.success {
   border-color: rgba(56, 173, 86, 0.35);
   background: rgba(56, 173, 86, 0.12);
@@ -2530,6 +2540,13 @@ pre code {
   border-color: rgba(235, 164, 52, 0.35);
   background: rgba(235, 164, 52, 0.12);
   color: var(--text-primary);
+}
+
+.chat-msg-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
 }
 
 .chat-context-panel {

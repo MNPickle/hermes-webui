@@ -230,6 +230,88 @@ class HermesWebUISmokeTests(unittest.TestCase):
         self.assertEqual(data["limits"]["max_upload_bytes"], mod.MAX_UPLOAD_SIZE)
         self.assertEqual(data["limits"]["max_request_body_bytes"], mod.MAX_REQUEST_BODY_SIZE)
 
+    def test_parse_sidecar_payload_extracts_embedded_json_and_normalizes_lists(self):
+        raw = """
+The screenshot shows a test page. Here is the structured summary:
+```json
+{
+  "overall_summary": "Hermes test screen",
+  "follow_up_hints": "Ask about the heading; Ask about the status line",
+  "images": [
+    {
+      "label": "vision-test.png",
+      "summary": "Shows the Hermes heading",
+      "visible_text": "Hermes Vision Test\\nStatus Line: CLI continuity should remain enabled.",
+      "details": "- White card\\n- Deploy and Cancel buttons"
+    }
+  ]
+}
+```
+"""
+        parsed = mod._parse_sidecar_payload(raw, ["vision-test.png"])
+        self.assertEqual(parsed["overall_summary"], "Hermes test screen")
+        self.assertEqual(parsed["follow_up_hints"], ["Ask about the heading", "Ask about the status line"])
+        self.assertEqual(parsed["images"][0]["label"], "vision-test.png")
+        self.assertEqual(
+            parsed["images"][0]["visible_text"],
+            ["Hermes Vision Test", "Status Line: CLI continuity should remain enabled."],
+        )
+        self.assertEqual(parsed["images"][0]["details"], ["White card", "Deploy and Cancel buttons"])
+
+    def test_parse_sidecar_payload_uses_nested_payload_and_top_level_fields(self):
+        raw = """
+Sidecar output:
+{
+  "notes": "vision run complete",
+  "result": {
+    "overall_summary": "Settings screen",
+    "visible_text": "[\\"General\\", \\"Advanced\\"]",
+    "details": "Sidebar on the left; Save button in footer",
+    "follow_up_hints": "Ask about the sidebar; Ask about the footer"
+  }
+}
+"""
+        parsed = mod._parse_sidecar_payload(raw, ["settings.png"])
+        self.assertEqual(parsed["overall_summary"], "Settings screen")
+        self.assertEqual(parsed["images"][0]["label"], "settings.png")
+        self.assertEqual(parsed["images"][0]["visible_text"], ["General", "Advanced"])
+        self.assertEqual(parsed["images"][0]["details"], ["Sidebar on the left", "Save button in footer"])
+        self.assertEqual(
+            parsed["images"][0]["follow_up_hints"],
+            ["Ask about the sidebar", "Ask about the footer"],
+        )
+
+    def test_run_sidecar_vision_analysis_wraps_rate_limit_helpfully(self):
+        image_path = Path(self.tmpdir.name) / "shot.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nstub")
+        user_message = {"timestamp": "2026-04-07T10:00:00"}
+        session = {"messages": [user_message]}
+
+        with patch.object(mod, "_resolve_api_target", return_value={
+            "provider": "openrouter",
+            "model": "vision-model",
+            "base_url": "https://vision.example.test/v1",
+            "api_key": "secret",
+        }), patch.object(
+            mod,
+            "_chat_completion_request",
+            side_effect=mod.ChatBackendError(
+                "API server returned HTTP 429: vision-model is temporarily rate-limited upstream. Please retry shortly.",
+                status_code=429,
+            ),
+        ):
+            with self.assertRaises(mod.ChatBackendError) as ctx:
+                mod._run_sidecar_vision_analysis(
+                    session,
+                    "describe",
+                    [image_path],
+                    user_message=user_message,
+                )
+
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertIn("Vision sidecar is temporarily rate-limited", str(ctx.exception))
+        self.assertIn("switch the vision model/provider in Providers", str(ctx.exception))
+
     def test_save_upload_stream_enforces_limit_and_cleans_partial_file(self):
         destination = mod.UPLOAD_FOLDER / "too-big.bin"
         partial = destination.with_name(f".{destination.name}.part")
@@ -280,54 +362,56 @@ class HermesWebUISmokeTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 400, resp.data)
         self.assertIn("Too large", resp.get_json()["error"])
 
-    def test_image_session_stays_on_api_replay_for_followups(self):
+    def test_cli_image_turn_uses_sidecar_and_preserves_hermes_session(self):
         image_path = mod.UPLOAD_FOLDER / "shot.png"
         image_path.write_bytes(b"\x89PNG\r\n\x1a\nstub")
-        api_calls = []
+        sidecar_calls = []
+        cli_prompts = []
 
-        def fake_api(session, messages, session_id, files=None, prefer_vision=False, file_display_names=None):
-            api_calls.append({
-                "session_id": session_id,
-                "folder_id": session.get("folder_id"),
-                "messages": [m["content"] for m in messages],
-                "files": [f.name for f in (files or [])],
-                "prefer_vision": prefer_vision,
+        def fake_sidecar(session, message, files, user_message=None, file_display_names=None):
+            sidecar_calls.append({"message": message, "files": [f.name for f in files], "session_id": session.get("hermes_session_id")})
+            session.setdefault("vision_assets", []).append({
+                "id": "vis-1",
+                "stored_as": image_path.name,
+                "display_name": "shot.png",
+                "mime_type": "image/png",
+                "created_at": user_message["timestamp"],
+                "source_message_index": len(session["messages"]) - 1,
+                "source_message_timestamp": user_message["timestamp"],
+                "last_analysis": {
+                    "summary": "Login form screenshot",
+                    "raw_text": "raw vision output",
+                    "focus": message,
+                    "analyzed_at": user_message["timestamp"],
+                    "model": "vision-model",
+                    "provider": "openai",
+                },
             })
-            return f"api:{len(api_calls)}"
+            user_message["sidecar_vision"] = {
+                "used": True,
+                "status": "ok",
+                "asset_ids": ["vis-1"],
+                "summary": "Login form screenshot",
+                "analysis_mode": "sidecar",
+                "reanalysis": False,
+            }
+            return {
+                "overall_summary": "Login form screenshot",
+                "images": [{"label": "shot.png", "summary": "Login form screenshot", "asset_id": "vis-1"}],
+                "asset_ids": ["vis-1"],
+                "reanalysis": False,
+            }
+
+        def fake_cli_prompt(session, prompt, request_id=None):
+            cli_prompts.append({"session_id": session.get("hermes_session_id"), "prompt": prompt})
+            return ("image turn ok", "hermes-session-1")
 
         with patch.object(mod, "_check_api_server", return_value=False), \
              patch.object(mod, "_image_attachment_support_status", return_value=(True, "")), \
-             patch.object(mod, "_call_api_server", side_effect=fake_api), \
-             patch.object(mod, "_call_hermes_direct", side_effect=AssertionError("CLI path should not be used after API replay starts")):
-            first = self.client.post(
-                "/api/chat",
-                json={"message": "Look at this", "files": [image_path.name]},
-                headers=self.headers,
-            )
-            self.assertEqual(first.status_code, 200, first.data)
-            session_id = first.get_json()["session_id"]
-            self.assertEqual(first.get_json()["session"]["transport_mode"], "api")
-            self.assertEqual(first.get_json()["session"]["continuity_mode"], "local_replay")
-
-            second = self.client.post(
-                "/api/chat",
-                json={"message": "Follow up", "session_id": session_id},
-                headers=self.headers,
-            )
-            self.assertEqual(second.status_code, 200, second.data)
-            self.assertEqual(second.get_json()["session"]["transport_mode"], "api")
-            self.assertEqual(len(api_calls), 2)
-            self.assertEqual(api_calls[1]["files"], [])
-            self.assertTrue(api_calls[1]["prefer_vision"])
-
-    def test_cli_session_switch_to_api_replay_sets_transport_notice(self):
-        image_path = mod.UPLOAD_FOLDER / "shot.png"
-        image_path.write_bytes(b"\x89PNG\r\n\x1a\nstub")
-
-        with patch.object(mod, "_check_api_server", return_value=False), \
-             patch.object(mod, "_image_attachment_support_status", return_value=(True, "")), \
-             patch.object(mod, "_call_hermes_direct", return_value=("cli ok", "hermes-session-1")), \
-             patch.object(mod, "_call_api_server", return_value="api ok"):
+             patch.object(mod, "_call_hermes_direct", return_value=("plain text ok", "hermes-session-1")), \
+             patch.object(mod, "_run_sidecar_vision_analysis", side_effect=fake_sidecar), \
+             patch.object(mod, "_call_hermes_prompt", side_effect=fake_cli_prompt), \
+             patch.object(mod, "_call_api_server", side_effect=AssertionError("API replay should not be used")):
             first = self.client.post(
                 "/api/chat",
                 json={"message": "plain text"},
@@ -335,18 +419,125 @@ class HermesWebUISmokeTests(unittest.TestCase):
             )
             self.assertEqual(first.status_code, 200, first.data)
             session_id = first.get_json()["session_id"]
-
             second = self.client.post(
                 "/api/chat",
-                json={"message": "look at this", "session_id": session_id, "files": [image_path.name]},
+                json={"message": "Look at this", "session_id": session_id, "files": [image_path.name]},
+                headers=self.headers,
+            )
+
+        self.assertEqual(second.status_code, 200, second.data)
+        self.assertEqual(len(sidecar_calls), 1)
+        self.assertEqual(cli_prompts[0]["session_id"], "hermes-session-1")
+        self.assertIn("Vision sidecar analysis", cli_prompts[0]["prompt"])
+        session_meta = second.get_json()["session"]
+        self.assertEqual(session_meta["transport_mode"], "cli")
+        self.assertEqual(session_meta["continuity_mode"], "hermes_resume")
+        self.assertTrue(session_meta["hermes_session_backed"])
+        self.assertTrue(session_meta["last_turn_used_sidecar_vision"])
+        persisted = json.loads((mod.CHAT_DATA_DIR / f"{session_id}.json").read_text())
+        self.assertEqual(persisted["hermes_session_id"], "hermes-session-1")
+        self.assertTrue(persisted["messages"][2]["sidecar_vision"]["used"])
+
+    def test_mixed_text_and_image_followup_stays_cli_backed(self):
+        image_path = mod.UPLOAD_FOLDER / "shot.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nstub")
+        call_session_ids = []
+
+        def fake_call(session, message, files=None, request_id=None, file_display_names=None):
+            call_session_ids.append(session.get("hermes_session_id"))
+            return (f"cli:{message}", "hermes-session-1")
+
+        def fake_sidecar(session, message, files, user_message=None, file_display_names=None):
+            session.setdefault("vision_assets", []).append({
+                "id": "vis-1",
+                "stored_as": image_path.name,
+                "display_name": "shot.png",
+                "mime_type": "image/png",
+                "created_at": user_message["timestamp"],
+                "source_message_index": len(session["messages"]) - 1,
+                "source_message_timestamp": user_message["timestamp"],
+                "last_analysis": {"summary": "Screenshot", "raw_text": "Screenshot", "focus": message, "analyzed_at": user_message["timestamp"], "model": "vision-model", "provider": "openai"},
+            })
+            user_message["sidecar_vision"] = {
+                "used": True,
+                "status": "ok",
+                "asset_ids": ["vis-1"],
+                "summary": "Screenshot",
+                "analysis_mode": "sidecar",
+                "reanalysis": False,
+            }
+            return {"overall_summary": "Screenshot", "images": [{"label": "shot.png", "summary": "Screenshot", "asset_id": "vis-1"}], "asset_ids": ["vis-1"], "reanalysis": False}
+
+        with patch.object(mod, "_check_api_server", return_value=False), \
+             patch.object(mod, "_image_attachment_support_status", return_value=(True, "")), \
+             patch.object(mod, "_call_hermes_direct", side_effect=fake_call), \
+             patch.object(mod, "_run_sidecar_vision_analysis", side_effect=fake_sidecar), \
+             patch.object(mod, "_call_hermes_prompt", return_value=("cli:image", "hermes-session-1")), \
+             patch.object(mod, "_call_api_server", side_effect=AssertionError("API replay should not be used")):
+            first = self.client.post(
+                "/api/chat",
+                json={"message": "Look at this", "files": [image_path.name]},
+                headers=self.headers,
+            )
+            self.assertEqual(first.status_code, 200, first.data)
+            session_id = first.get_json()["session_id"]
+            second = self.client.post(
+                "/api/chat",
+                json={"message": "Follow up", "session_id": session_id},
                 headers=self.headers,
             )
 
         self.assertEqual(second.status_code, 200, second.data)
         session_meta = second.get_json()["session"]
-        self.assertEqual(session_meta["transport_mode"], "api")
-        self.assertEqual(session_meta["continuity_mode"], "local_replay")
-        self.assertIn("switched to API replay", session_meta["transport_notice"])
+        self.assertEqual(session_meta["transport_mode"], "cli")
+        self.assertEqual(session_meta["continuity_mode"], "hermes_resume")
+        self.assertFalse(session_meta["last_turn_used_sidecar_vision"])
+        self.assertEqual(call_session_ids, ["hermes-session-1"])
+
+    def test_followup_can_reanalyze_latest_screenshot(self):
+        image_path = mod.UPLOAD_FOLDER / "shot.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nstub")
+        captured_requests = []
+
+        def fake_completion(target, messages):
+            captured_requests.append({"target": target, "messages": messages})
+            return json.dumps({
+                "overall_summary": "Settings screen",
+                "images": [
+                    {
+                        "label": "shot.png",
+                        "summary": "Settings screen",
+                        "visible_text": ["General", "Advanced"],
+                        "details": ["Sidebar on the left"],
+                    }
+                ],
+            })
+
+        with patch.object(mod, "_check_api_server", return_value=False), \
+             patch.object(mod, "_image_attachment_support_status", return_value=(True, "")), \
+             patch.object(mod, "_resolve_api_target", return_value={"base_url": "https://vision.example.test/v1", "model": "vision-model", "provider": "openai", "api_key": "secret"}), \
+             patch.object(mod, "_chat_completion_request", side_effect=fake_completion), \
+             patch.object(mod, "_call_hermes_prompt", return_value=("cli ok", "hermes-session-1")):
+            first = self.client.post(
+                "/api/chat",
+                json={"message": "Look at this", "files": [image_path.name]},
+                headers=self.headers,
+            )
+            self.assertEqual(first.status_code, 200, first.data)
+            session_id = first.get_json()["session_id"]
+
+            second = self.client.post(
+                "/api/chat",
+                json={"message": "What does the screenshot from earlier say in the sidebar?", "session_id": session_id},
+                headers=self.headers,
+            )
+
+        self.assertEqual(second.status_code, 200, second.data)
+        self.assertEqual(len(captured_requests), 2)
+        followup_prompt = captured_requests[1]["messages"][0]["content"][0]["text"]
+        self.assertIn("follow-up about an earlier screenshot", followup_prompt)
+        self.assertTrue(second.get_json()["user_message"]["sidecar_vision"]["reanalysis"])
+        self.assertTrue(second.get_json()["session"]["last_turn_used_sidecar_vision"])
 
     def test_api_transport_cannot_be_cancelled(self):
         mod._register_chat_request(
@@ -375,6 +566,58 @@ class HermesWebUISmokeTests(unittest.TestCase):
         body = resp.get_json()
         self.assertEqual(body["error"], "Unsupported attachment selection")
         self.assertTrue(body["details"])
+
+    def test_explicit_api_mode_still_works_when_enabled(self):
+        image_path = mod.UPLOAD_FOLDER / "shot.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nstub")
+
+        with patch.object(mod, "_check_api_server", return_value=True), \
+             patch.object(mod, "_image_attachment_support_status", return_value=(True, "")), \
+             patch.object(mod, "_call_api_server", return_value="api ok"), \
+             patch.object(mod, "_call_hermes_direct", side_effect=AssertionError("CLI should not be used in explicit API mode")), \
+             patch.object(mod, "_call_hermes_prompt", side_effect=AssertionError("CLI sidecar path should not be used in explicit API mode")):
+            resp = self.client.post(
+                "/api/chat",
+                json={"message": "Look at this", "files": [image_path.name]},
+                headers=self.headers,
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        session_meta = resp.get_json()["session"]
+        self.assertEqual(session_meta["transport_mode"], "api")
+        self.assertEqual(session_meta["continuity_mode"], "local_replay")
+        self.assertFalse(session_meta["hermes_session_backed"])
+
+    def test_sidecar_failure_does_not_silently_downgrade_thread(self):
+        image_path = mod.UPLOAD_FOLDER / "shot.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nstub")
+
+        with patch.object(mod, "_check_api_server", return_value=False), \
+             patch.object(mod, "_image_attachment_support_status", return_value=(True, "")), \
+             patch.object(mod, "_call_hermes_direct", return_value=("plain text ok", "hermes-session-1")), \
+             patch.object(mod, "_run_sidecar_vision_analysis", side_effect=mod.ChatBackendError("vision sidecar failed")), \
+             patch.object(mod, "_call_api_server", side_effect=AssertionError("API replay should not be used")):
+            first = self.client.post(
+                "/api/chat",
+                json={"message": "plain text"},
+                headers=self.headers,
+            )
+            self.assertEqual(first.status_code, 200, first.data)
+            session_id = first.get_json()["session_id"]
+
+            second = self.client.post(
+                "/api/chat",
+                json={"message": "Look at this", "session_id": session_id, "files": [image_path.name]},
+                headers=self.headers,
+            )
+
+        self.assertEqual(second.status_code, 502, second.data)
+        self.assertEqual(second.get_json()["error"], "vision sidecar failed")
+        persisted = json.loads((mod.CHAT_DATA_DIR / f"{session_id}.json").read_text())
+        self.assertEqual(persisted["hermes_session_id"], "hermes-session-1")
+        self.assertEqual(persisted["transport_mode"], "cli")
+        self.assertEqual(persisted["continuity_mode"], "hermes_resume")
+        self.assertEqual(len(persisted["messages"]), 2)
 
     def test_repo_env_token_is_accepted_without_process_env(self):
         repo_env = Path(self.tmpdir.name) / ".env"
@@ -814,8 +1057,8 @@ class HermesWebUISmokeTests(unittest.TestCase):
     def test_release_version_marker_matches_first_stable_release(self):
         template = (mod.APP_ROOT / "templates" / "index.html").read_text(encoding="utf-8")
         script = (mod.APP_ROOT / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("UI v1.0.0", template)
-        self.assertIn("const WEB_UI_VERSION = '1.0.0';", script)
+        self.assertIn("UI v1.1.0", template)
+        self.assertIn("const WEB_UI_VERSION = '1.1.0';", script)
         self.assertNotIn("v0.4.0", template)
 
 

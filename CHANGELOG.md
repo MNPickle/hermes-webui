@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## v1.1.0 - 2026-04-07
+
+- Kept Hermes CLI as the canonical browser-chat backend, even when image turns use vision.
+- Added a sidecar vision bridge that analyzes screenshots through the configured vision target, injects structured text back into the same Hermes CLI session, and preserves `hermes_session_id`.
+- Added session and turn metadata for sidecar vision so follow-up questions can re-analyze earlier screenshots without silently switching the chat into replay mode.
+- Updated the chat UI to show Hermes-session-backed vs local replay only, plus per-turn sidecar vision usage.
+- Expanded smoke coverage for CLI continuity across mixed text and image turns, explicit API fallback mode, and sidecar failure handling.
+
 ## v1.0.0 - 2026-04-07
 
 First official stable release of the Hermes Web UI.

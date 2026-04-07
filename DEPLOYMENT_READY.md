@@ -5,8 +5,8 @@
 The web UI is hardened enough for local deployment, but image chat and a few deployment checks still depend on correct Hermes/provider configuration.
 
 Recent runtime improvements in this repo:
-- Chat sessions now stay on one backend transport once established, so follow-up turns do not silently hop between Hermes CLI resume and API replay.
-- The UI shows when a chat is Hermes-resumable versus local API replay.
+- CLI-backed chats now stay Hermes-session-backed even when a screenshot turn uses sidecar vision.
+- The UI shows when a chat is Hermes-session-backed versus local replay only, and flags turns that used sidecar vision.
 - Stop/cancel is only offered for real Hermes CLI subprocesses; API/vision requests no longer pretend to be cancellable.
 - `start.sh` now launches from the repo it lives in rather than assuming `~/hermes-web-ui`.
 
@@ -129,9 +129,9 @@ For pasted screenshots to work end-to-end, all of these must be true:
 This repo now helps with the repo-side pieces:
 - the Providers screen shows screenshot readiness
 - the Providers screen lets you edit the Hermes `auxiliary.vision` config
-- image chat probes generic OpenAI-compatible APIs, not just `/health`
-- image-only pasted screenshots are sent correctly as multimodal payloads
-- chats that use image/API mode stay on API replay for later turns instead of quietly dropping back to CLI resume
+- the sidecar vision path probes generic OpenAI-compatible APIs, not just `/health`
+- image-only pasted screenshots are analyzed through sidecar vision and then bridged back into the Hermes CLI session
+- follow-up turns can re-analyze the latest screenshot instead of silently downgrading the chat into API replay
 
 Minimum configuration:
 ```bash
