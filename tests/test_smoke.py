@@ -213,6 +213,19 @@ class HermesWebUISmokeTests(unittest.TestCase):
             "plain upstream failure",
         )
 
+    def test_openrouter_discovery_endpoints_preserves_model_path_segments(self):
+        captured = {}
+
+        def fake_fetch(path, timeout=10):
+            captured["path"] = path
+            return {"data": {"endpoints": []}}
+
+        with patch.object(mod, "_openrouter_fetch_json", side_effect=fake_fetch):
+            endpoints = mod._openrouter_discovery_endpoints("minimax/minimax-m2.7")
+
+        self.assertEqual(endpoints, [])
+        self.assertEqual(captured["path"], "models/minimax/minimax-m2.7/endpoints")
+
     def test_call_api_server_can_stay_on_vision_target_without_new_image(self):
         captured = {}
 
@@ -1815,6 +1828,46 @@ Sidecar output:
 
         folders = mod._load_all_folders()
         self.assertEqual(sorted(folder["title"] for folder in folders.values()).count("Folder"), 2)
+
+    def test_dedupe_legacy_folder_titles_merges_sources_and_sessions(self):
+        mod._write_folder({
+            "id": "older-folder",
+            "title": "Folder",
+            "created": "2026-01-01T00:00:00",
+            "updated": "2026-01-01T00:00:00",
+            "workspace_roots": ["/tmp/root-a"],
+            "source_docs": ["/tmp/source-a.md"],
+        })
+        mod._write_folder({
+            "id": "newer-folder",
+            "title": "folder",
+            "created": "2026-01-02T00:00:00",
+            "updated": "2026-01-02T00:00:00",
+            "workspace_roots": ["/tmp/root-b"],
+            "source_docs": ["/tmp/source-b.md"],
+        })
+        session = mod._get_or_create_chat_session()
+        session["folder_id"] = "newer-folder"
+        session["updated"] = "2026-01-03T00:00:00"
+        mod._write_session(session)
+
+        report = mod._dedupe_legacy_folder_titles()
+
+        self.assertTrue(report["changed"])
+        self.assertEqual(report["merged_group_count"], 1)
+        self.assertEqual(report["merged_groups"][0]["title"], "Folder")
+        self.assertEqual(report["merged_groups"][0]["kept_id"], "older-folder")
+        self.assertEqual(report["merged_groups"][0]["removed_ids"], ["newer-folder"])
+        self.assertEqual(report["updated_session_ids"], [session["id"]])
+
+        folders = mod._load_all_folders()
+        self.assertIn("older-folder", folders)
+        self.assertNotIn("newer-folder", folders)
+        self.assertEqual(folders["older-folder"]["workspace_roots"], ["/tmp/root-a", "/tmp/root-b"])
+        self.assertEqual(folders["older-folder"]["source_docs"], ["/tmp/source-a.md", "/tmp/source-b.md"])
+
+        persisted = mod._load_session(session["id"])
+        self.assertEqual(persisted["folder_id"], "older-folder")
 
     def test_folder_can_add_chat_transcript_as_source(self):
         folder_resp = self.client.post("/api/chat/folders", json={"title": "Folder"}, headers=self.headers)

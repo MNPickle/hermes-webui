@@ -816,6 +816,84 @@ def _ensure_folder_exists(folder_id: str) -> dict | None:
     })
 
 
+def _dedupe_legacy_folder_titles() -> dict:
+    folders = _load_all_folders()
+    sessions = _load_all_sessions()
+    groups: dict[str, list[dict]] = {}
+    for folder in folders.values():
+        normalized = _normalize_chat_folder(folder)
+        title_key = _folder_title_key(normalized.get("title"))
+        if not title_key:
+            continue
+        groups.setdefault(title_key, []).append(normalized)
+
+    changed_sessions: list[str] = []
+    changed_session_ids = set()
+    merged_groups = []
+    changed = False
+
+    for duplicates in groups.values():
+        if len(duplicates) < 2:
+            continue
+        duplicates.sort(key=lambda folder: (
+            folder.get("created") or "",
+            folder.get("id") or "",
+        ))
+        canonical = dict(duplicates[0])
+        merged_workspace_roots = _merge_unique_strings(*(folder.get("workspace_roots") or [] for folder in duplicates))
+        merged_source_docs = _merge_unique_strings(*(folder.get("source_docs") or [] for folder in duplicates))
+        merged_updated = max(
+            [canonical.get("updated") or canonical.get("created")] +
+            [folder.get("updated") or folder.get("created") for folder in duplicates[1:]]
+        )
+        if canonical.get("workspace_roots") != merged_workspace_roots or canonical.get("source_docs") != merged_source_docs or canonical.get("updated") != merged_updated:
+            canonical["workspace_roots"] = merged_workspace_roots
+            canonical["source_docs"] = merged_source_docs
+            canonical["updated"] = merged_updated
+            folders[canonical["id"]] = canonical
+            changed = True
+
+        removed_ids = []
+        for duplicate in duplicates[1:]:
+            duplicate_id = duplicate["id"]
+            removed_ids.append(duplicate_id)
+            if duplicate_id in folders:
+                folders.pop(duplicate_id, None)
+                changed = True
+            for session in sessions.values():
+                if (session.get("folder_id") or "").strip() != duplicate_id:
+                    continue
+                session["folder_id"] = canonical["id"]
+                session["updated"] = datetime.now().isoformat()
+                if session["id"] not in changed_session_ids:
+                    changed_session_ids.add(session["id"])
+                    changed_sessions.append(session["id"])
+                changed = True
+
+        merged_groups.append({
+            "title": canonical["title"],
+            "kept_id": canonical["id"],
+            "removed_ids": removed_ids,
+            "source_count": len(canonical.get("source_docs") or []),
+            "workspace_root_count": len(canonical.get("workspace_roots") or []),
+        })
+
+    if changed:
+        _write_all_folders(folders)
+        for session_id in changed_sessions:
+            session = sessions.get(session_id)
+            if session:
+                _write_session(session)
+
+    return {
+        "changed": changed,
+        "merged_group_count": len(merged_groups),
+        "merged_groups": merged_groups,
+        "updated_session_ids": changed_sessions,
+        "folders": _load_all_folders() if changed else folders,
+    }
+
+
 def _folder_summaries(sessions: dict | None = None) -> list[dict]:
     sessions = sessions if sessions is not None else _load_all_sessions()
     folders = _load_all_folders()
@@ -5543,7 +5621,8 @@ def _openrouter_discovery_models(*, vision_only: bool = False, timeout: int = 10
 def _openrouter_discovery_endpoints(model_id: str, timeout: int = 10) -> list[dict]:
     import urllib.parse
 
-    encoded_model = urllib.parse.quote(str(model_id or "").strip(), safe="")
+    # OpenRouter expects slash-delimited model ids in the path here.
+    encoded_model = urllib.parse.quote(str(model_id or "").strip(), safe="/")
     payload = _openrouter_fetch_json(f"models/{encoded_model}/endpoints", timeout=timeout)
     data = payload.get("data", payload) if isinstance(payload, dict) else payload
     endpoints = data.get("endpoints", []) if isinstance(data, dict) else []
