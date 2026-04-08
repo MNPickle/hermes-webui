@@ -256,6 +256,7 @@ function screenTitle(s) {
 }
 
 function navigate(screen) {
+    if (screen === 'integrations') screen = 'channels';
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     const navItem = document.querySelector('[data-screen="' + screen + '"]');
     if (navItem) navItem.classList.add('active');
@@ -503,28 +504,101 @@ window.saveSettings = async function (btn) {
 };
 
 // ── ENV VARS ───────────────────────────────────────────────
+const envVarsState = {
+    activeGroup: 'Provider',
+    vars: {},
+    groups: {},
+    metadata: {},
+    presets: {},
+    groupHelp: {},
+};
+
+function envPresetList(group) {
+    return Array.isArray(envVarsState.presets[group]) ? envVarsState.presets[group] : [];
+}
+
+function envVarMeta(key) {
+    return envVarsState.metadata[key] || {
+        key,
+        label: key,
+        description: 'Custom environment variable.',
+        group: 'System',
+        secret: /token|secret|key|password/i.test(String(key || '')),
+        default_value: '',
+    };
+}
+
+function envActiveGroupList() {
+    return ['Provider', 'Channel', 'System'];
+}
+
+function envAddButtonLabel(group) {
+    return '+ Add ' + (group || 'Environment') + ' Variable';
+}
+
+function envPresetDescription(meta) {
+    let text = meta.description || 'Custom environment variable.';
+    if (meta.default_value) {
+        text += ' Default: ' + meta.default_value + '.';
+    }
+    return text;
+}
+
+function envMaskedDisplay(value) {
+    const text = String(value || '');
+    if (!text) return '(empty)';
+    return '•'.repeat(Math.min(text.length, 20)) + (text.length > 20 ? '…' : '');
+}
+
+function envPresetAction(group, key) {
+    if (key && Object.prototype.hasOwnProperty.call(envVarsState.vars || {}, key)) {
+        editEnvVar(key);
+        return;
+    }
+    addEnvVar(group, key);
+}
+
 Screens['env-vars'] = async function () {
     const content = document.getElementById('content');
     try {
         const data = await api('GET', '/api/env');
-        const vars = data.vars || {};
-        const groups = data.groups || {};
-        const groupNames = ['Provider', 'Channel', 'System'];
+        envVarsState.vars = data.vars || {};
+        envVarsState.groups = data.groups || {};
+        envVarsState.metadata = data.metadata || {};
+        envVarsState.presets = data.presets || {};
+        envVarsState.groupHelp = data.group_help || {};
+        const vars = envVarsState.vars;
+        const groups = envVarsState.groups;
+        const groupNames = envActiveGroupList();
+        if (!groupNames.includes(envVarsState.activeGroup)) envVarsState.activeGroup = groupNames[0];
+        const activeGroup = envVarsState.activeGroup;
+        const activePresets = envPresetList(activeGroup);
 
-        let html = '<div class="section-header"><span></span><button class="btn btn-primary" onclick="addEnvVar()">+ Add Variable</button></div>';
+        let html = '<div class="section-header"><span></span><button class="btn btn-primary" onclick="addEnvVar(\'' + escA(activeGroup) + '\')">' + escH(envAddButtonLabel(activeGroup)) + '</button></div>';
+        html += '<div class="card mb-16"><div class="card-header"><span>' + escH(activeGroup + ' Variables') + '</span></div><div class="card-body">';
+        html += '<p class="text-sm text-secondary mb-16">' + escH(envVarsState.groupHelp[activeGroup] || 'Environment variables let you configure Hermes without editing files by hand.') + '</p>';
+        if (activePresets.length) {
+            html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+            activePresets.forEach(preset => {
+                html += '<button class="btn btn-sm" onclick="envPresetAction(\'' + escA(activeGroup) + '\', \'' + escA(preset.key) + '\')">' + escH(preset.label || preset.key) + '</button>';
+            });
+            html += '</div>';
+        }
+        html += '</div></div>';
         html += '<div class="tabs">';
-        groupNames.forEach((g, i) => { html += '<button class="tab' + (i === 0 ? ' active' : '') + '" data-group="' + g + '">' + g + '</button>'; });
+        groupNames.forEach(g => { html += '<button class="tab' + (g === activeGroup ? ' active' : '') + '" data-group="' + g + '">' + g + '</button>'; });
         html += '</div>';
 
-        groupNames.forEach((g, i) => {
+        groupNames.forEach(g => {
             const keys = (groups[g] || []).filter(k => vars.hasOwnProperty(k));
-            html += '<div class="tab-pane' + (i === 0 ? ' active' : '') + '" data-group="' + g + '">';
+            html += '<div class="tab-pane' + (g === activeGroup ? ' active' : '') + '" data-group="' + g + '">';
             if (keys.length === 0) {
-                html += '<div class="empty-state"><p>No variables in this group</p></div>';
+                html += '<div class="empty-state"><p>No variables in this group yet.</p></div>';
             } else {
-                html += '<div class="table-container"><table class="table"><thead><tr><th>Key</th><th>Value</th><th style="width:120px">Actions</th></tr></thead><tbody>';
+                html += '<div class="table-container"><table class="table"><thead><tr><th>Key</th><th>What It Does</th><th>Value</th><th style="width:120px">Actions</th></tr></thead><tbody>';
                 keys.forEach(k => {
-                    html += '<tr><td class="font-mono text-sm">' + escH(k) + '</td><td class="font-mono text-sm text-muted">' + escH(vars[k]) + '</td><td class="actions"><button class="btn btn-sm" onclick="editEnvVar(\'' + escA(k) + '\')">Edit</button> <button class="btn btn-sm btn-danger" onclick="deleteEnvVar(\'' + escA(k) + '\')">Delete</button></td></tr>';
+                    const meta = envVarMeta(k);
+                    html += '<tr><td><div class="font-mono text-sm">' + escH(k) + '</div></td><td class="text-sm">' + escH(meta.description || 'Custom environment variable.') + '</td><td class="font-mono text-sm text-muted">' + escH(vars[k]) + '</td><td class="actions"><button class="btn btn-sm" onclick="editEnvVar(\'' + escA(k) + '\')">Edit</button> <button class="btn btn-sm btn-danger" onclick="deleteEnvVar(\'' + escA(k) + '\')">Delete</button></td></tr>';
                 });
                 html += '</tbody></table></div>';
             }
@@ -534,10 +608,8 @@ Screens['env-vars'] = async function () {
 
         content.querySelectorAll('.tab').forEach(tab => {
             tab.addEventListener('click', () => {
-                content.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-                content.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-                tab.classList.add('active');
-                content.querySelector('[data-group="' + tab.dataset.group + '"].tab-pane')?.classList.add('active');
+                envVarsState.activeGroup = tab.dataset.group || 'Provider';
+                Screens['env-vars']();
             });
         });
     } catch (e) {
@@ -545,12 +617,55 @@ Screens['env-vars'] = async function () {
     }
 };
 
-window.addEnvVar = function () {
+window.envVarPresetChanged = function () {
+    const presetKey = document.getElementById('env-preset')?.value || '';
+    const group = document.getElementById('env-group')?.value || envVarsState.activeGroup || 'Provider';
+    const preset = envPresetList(group).find(item => item.key === presetKey) || null;
+    const keyInput = document.getElementById('env-key');
+    const valueInput = document.getElementById('env-value');
+    const helper = document.getElementById('env-preset-helper');
+    const footerBtn = document.getElementById('env-save-btn');
+    if (!keyInput || !helper) return;
+    if (preset) {
+        keyInput.value = preset.key || '';
+        keyInput.placeholder = preset.key || 'ENV_VAR_NAME';
+        if (valueInput && !valueInput.value && preset.default_value) {
+            valueInput.value = preset.default_value;
+        }
+        const existingValue = Object.prototype.hasOwnProperty.call(envVarsState.vars || {}, preset.key) ? envVarsState.vars[preset.key] : '';
+        helper.innerHTML = '<p class="text-sm text-secondary">' + escH(envPresetDescription(preset)) + '</p>' +
+            (existingValue
+                ? '<p class="text-sm text-secondary">Saved already: <span class="font-mono">' + escH(envMaskedDisplay(existingValue)) + '</span>. Saving here will update the existing value.</p>'
+                : '');
+        if (footerBtn) footerBtn.textContent = existingValue ? 'Update' : 'Save';
+    } else {
+        keyInput.placeholder = 'e.g. MY_API_KEY';
+        helper.innerHTML = '<p class="text-sm text-secondary">Use a custom variable name only when the Hermes docs, a provider, or a skill specifically tells you to.</p>';
+        if (footerBtn) footerBtn.textContent = 'Save';
+    }
+};
+
+window.addEnvVar = function (group = envVarsState.activeGroup || 'Provider', presetKey = '') {
+    const presets = envPresetList(group);
+    const options = [{ value: '', label: 'Custom variable' }].concat(presets.map(item => ({
+        value: item.key,
+        label: item.label || item.key,
+    })));
     showModal('Add Environment Variable',
+        '<div class="form-group"><label class="form-label">Group</label><input class="form-input" id="env-group" value="' + escA(group) + '" disabled></div>' +
+        (options.length > 1
+            ? '<div class="form-group"><label class="form-label">Preset</label>' + selectH('env-preset', options, presetKey || '', 'env-preset') + '</div>'
+            : '') +
+        '<div id="env-preset-helper" class="mb-12"></div>' +
         '<div class="form-group"><label class="form-label">Key</label>' + inputH('env-key', '', 'text', 'e.g. MY_API_KEY') + '</div>' +
-        '<div class="form-group"><label class="form-label">Value</label>' + inputH('env-value', '', 'text', 'Secret value') + '</div>',
-        '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="saveNewEnvVar()">Save</button>'
+        '<div class="form-group"><label class="form-label">Value</label><p class="text-sm text-secondary mb-8">Enter the actual API key or secret here.</p>' + inputH('env-value', '', 'text', 'Paste the real secret value') + '</div>',
+        '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" id="env-save-btn" onclick="saveNewEnvVar()">Save</button>'
     );
+    const presetSelect = document.getElementById('env-preset');
+    if (presetSelect) {
+        presetSelect.addEventListener('change', window.envVarPresetChanged);
+    }
+    window.envVarPresetChanged();
 };
 window.saveNewEnvVar = async function () {
     const key = document.getElementById('env-key').value.trim();
@@ -563,12 +678,18 @@ window.editEnvVar = async function (key) {
     try {
         const data = await api('GET', '/api/env');
         const val = data.vars[key] || '';
+        const metadata = data.metadata || {};
+        const meta = metadata[key] || envVarMeta(key);
         const masked = val ? '•'.repeat(Math.min(val.length, 20)) + (val.length > 20 ? '…' : '') : '(empty)';
         showModal('Edit Variable: ' + key,
             '<div class="form-group"><label class="form-label">Key</label><input class="form-input" value="' + escA(key) + '" disabled></div>' +
+            '<p class="text-sm text-secondary mb-12">' + escH(meta.description || 'Custom environment variable.') + '</p>' +
+            (meta.default_value ? '<p class="text-sm text-secondary mb-12">Recommended default: <span class="font-mono">' + escH(meta.default_value) + '</span>. Leave this unset unless you need an override.</p>' : '') +
             '<div class="form-group"><label class="form-label">Current Value</label><div class="font-mono text-sm" style="color:var(--muted);padding:4px 0">' + escH(masked) + '</div></div>' +
             '<div class="form-group"><label class="form-label">New Value</label>' + inputH('env-edit-value', '', 'text', 'Enter new value') + '</div>',
-            '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="saveEditEnvVar(\'' + escA(key) + '\')">Save</button>'
+            '<button class="btn" onclick="closeModal()">Cancel</button>' +
+            (meta.default_value ? '<button class="btn" onclick="document.getElementById(\'env-edit-value\').value=\'' + escA(meta.default_value) + '\'">Use Default</button>' : '') +
+            '<button class="btn btn-primary" onclick="saveEditEnvVar(\'' + escA(key) + '\')">Save</button>'
         );
     } catch (e) { toast('Error: ' + e.message, 'error'); }
 };
@@ -1453,6 +1574,9 @@ function renderStarterPackGrid(items) {
             '<div class="starter-pack-item-kind">' + escH((item.kind || 'runtime').replace(/_/g, ' ')) + '</div>' +
             '<div class="starter-pack-item-detail">' + escH(item.detail || '') + '</div>' +
             '<div class="starter-pack-item-actions">' +
+                ((item.setup_action && item.setup_action.type === 'env_var')
+                    ? '<button class="btn btn-sm btn-primary" onclick="starterPackRunSetup(\'' + escA(item.id) + '\')">' + escH((item.setup_action || {}).label || 'Set Up') + '</button>'
+                    : '') +
                 ((item.supports_install && item.install_available !== false)
                     ? '<button class="btn btn-sm btn-primary" onclick="starterPackInstallPrompt(\'' + escA(item.id) + '\')">' + escH(item.install_action_label || 'Install') + '</button>'
                     : '') +
@@ -1489,10 +1613,56 @@ window.starterPackShowNotes = function (itemId) {
         item.label || 'Starter Pack Item',
         html,
         '<button class="btn" onclick="closeModal()">Close</button>' +
+        ((item.setup_action && item.setup_action.type === 'env_var')
+            ? '<button class="btn btn-primary" onclick="starterPackRunSetup(\'' + escA(item.id) + '\')">' + escH((item.setup_action || {}).label || 'Set Up') + '</button>'
+            : '') +
         ((item.supports_install && item.install_available !== false)
             ? '<button class="btn btn-primary" onclick="starterPackInstallPrompt(\'' + escA(item.id) + '\')">' + escH(item.install_action_label || 'Install') + '</button>'
             : '')
     );
+};
+
+window.starterPackRunSetup = async function (itemId) {
+    const item = starterPackState.items[itemId];
+    if (!item) {
+        toast('Starter-pack item not found', 'error');
+        return;
+    }
+    const action = item.setup_action || {};
+    if (action.type !== 'env_var' || !action.key) {
+        starterPackShowNotes(itemId);
+        return;
+    }
+    closeModal();
+    if (action.key === 'OPENAI_API_KEY') {
+        showModal(
+            action.label || 'Set Up Memory',
+            '<p class="text-sm text-secondary mb-16">Hermes already stores memory locally. Adding your OpenAI API key is optional and only turns on stronger OpenAI-backed semantic memory search.</p>' +
+            '<p class="text-sm text-secondary mb-16">For standard OpenAI use, you do not need to set <span class="font-mono">OPENAI_BASE_URL</span>. Leave that unset unless you are using a custom OpenAI-compatible gateway.</p>' +
+            '<div class="form-group"><label class="form-label">OPENAI_API_KEY</label>' + inputH('starter-memory-openai-key', '', 'text', 'sk-...') + '</div>',
+            '<button class="btn" onclick="closeModal()">Cancel</button>' +
+            '<button class="btn" onclick="closeModal(); navigate(\'env-vars\')">Advanced Env Vars</button>' +
+            '<button class="btn btn-primary" onclick="saveStarterPackMemoryKey()">Save</button>'
+        );
+        return;
+    }
+    addEnvVar('Provider', action.key);
+};
+
+window.saveStarterPackMemoryKey = async function () {
+    const value = document.getElementById('starter-memory-openai-key')?.value?.trim() || '';
+    if (!value) {
+        toast('OpenAI API key is required', 'error');
+        return;
+    }
+    try {
+        await api('PUT', '/api/env/OPENAI_API_KEY', { value });
+        toast('OpenAI memory search key saved. New CLI turns can use it right away.', 'success');
+        closeModal();
+        Screens.skills();
+    } catch (e) {
+        toast('Error: ' + e.message, 'error');
+    }
 };
 
 window.starterPackInstallPrompt = function (itemId) {
@@ -1606,8 +1776,8 @@ Screens.skills = async function () {
         const skills = data.skills || [];
         const runtime = status.runtime || {};
         const policy = status.transport_policy || {};
-        let html = '<div class="section-header"><span>' + skills.length + ' Skills</span><div class="search-box"><span class="search-icon">' + UI_ICONS.search + '</span><input type="text" class="form-input" id="skill-search" placeholder="Search skills..." oninput="filterSkills()"></div></div>';
-        html += '<div class="card mb-16"><div class="card-header"><span>Starter Pack</span><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-sm" onclick="navigate(\'integrations\')">Open Integrations</button><button class="btn btn-sm" onclick="navigate(\'env-vars\')">Open Env Vars</button></div></div><div class="card-body">';
+        let html = '<div class="section-header"><span>' + skills.length + ' Skills</span><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button class="btn btn-primary" onclick="openSkillInstallModal()">Install Skill</button><div class="search-box"><span class="search-icon">' + UI_ICONS.search + '</span><input type="text" class="form-input" id="skill-search" placeholder="Search skills..." oninput="filterSkills()"></div></div></div>';
+        html += '<div class="card mb-16"><div class="card-header"><span>Starter Pack</span><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-sm" onclick="navigate(\'channels\')">Open Integrations</button><button class="btn btn-sm" onclick="navigate(\'env-vars\')">Open Env Vars</button></div></div><div class="card-body">';
         html += '<p class="text-sm text-secondary mb-16">Safe-route defaults for everyday use. Missing items are shown here so you can decide what to add next without auto-installing anything behind your back.</p>';
         if (policy.reason) {
             html += '<p class="text-sm text-secondary mb-16">' + escH(policy.reason) + '</p>';
@@ -1653,6 +1823,32 @@ window.toggleSkill = async function (name) {
         toast(name + ': ' + (r.enabled ? 'Enabled' : 'Disabled'), 'success');
         Screens.skills();
     } catch (e) { toast('Error: ' + e.message, 'error'); }
+};
+
+window.openSkillInstallModal = function () {
+    showModal(
+        'Install Skill',
+        '<p class="text-sm text-secondary mb-16">Paste a Hermes skill identifier exactly the way you would use it in the CLI. GitHub repos such as <span class="font-mono">wondelai/skills</span> work here, and so do registry targets like <span class="font-mono">skills-sh/steipete/clawdis/weather</span>.</p>' +
+        '<div class="form-group"><label class="form-label">Skill Identifier</label>' + inputH('skill-install-identifier', '', 'text', 'wondelai/skills') + '</div>',
+        '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="installSkillFromModal()">Install</button>'
+    );
+};
+
+window.installSkillFromModal = async function () {
+    const identifier = document.getElementById('skill-install-identifier')?.value?.trim() || '';
+    if (!identifier) {
+        toast('Skill identifier is required', 'error');
+        return;
+    }
+    toast('Installing ' + identifier + '...', 'info', 2500);
+    try {
+        await api('POST', '/api/skills/install', { identifier });
+        closeModal();
+        toast('Skill installed: ' + identifier, 'success');
+        Screens.skills();
+    } catch (e) {
+        toast('Install failed: ' + e.message, 'error');
+    }
 };
 
 // ── CHANNELS ───────────────────────────────────────────────

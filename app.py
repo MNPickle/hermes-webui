@@ -267,6 +267,82 @@ INTEGRATION_SECTION_LABELS = {
     "webhook": "Webhook",
 }
 INTEGRATION_SECTION_ORDER = tuple(INTEGRATION_SECTION_LABELS.keys())
+ENV_GROUP_HELP = {
+    "Provider": "Provider variables are API keys and optional endpoint overrides used by model providers and memory search. For standard OpenAI use, you usually only need OPENAI_API_KEY.",
+    "Channel": "Channel variables are only needed when an integration or skill specifically asks for them. If you are not setting up Discord, WhatsApp, Slack, or another messaging bridge, you can usually leave this group alone.",
+    "System": "System variables tune how Hermes itself behaves. Only change these when you are intentionally customizing the runtime.",
+}
+ENV_VAR_PRESETS = {
+    "OPENAI_API_KEY": {
+        "group": "Provider",
+        "label": "OpenAI API Key",
+        "description": "Used for OpenAI provider profiles and optional OpenAI-backed Hermes memory search.",
+        "secret": True,
+        "recommended": True,
+        "starter_pack_item": "memory",
+    },
+    "OPENAI_BASE_URL": {
+        "group": "Provider",
+        "label": "OpenAI Base URL",
+        "description": "Optional override for custom OpenAI-compatible gateways. Leave this unset for normal OpenAI API use.",
+        "default_value": "https://api.openai.com/v1",
+    },
+    "OPENROUTER_API_KEY": {
+        "group": "Provider",
+        "label": "OpenRouter API Key",
+        "description": "Lets Hermes and provider profiles call OpenRouter.",
+        "secret": True,
+        "recommended": True,
+    },
+    "ANTHROPIC_API_KEY": {
+        "group": "Provider",
+        "label": "Anthropic API Key",
+        "description": "Lets Hermes call Anthropic models directly.",
+        "secret": True,
+    },
+    "GOOGLE_API_KEY": {
+        "group": "Provider",
+        "label": "Google API Key",
+        "description": "Used by some Google and Gemini provider flows. Google Workspace skills may still need OAuth files separately.",
+        "secret": True,
+    },
+    "GROQ_API_KEY": {
+        "group": "Provider",
+        "label": "Groq API Key",
+        "description": "Lets Hermes call Groq-hosted models.",
+        "secret": True,
+    },
+    "DISCORD_TOKEN": {
+        "group": "Channel",
+        "label": "Discord Token",
+        "description": "Only needed if your Discord integration or skill specifically asks for it.",
+        "secret": True,
+    },
+    "SLACK_BOT_TOKEN": {
+        "group": "Channel",
+        "label": "Slack Bot Token",
+        "description": "Only needed if you connect Hermes to Slack via a bot token.",
+        "secret": True,
+    },
+    "TELEGRAM_BOT_TOKEN": {
+        "group": "Channel",
+        "label": "Telegram Bot Token",
+        "description": "Only needed if you connect Hermes to Telegram.",
+        "secret": True,
+    },
+    "HERMES_API_URL": {
+        "group": "System",
+        "label": "Hermes API URL",
+        "description": "Overrides the URL the web UI uses for API replay.",
+        "default_value": "http://127.0.0.1:8642",
+    },
+    "HERMES_CHAT_TIMEOUT": {
+        "group": "System",
+        "label": "Chat Timeout",
+        "description": "How long the web UI waits for a Hermes chat turn before timing out.",
+        "default_value": "300",
+    },
+}
 STARTER_PACK_SKILL_GROUPS = (
     {
         "id": "google_workspace",
@@ -1948,6 +2024,28 @@ def _classify_env_key(key: str) -> str:
     return "System"
 
 
+def _env_var_metadata(key: str) -> dict:
+    preset = ENV_VAR_PRESETS.get(str(key or "").strip(), {})
+    return {
+        "key": str(key or "").strip(),
+        "group": preset.get("group") or _classify_env_key(key),
+        "label": preset.get("label") or str(key or "").strip(),
+        "description": preset.get("description") or "",
+        "secret": bool(preset.get("secret")),
+        "recommended": bool(preset.get("recommended")),
+        "default_value": str(preset.get("default_value") or ""),
+        "starter_pack_item": str(preset.get("starter_pack_item") or ""),
+    }
+
+
+def _env_presets_by_group() -> dict[str, list[dict]]:
+    grouped = {group: [] for group in ENV_GROUP_HELP}
+    for key in sorted(ENV_VAR_PRESETS.keys()):
+        meta = _env_var_metadata(key)
+        grouped.setdefault(meta["group"], []).append(meta)
+    return grouped
+
+
 def _run_hermes(*args, timeout: int = 30) -> subprocess.CompletedProcess:
     """Run a hermes CLI command and return the CompletedProcess."""
     env = {**os.environ, "NO_COLOR": "1"}
@@ -2183,7 +2281,14 @@ def api_env_get():
             g = _classify_env_key(k)
             groups.setdefault(g, []).append(k)
 
-        return jsonify({"vars": masked, "groups": groups})
+        metadata = {k: _env_var_metadata(k) for k in masked}
+        return jsonify({
+            "vars": masked,
+            "groups": groups,
+            "metadata": metadata,
+            "group_help": ENV_GROUP_HELP,
+            "presets": _env_presets_by_group(),
+        })
     except Exception as exc:
         return _http_error(str(exc))
 
@@ -2781,6 +2886,34 @@ def api_skill_toggle(name):
             return jsonify({"ok": True, "enabled": True})
         else:
             return jsonify({"ok": False, "error": f"Skill '{name}' not found"}), 404
+    except Exception as exc:
+        return _http_error(str(exc))
+
+
+@app.route("/api/skills/install", methods=["POST"])
+@require_token
+def api_skill_install():
+    try:
+        data = request.get_json(force=True) or {}
+        identifier = str(data.get("identifier") or "").strip()
+        if not identifier:
+            return jsonify({"ok": False, "error": "identifier is required"}), 400
+
+        result = _run_hermes("skills", "install", identifier, "--yes", timeout=300)
+        combined_output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part and part.strip()).strip()
+        lowered_output = combined_output.lower()
+        if result.returncode != 0 and "already installed" not in lowered_output:
+            message = combined_output or f"Hermes skills install exited with status {result.returncode}"
+            return jsonify({"ok": False, "error": message}), 502
+
+        return jsonify({
+            "ok": True,
+            "identifier": identifier,
+            "output": combined_output,
+            "skills": _discover_skill_entries(),
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "error": "Hermes skills install timed out"}), 504
     except Exception as exc:
         return _http_error(str(exc))
 
@@ -3894,8 +4027,14 @@ def _chat_runtime_status(raw: dict | None = None, *, skills: list[dict] | None =
         "ready": bool(memory.get("semantic_search_ready")),
         "detail": memory.get("detail"),
         "supports_install": False,
+        "setup_action": {
+            "type": "env_var",
+            "key": "OPENAI_API_KEY",
+            "label": "Set Up Memory",
+        },
         "setup_notes": [
-            "OpenAI-backed memory search uses your OPENAI_API_KEY from the Hermes environment.",
+            "Hermes already stores memory locally. OPENAI_API_KEY is optional and only enables better OpenAI-backed semantic memory search.",
+            "For standard OpenAI use, you do not need OPENAI_BASE_URL. Leave it unset unless you are pointing Hermes at a custom OpenAI-compatible gateway.",
         ],
     })
 

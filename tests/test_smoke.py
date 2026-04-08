@@ -297,6 +297,22 @@ class HermesWebUISmokeTests(unittest.TestCase):
         self.assertEqual(data["limits"]["max_upload_bytes"], mod.MAX_UPLOAD_SIZE)
         self.assertEqual(data["limits"]["max_request_body_bytes"], mod.MAX_REQUEST_BODY_SIZE)
 
+    def test_env_api_returns_metadata_and_presets(self):
+        env_file = Path(self.tmpdir.name) / ".env"
+        env_file.write_text("OPENAI_API_KEY=test-key\nOPENAI_BASE_URL=\n", encoding="utf-8")
+
+        with patch.object(mod, "ENV_PATH", env_file):
+            resp = self.client.get("/api/env", headers=self.headers)
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        data = resp.get_json()
+        self.assertIn("metadata", data)
+        self.assertIn("presets", data)
+        self.assertEqual(data["metadata"]["OPENAI_API_KEY"]["label"], "OpenAI API Key")
+        self.assertEqual(data["metadata"]["OPENAI_BASE_URL"]["default_value"], "https://api.openai.com/v1")
+        self.assertIn("Provider", data["group_help"])
+        self.assertTrue(any(item["key"] == "OPENAI_API_KEY" for item in data["presets"]["Provider"]))
+
     def test_skill_setup_readiness_detects_missing_requirements(self):
         skill_root = Path(self.tmpdir.name) / "skills"
         skill_dir = skill_root / "productivity" / "google-workspace"
@@ -383,6 +399,8 @@ required_credential_files:
         self.assertEqual(runtime["blocking_features"], [])
         self.assertIn("Hermes memory is enabled for chat sessions.", runtime["reasons"])
         self.assertIn("1 Hermes skill is enabled.", runtime["reasons"])
+        items = {item["id"]: item for item in runtime["starter_pack"]["items"]}
+        self.assertEqual(items["memory"]["setup_action"]["key"], "OPENAI_API_KEY")
 
     def test_starter_pack_summary_install_stays_available_when_builtins_cover_it(self):
         raw = {
@@ -1293,6 +1311,31 @@ Sidecar output:
         )
         self.assertEqual(resp.status_code, 400, resp.data)
         self.assertEqual(resp.get_json()["error"], "Unsupported starter-pack install target")
+
+    def test_skill_install_endpoint_runs_hermes_install_for_repo_identifier(self):
+        with patch.object(mod, "_run_hermes", return_value=SimpleNamespace(returncode=0, stdout="installed ok", stderr="")) as run_mock, \
+             patch.object(mod, "_discover_skill_entries", return_value=[{"name": "wondelai-skills", "enabled": True}]):
+            resp = self.client.post(
+                "/api/skills/install",
+                json={"identifier": "wondelai/skills"},
+                headers=self.headers,
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        run_mock.assert_called_once_with("skills", "install", "wondelai/skills", "--yes", timeout=300)
+        body = resp.get_json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["identifier"], "wondelai/skills")
+        self.assertEqual(body["skills"][0]["name"], "wondelai-skills")
+
+    def test_skill_install_endpoint_requires_identifier(self):
+        resp = self.client.post(
+            "/api/skills/install",
+            json={},
+            headers=self.headers,
+        )
+        self.assertEqual(resp.status_code, 400, resp.data)
+        self.assertEqual(resp.get_json()["error"], "identifier is required")
 
     def test_channels_api_exposes_top_level_integrations(self):
         mod.cfg._config = {
