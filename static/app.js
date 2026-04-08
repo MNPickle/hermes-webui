@@ -250,7 +250,7 @@ function screenTitle(s) {
     return {
         dashboard: 'Dashboard', settings: 'Settings', 'env-vars': 'Environment Variables',
         folders: 'Folders', service: 'Service Controls', providers: 'Providers', models: 'Models',
-        agents: 'Agents', skills: 'Skills', channels: 'Channels',
+        agents: 'Agents', skills: 'Skills', channels: 'Integrations',
         hooks: 'Hooks / Webhooks', cron: 'Cron Jobs', sessions: 'Session Reset', logs: 'Log File Tail', chat: 'Chat'
     }[s] || s;
 }
@@ -626,125 +626,468 @@ Screens.service = async function () {
 };
 
 // ── PROVIDERS ──────────────────────────────────────────────
+const PROVIDER_TYPE_OPTIONS = [
+    { value: 'auto', label: 'Generic OpenAI-Compatible' },
+    { value: 'openrouter', label: 'OpenRouter' },
+    { value: 'openai', label: 'OpenAI' },
+    { value: 'azure', label: 'Azure OpenAI' },
+    { value: 'anthropic', label: 'Anthropic' },
+    { value: 'groq', label: 'Groq' },
+    { value: 'google', label: 'Google' },
+    { value: 'mistral', label: 'Mistral' },
+    { value: 'together', label: 'Together' },
+    { value: 'fireworks', label: 'Fireworks' },
+    { value: 'deepseek', label: 'DeepSeek' },
+    { value: 'cohere', label: 'Cohere' },
+];
+const PROVIDER_ENV_VAR_MAP = {
+    openrouter: 'OPENROUTER_API_KEY',
+    openai: 'OPENAI_API_KEY',
+    'openai-codex': 'OPENAI_API_KEY',
+    azure: 'AZURE_OPENAI_API_KEY',
+    anthropic: 'ANTHROPIC_API_KEY',
+    groq: 'GROQ_API_KEY',
+    google: 'GOOGLE_API_KEY',
+    gemini: 'GOOGLE_API_KEY',
+    mistral: 'MISTRAL_API_KEY',
+    together: 'TOGETHER_API_KEY',
+    fireworks: 'FIREWORKS_API_KEY',
+    deepseek: 'DEEPSEEK_API_KEY',
+    cohere: 'COHERE_API_KEY',
+};
+const MODEL_ROLE_META = {
+    primary: {
+        title: 'Primary Chat',
+        description: 'The main provider profile and model Hermes uses for normal chat requests.',
+        disableAllowed: false,
+    },
+    fallback: {
+        title: 'Fallback Chat',
+        description: 'A second provider profile and model the app retries automatically when the primary chat target has a retryable failure.',
+        disableAllowed: true,
+    },
+    vision: {
+        title: 'Vision',
+        description: 'The provider profile and model used for screenshot analysis and other image-aware requests.',
+        disableAllowed: true,
+    },
+};
+const modelRoleDiscoveryCache = { models: {}, endpoints: {} };
+window.modelRolesCache = null;
+window.providerEnvCache = null;
+
+function providerPresetConfig(kind) {
+    const presets = {
+        openrouter: {
+            title: 'Add OpenRouter Profile',
+            intro: 'Create a saved OpenRouter provider profile, then assign it to Primary Chat, Fallback Chat, or Vision in Model Roles.',
+            name: 'openrouter',
+            provider: 'openrouter',
+            base_url: 'https://openrouter.ai/api/v1',
+            model: '',
+        },
+        openai: {
+            title: 'Add OpenAI Profile',
+            intro: 'Create a saved OpenAI provider profile for direct model access.',
+            name: 'openai',
+            provider: 'openai',
+            base_url: 'https://api.openai.com/v1',
+            model: '',
+        },
+        local: {
+            title: 'Add Local API Profile',
+            intro: 'Create a saved OpenAI-compatible profile for a local or self-hosted server.',
+            name: 'local-api',
+            provider: 'auto',
+            base_url: 'http://127.0.0.1:8000/v1',
+            model: '',
+        },
+    };
+    return presets[kind] || null;
+}
+
+function providerUsageBadgesH(usedBy) {
+    if (!usedBy || !usedBy.length) return '<span class="text-muted">Not linked</span>';
+    return usedBy.map(label => '<span class="badge badge-info">' + escH(label) + '</span>').join(' ');
+}
+
+async function loadModelRoles(force = false) {
+    if (!force && window.modelRolesCache) return window.modelRolesCache;
+    window.modelRolesCache = await api('GET', '/api/model-roles');
+    return window.modelRolesCache;
+}
+
+async function loadEnvVarMap(force = false) {
+    if (!force && window.providerEnvCache) return window.providerEnvCache;
+    const data = await api('GET', '/api/env');
+    window.providerEnvCache = data.vars || {};
+    return window.providerEnvCache;
+}
+
+function providerTypeDefaultConfig(providerType) {
+    const preset = providerPresetConfig(providerType);
+    if (preset) return preset;
+    return {
+        name: providerType || '',
+        base_url: '',
+    };
+}
+
+function providerApiKeyRequirementText(providerType, envVars, hasSavedApiKey = false) {
+    const envKey = PROVIDER_ENV_VAR_MAP[providerType];
+    if (!envKey) return 'Optional. Leave blank if this profile does not need an API key.';
+    if (hasSavedApiKey) return 'Optional here because this profile already has a saved API key. Leave it blank to keep the current secret.';
+    if (envVars && envVars[envKey]) return 'Optional because ' + envKey + ' is already set in Env Vars.';
+    return 'Required here or in Env Vars as ' + envKey + '.';
+}
+
+async function loadProviderDiscoveryModels(profileName, visionOnly = false, force = false) {
+    const key = profileName + '|' + (visionOnly ? 'vision' : 'chat');
+    if (!force && modelRoleDiscoveryCache.models[key]) return modelRoleDiscoveryCache.models[key];
+    const query = visionOnly ? '?vision_only=1' : '';
+    const data = await api('GET', '/api/providers/' + encodeURIComponent(profileName) + '/discovery/models' + query);
+    modelRoleDiscoveryCache.models[key] = data;
+    return data;
+}
+
+async function loadProviderDiscoveryEndpoints(profileName, modelId, force = false) {
+    const key = profileName + '|' + modelId;
+    if (!force && modelRoleDiscoveryCache.endpoints[key]) return modelRoleDiscoveryCache.endpoints[key];
+    const data = await api('GET', '/api/providers/' + encodeURIComponent(profileName) + '/discovery/endpoints?model=' + encodeURIComponent(modelId));
+    modelRoleDiscoveryCache.endpoints[key] = data;
+    return data;
+}
+
+function modelRoleCardH(role, info) {
+    const meta = MODEL_ROLE_META[role] || { title: role, description: '' };
+    const enabled = role === 'primary' ? true : !!info?.enabled;
+    const statusBadge = role === 'primary'
+        ? '<span class="badge badge-success">Required</span>'
+        : '<span class="badge ' + (enabled ? 'badge-info' : 'badge-secondary') + '">' + (enabled ? 'Enabled' : 'Disabled') + '</span>';
+    const profileLabel = info?.profile || '(not linked)';
+    const providerLabel = info?.provider_label || info?.provider || '(not set)';
+    const modelLabel = info?.model || '(not set)';
+    const routeLabel = info?.routing_provider || 'Auto';
+    return '' +
+        '<div class="card model-role-card">' +
+            '<div class="card-header"><span>' + escH(meta.title) + '</span>' + statusBadge + '</div>' +
+            '<div class="card-body">' +
+                '<p class="text-sm text-secondary mb-16">' + escH(meta.description) + '</p>' +
+                '<div class="model-role-meta">' +
+                    '<div class="model-role-meta-item"><label class="form-label">Provider Profile</label><div class="font-mono text-sm">' + escH(profileLabel) + '</div></div>' +
+                    '<div class="model-role-meta-item"><label class="form-label">Provider Type</label><div class="text-sm">' + escH(providerLabel) + '</div></div>' +
+                    '<div class="model-role-meta-item"><label class="form-label">Model</label><div class="font-mono text-sm">' + escH(modelLabel) + '</div></div>' +
+                    '<div class="model-role-meta-item"><label class="form-label">OpenRouter Endpoint</label><div class="font-mono text-sm">' + escH(routeLabel) + '</div></div>' +
+                '</div>' +
+                '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:16px">' +
+                    '<button class="btn btn-primary" onclick="editModelRole(\'' + escA(role) + '\')">Edit</button>' +
+                '</div>' +
+            '</div>' +
+        '</div>';
+}
+
 Screens.providers = async function () {
     const content = document.getElementById('content');
     try {
-        const [data, chatStatus] = await Promise.all([
+        const [data, chatStatus, roleData] = await Promise.all([
             api('GET', '/api/providers'),
             api('GET', '/api/chat/status').catch(() => null),
+            loadModelRoles(true),
         ]);
         const def = data.default || {};
         const custom = data.custom || [];
-        const aux = data.auxiliary || {};
         const readiness = chatStatus?.readiness || {};
         const screenshotReady = !!readiness.screenshots_ready;
         const screenshotReason = screenshotReady
             ? 'Pasted screenshots can be analyzed through the configured vision sidecar while Hermes CLI remains the main session.'
             : (chatStatus?.capability_reasons?.image_attachments || readiness.vision_reason || 'A vision model and reachable OpenAI-compatible API are required before screenshot paste can work.');
-        const visionCfg = aux.vision || {};
+        const primaryRole = roleData?.roles?.primary || {};
+        const visionRole = roleData?.roles?.vision || {};
+        const availableProfiles = roleData?.profiles || [];
+        const implicitProfiles = availableProfiles.filter(profile => !(custom || []).some(saved => saved.name === profile.name));
 
-        let html = '<div class="section-header"><span>Default Provider</span></div>';
+        let html = '<div class="card mb-16"><div class="card-body">';
+        html += '<p class="text-sm text-secondary mb-16">Provider Profiles store connection details like provider type, base URL, API key, and an optional suggested model. Model Roles decides which saved provider Hermes uses for Primary Chat, Fallback Chat, and Vision.</p>';
+        html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+        html += '<button class="btn btn-primary" onclick="navigate(\'models\')">Open Model Roles</button>';
+        html += '<button class="btn" onclick="navigate(\'env-vars\')">Open Env Vars</button>';
+        html += '</div></div></div>';
+
+        html += '<div class="section-header"><span>Quick Add</span></div>';
+        html += '<div class="provider-grid mb-16">';
+        ['openrouter', 'openai', 'local'].forEach(kind => {
+            const preset = providerPresetConfig(kind);
+            html += '<button class="provider-card" onclick="addProvider(\'' + escA(kind) + '\')">';
+            html += '<div class="provider-icon">' + escH((preset?.label || kind).slice(0, 2).toUpperCase()) + '</div>';
+            html += '<div class="provider-name">' + escH(preset?.label || kind) + '</div>';
+            html += '</button>';
+        });
+        html += '</div>';
+
+        html += '<div class="section-header"><span>Current Primary Chat Target</span></div>';
         html += '<div class="card mb-16"><div class="card-body"><div class="form-row">';
-        html += '<div class="form-group"><label class="form-label">Provider</label><div class="font-mono text-sm">' + escH(def.provider || '?') + '</div></div>';
-        html += '<div class="form-group"><label class="form-label">Model</label><div class="font-mono text-sm">' + escH(def.model || '?') + '</div></div>';
-        html += '<div class="form-group"><label class="form-label">Base URL</label><div class="font-mono text-sm">' + escH(def.base_url || '?') + '</div></div></div></div></div>';
+        html += '<div class="form-group"><label class="form-label">Provider Profile</label><div class="font-mono text-sm">' + escH(primaryRole.profile || def.profile || '(not linked)') + '</div></div>';
+        html += '<div class="form-group"><label class="form-label">Provider Type</label><div class="text-sm">' + escH(primaryRole.provider_label || def.provider_label || def.provider || '(not set)') + '</div></div>';
+        html += '<div class="form-group"><label class="form-label">Model</label><div class="font-mono text-sm">' + escH(primaryRole.model || def.model || '(not set)') + '</div></div>';
+        html += '<div class="form-group"><label class="form-label">Base URL</label><div class="font-mono text-sm">' + escH(primaryRole.base_url || def.base_url || '(not set)') + '</div></div>';
+        html += '</div><div style="display:flex;gap:8px;flex-wrap:wrap">';
+        html += '<button class="btn btn-primary" onclick="editModelRole(\'primary\')">Edit Primary Chat</button>';
+        html += '<button class="btn" onclick="editModelRole(\'fallback\')">Edit Fallback Chat</button>';
+        html += '</div></div></div>';
 
         html += '<div class="section-header"><span>Vision Chat Readiness</span></div>';
         html += '<div class="card mb-16"><div class="card-header"><span>Screenshot Paste</span><span class="badge ' + (screenshotReady ? 'badge-success' : 'badge-danger') + '">' + (screenshotReady ? 'Ready' : 'Not Ready') + '</span></div><div class="card-body">';
         html += '<p class="text-sm text-secondary mb-16">' + escH(screenshotReason) + '</p>';
         html += '<div class="form-row">';
-        html += '<div class="form-group"><label class="form-label">Vision Provider</label><div class="font-mono text-sm">' + escH(visionCfg.provider || 'auto') + '</div></div>';
-        html += '<div class="form-group"><label class="form-label">Vision Model</label><div class="font-mono text-sm">' + escH(readiness.vision_model || visionCfg.model || '(not set)') + '</div></div>';
-        html += '<div class="form-group"><label class="form-label">Vision API URL</label><div class="font-mono text-sm">' + escH(readiness.vision_api_url || chatStatus?.api_url || '(not set)') + '</div></div>';
+        html += '<div class="form-group"><label class="form-label">Provider Profile</label><div class="font-mono text-sm">' + escH(visionRole.profile || '(not linked)') + '</div></div>';
+        html += '<div class="form-group"><label class="form-label">Vision Provider</label><div class="text-sm">' + escH(visionRole.provider_label || visionRole.provider || 'auto') + '</div></div>';
+        html += '<div class="form-group"><label class="form-label">Vision Model</label><div class="font-mono text-sm">' + escH(readiness.vision_model || visionRole.model || '(not set)') + '</div></div>';
+        html += '<div class="form-group"><label class="form-label">Vision API URL</label><div class="font-mono text-sm">' + escH(readiness.vision_api_url || visionRole.base_url || chatStatus?.api_url || '(not set)') + '</div></div>';
         html += '</div>';
         html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
-        html += '<button class="btn btn-primary" onclick="editAuxProvider(\'vision\')">Configure Vision Model</button>';
-        html += '<button class="btn" onclick="navigate(\'env-vars\')">Open Env Vars</button>';
+        html += '<button class="btn btn-primary" onclick="editModelRole(\'vision\')">Edit Vision Role</button>';
         html += '<button class="btn" onclick="chatRefreshCapabilities(); Screens.providers();">Refresh Readiness</button>';
         html += '</div></div></div>';
         if (!screenshotReady) {
             html += '<div class="card mb-16"><div class="card-header"><span>Quick Setup</span></div><div class="card-body">';
-            html += '<p class="text-sm text-secondary mb-16">Pick the vision backend you want to use locally, then save a model and key.</p>';
+            html += '<p class="text-sm text-secondary mb-16">Start by creating a provider profile, then assign it to the Vision role in Model Roles.</p>';
             html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
-            html += '<button class="btn btn-primary" onclick="startVisionWizard(\'openrouter\')">OpenRouter</button>';
-            html += '<button class="btn" onclick="startVisionWizard(\'openai\')">OpenAI</button>';
-            html += '<button class="btn" onclick="startVisionWizard(\'local\')">Local API</button>';
-            html += '<button class="btn" onclick="editAuxProvider(\'vision\')">Manual</button>';
+            html += '<button class="btn btn-primary" onclick="startVisionWizard(\'openrouter\')">Add OpenRouter Profile</button>';
+            html += '<button class="btn" onclick="startVisionWizard(\'openai\')">Add OpenAI Profile</button>';
+            html += '<button class="btn" onclick="startVisionWizard(\'local\')">Add Local API Profile</button>';
+            html += '<button class="btn" onclick="editModelRole(\'vision\')">Open Vision Role</button>';
             html += '</div></div></div>';
         }
 
-        html += '<div class="section-header"><span>Custom Providers</span><button class="btn btn-primary" onclick="addProvider()">+ Add Provider</button></div>';
+        if (implicitProfiles.length) {
+            html += '<div class="card mb-16"><div class="card-header"><span>Profiles From Current Hermes Config</span></div><div class="card-body">';
+            html += '<p class="text-sm text-secondary mb-16">Hermes already has active provider targets that Model Roles can use immediately. They are shown here even if you have not saved them as standalone provider profiles yet.</p>';
+            html += '<div class="table-container"><table class="table"><thead><tr><th>Name</th><th>Type</th><th>Base URL</th><th>Suggested Model</th><th>Used By</th></tr></thead><tbody>';
+            implicitProfiles.forEach(p => {
+                html += '<tr><td class="font-mono text-sm">' + escH(p.name) + '</td><td class="text-sm">' + escH(p.provider_label || p.provider || '') + '</td><td class="text-sm">' + escH(p.base_url || '') + '</td><td class="font-mono text-sm">' + escH(p.model || '') + '</td><td>' + providerUsageBadgesH(p.used_by) + '</td></tr>';
+            });
+            html += '</tbody></table></div></div></div>';
+        }
+
+        html += '<div class="section-header"><span>Provider Profiles</span><button class="btn btn-primary" onclick="addProvider()">+ Add Provider</button></div>';
         if (custom.length === 0) {
-            html += '<div class="empty-state"><p>No custom providers configured</p></div>';
+            html += '<div class="empty-state"><p>No provider profiles configured yet</p></div>';
         } else {
-            html += '<div class="table-container"><table class="table"><thead><tr><th>Name</th><th>Base URL</th><th>Model</th><th style="width:180px">Actions</th></tr></thead><tbody>';
+            html += '<div class="table-container"><table class="table"><thead><tr><th>Name</th><th>Type</th><th>Base URL</th><th>Suggested Model</th><th>Used By</th><th style="width:180px">Actions</th></tr></thead><tbody>';
             custom.forEach(p => {
-                html += '<tr><td class="font-mono text-sm">' + escH(p.name) + '</td><td class="text-sm">' + escH(p.base_url || '') + '</td><td class="font-mono text-sm">' + escH(p.model || '') + '</td>';
+                html += '<tr><td class="font-mono text-sm">' + escH(p.name) + '</td><td class="text-sm">' + escH(p.provider_label || p.provider || '') + '</td><td class="text-sm">' + escH(p.base_url || '') + '</td><td class="font-mono text-sm">' + escH(p.model || '') + '</td><td>' + providerUsageBadgesH(p.used_by) + '</td>';
                 html += '<td class="actions"><button class="btn btn-sm" onclick="editProvider(\'' + escA(p.name) + '\')">Edit</button> <button class="btn btn-sm" onclick="testProvider(this, \'' + escA(p.name) + '\')">Test</button> <button class="btn btn-sm btn-danger" onclick="deleteProvider(\'' + escA(p.name) + '\')">Delete</button></td></tr>';
             });
             html += '</tbody></table></div>';
         }
-
-        html += '<div class="section-header mt-16"><span>Auxiliary Models</span></div>';
-        html += '<div class="table-container"><table class="table"><thead><tr><th>Purpose</th><th>Provider</th><th>Model</th></tr></thead><tbody>';
-        for (const [purpose, cfg] of Object.entries(aux)) {
-            if (!cfg || typeof cfg !== 'object') continue;
-            html += '<tr><td>' + escH(purpose) + '</td><td class="font-mono text-sm">' + escH(cfg.provider || 'auto') + '</td><td class="font-mono text-sm">' + escH(cfg.model || 'default') + '</td></tr>';
-        }
-        html += '</tbody></table></div>';
         content.innerHTML = html;
     } catch (e) {
         content.innerHTML = '<div class="empty-state"><div class="empty-icon">\u26a0\ufe0f</div><h3>Error</h3><p>' + escH(e.message) + '</p></div>';
     }
 };
 
-window.providerModal = function (title, name, base_url, model, api_key, saveFn, hasSavedApiKey = false) {
-    showModal(title,
-        '<div class="form-group"><label class="form-label">Name</label>' + inputH('prov-name', name, 'text', 'e.g. my-provider', name ? 'disabled' : '') + '</div>' +
-        '<div class="form-group"><label class="form-label">Base URL</label>' + inputH('prov-url', base_url, 'url', 'https://api.example.com/v1') + '</div>' +
-        '<div class="form-group"><label class="form-label">Model</label>' + inputH('prov-model', model, 'text', 'e.g. gpt-4') + '</div>' +
-        '<div class="form-group"><label class="form-label">API Key <span class="form-label-hint">(optional)</span></label>' + inputH('prov-api-key', api_key || '', 'password', hasSavedApiKey ? 'Leave blank to keep current secret' : 'Optional API key') + '</div>',
-        '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="' + saveFn + '">Save</button>'
+async function loadProviderTypeDiscoveryModels(providerType, force = false) {
+    const key = 'provider-type|' + providerType;
+    if (!force && modelRoleDiscoveryCache.models[key]) return modelRoleDiscoveryCache.models[key];
+    const data = await api('GET', '/api/provider-types/' + encodeURIComponent(providerType) + '/discovery/models');
+    modelRoleDiscoveryCache.models[key] = data;
+    return data;
+}
+
+async function validateProviderCredentials(providerType, apiKey, hasSavedApiKey = false) {
+    const envKey = PROVIDER_ENV_VAR_MAP[providerType];
+    if (!envKey) return;
+    const envVars = await loadEnvVarMap();
+    if (!apiKey && !hasSavedApiKey && !envVars[envKey]) {
+        throw new Error('API key is required here or in Env Vars as ' + envKey);
+    }
+}
+
+function applyProviderModalDefaults(config) {
+    const typeSelect = document.getElementById('prov-type');
+    const nameInput = document.getElementById('prov-name');
+    const urlInput = document.getElementById('prov-url');
+    if (!typeSelect || !nameInput || !urlInput) return;
+    const providerType = typeSelect.value || 'auto';
+    const defaults = providerTypeDefaultConfig(providerType);
+    const canAutoName = !config.nameReadonly && (!nameInput.dataset.userEdited || !nameInput.value || nameInput.value === (nameInput.dataset.autoValue || ''));
+    const canAutoUrl = !urlInput.dataset.userEdited || !urlInput.value || urlInput.value === (urlInput.dataset.autoValue || '');
+    if (canAutoName && defaults.name) {
+        nameInput.value = defaults.name;
+        nameInput.dataset.autoValue = defaults.name;
+    }
+    if (canAutoUrl && defaults.base_url) {
+        urlInput.value = defaults.base_url;
+        urlInput.dataset.autoValue = defaults.base_url;
+    }
+}
+
+async function refreshProviderModalState(forceDiscovery = false) {
+    const state = window.providerModalState || {};
+    const typeSelect = document.getElementById('prov-type');
+    const modelInput = document.getElementById('prov-model');
+    const modelDiscovery = document.getElementById('prov-model-discovery');
+    const apiHint = document.getElementById('prov-api-key-hint');
+    const apiInput = document.getElementById('prov-api-key');
+    if (!typeSelect || !modelInput || !modelDiscovery || !apiHint || !apiInput) return;
+    applyProviderModalDefaults(state.config || {});
+    const providerType = typeSelect.value || 'auto';
+    const envVars = await loadEnvVarMap().catch(() => ({}));
+    apiHint.textContent = providerApiKeyRequirementText(providerType, envVars, !!state.config?.hasSavedApiKey);
+    apiInput.placeholder = state.config?.hasSavedApiKey
+        ? 'Leave blank to keep current secret'
+        : (PROVIDER_ENV_VAR_MAP[providerType] ? 'Leave blank if ' + PROVIDER_ENV_VAR_MAP[providerType] + ' is already set' : 'Optional API key');
+
+    if (providerType !== 'openrouter') {
+        modelDiscovery.innerHTML = '';
+        return;
+    }
+
+    modelDiscovery.innerHTML = '<div class="text-sm text-secondary mb-12">Loading OpenRouter models…</div>';
+    try {
+        const discovery = await loadProviderTypeDiscoveryModels(providerType, forceDiscovery);
+        const currentModel = (modelInput.value || '').trim();
+        const options = [{ value: '', label: 'Choose from OpenRouter' }];
+        (discovery.models || []).forEach(item => {
+            const badge = item.supports_image ? ' [image]' : '';
+            options.push({ value: item.id, label: item.id + badge });
+        });
+        if (currentModel && !options.find(option => option.value === currentModel)) {
+            options.push({ value: currentModel, label: currentModel + ' (current)' });
+        }
+        modelDiscovery.innerHTML = '' +
+            '<div class="form-group">' +
+                '<label class="form-label">OpenRouter Model List</label>' +
+                selectH('prov-model-select', options, currentModel) +
+                '<div class="text-xs text-secondary mt-8">Pick a live OpenRouter model, or type a custom suggested model below.</div>' +
+            '</div>' +
+            '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:-4px;margin-bottom:12px">' +
+                '<button class="btn btn-sm" onclick="refreshProviderModalState(true)">Refresh Model List</button>' +
+            '</div>';
+        const modelSelect = document.getElementById('prov-model-select');
+        if (modelSelect) {
+            modelSelect.addEventListener('change', function () {
+                if (this.value) modelInput.value = this.value;
+            });
+        }
+    } catch (e) {
+        modelDiscovery.innerHTML = '<div class="text-sm text-danger mb-12">Could not load OpenRouter models: ' + escH(e.message) + '</div>';
+    }
+}
+
+window.refreshProviderModalState = refreshProviderModalState;
+
+window.providerModal = function (opts) {
+    const config = opts || {};
+    window.providerModalState = { config };
+    const body = '' +
+        (config.intro ? '<p class="text-sm text-secondary mb-16">' + escH(config.intro) + '</p>' : '') +
+        '<div class="form-group"><label class="form-label">Profile Name</label>' + inputH('prov-name', config.name || '', 'text', 'e.g. openrouter-prod', config.nameReadonly ? 'disabled' : '') + '</div>' +
+        '<div class="form-group"><label class="form-label">Provider Type</label>' + selectH('prov-type', PROVIDER_TYPE_OPTIONS, config.provider || 'auto') + '</div>' +
+        '<div class="form-group"><label class="form-label">Base URL</label>' + inputH('prov-url', config.base_url || '', 'url', 'https://api.example.com/v1') + '</div>' +
+        '<div id="prov-model-discovery"></div>' +
+        '<div class="form-group"><label class="form-label">Suggested Model <span class="form-label-hint">(optional)</span></label>' + inputH('prov-model', config.model || '', 'text', 'e.g. openai/gpt-4o') + '</div>' +
+        '<div class="form-group"><label class="form-label">API Key <span class="form-label-hint">(optional)</span></label>' + inputH('prov-api-key', '', 'password', config.hasSavedApiKey ? 'Leave blank to keep current secret' : 'Optional API key') + '<div class="form-hint" id="prov-api-key-hint">Checking API key requirements…</div></div>';
+    showModal(
+        config.title || 'Provider Profile',
+        body,
+        '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="' + config.saveFn + '">Save</button>'
     );
+    const nameInput = document.getElementById('prov-name');
+    const urlInput = document.getElementById('prov-url');
+    const typeSelect = document.getElementById('prov-type');
+    if (nameInput && !config.nameReadonly) {
+        nameInput.addEventListener('input', function () { this.dataset.userEdited = '1'; });
+    }
+    if (urlInput) {
+        urlInput.addEventListener('input', function () { this.dataset.userEdited = '1'; });
+    }
+    if (typeSelect) {
+        typeSelect.addEventListener('change', function () {
+            refreshProviderModalState();
+        });
+    }
+    refreshProviderModalState();
 };
-window.addProvider = function () { window.providerModal('Add Provider', '', '', '', '', 'saveNewProvider()'); };
+window.addProvider = function (presetKind = null) {
+    const preset = presetKind ? providerPresetConfig(presetKind) : null;
+    window.providerModal({
+        title: preset?.title || 'Add Provider Profile',
+        intro: preset?.intro || 'Create a reusable provider profile that Model Roles can reference for Primary Chat, Fallback Chat, and Vision.',
+        name: preset?.name || '',
+        provider: preset?.provider || 'auto',
+        base_url: preset?.base_url || '',
+        model: preset?.model || '',
+        saveFn: 'saveNewProvider()',
+    });
+};
 window.editProvider = async function (name) {
     try {
         const data = await api('GET', '/api/providers');
         const p = (data.custom || []).find(x => x.name === name);
         if (!p) { toast('Provider not found', 'error'); return; }
-        window.providerModal('Edit Provider: ' + name, p.name, p.base_url, p.model, '', 'saveEditProvider()', !!p.api_key);
+        window.providerModal({
+            title: 'Edit Provider Profile: ' + name,
+            intro: 'Update the saved provider profile. Linked Model Roles will keep pointing at this profile.',
+            name: p.name,
+            provider: p.provider || 'auto',
+            base_url: p.base_url || '',
+            model: p.model || '',
+            hasSavedApiKey: !!p.has_api_key,
+            nameReadonly: true,
+            saveFn: 'saveEditProvider()',
+        });
     } catch (e) { toast('Error: ' + e.message, 'error'); }
 };
 window.saveNewProvider = async function () {
     const name = document.getElementById('prov-name').value.trim();
+    const provider = document.getElementById('prov-type').value.trim() || 'auto';
     const base_url = document.getElementById('prov-url').value.trim();
     const model = document.getElementById('prov-model').value.trim();
     const api_key = document.getElementById('prov-api-key').value;
-    if (!name) { toast('Name required', 'error'); return; }
-    const payload = { name, base_url, model };
+    if (!name) { toast('Profile name is required', 'error'); return; }
+    const payload = { name, provider, base_url, model };
     if (api_key) payload.api_key = api_key;
-    try { await api('POST', '/api/providers', payload); toast('Provider added', 'success'); closeModal(); Screens.providers(); }
-    catch (e) { toast('Error: ' + e.message, 'error'); }
+    try {
+        await validateProviderCredentials(provider, api_key, false);
+        await api('POST', '/api/providers', payload);
+        window.modelRolesCache = null;
+        toast('Provider profile added', 'success');
+        closeModal();
+        Screens.providers();
+    } catch (e) { toast('Error: ' + e.message, 'error'); }
 };
 window.saveEditProvider = async function () {
     const name = document.getElementById('prov-name').value.trim();
+    const provider = document.getElementById('prov-type').value.trim() || 'auto';
     const base_url = document.getElementById('prov-url').value.trim();
     const model = document.getElementById('prov-model').value.trim();
     const api_key = document.getElementById('prov-api-key').value;
-    const payload = { base_url, model };
+    const hasSavedApiKey = !!window.providerModalState?.config?.hasSavedApiKey;
+    const payload = { provider, base_url, model };
     if (api_key) payload.api_key = api_key;
-    try { await api('PUT', '/api/providers/' + name, payload); toast('Provider updated', 'success'); closeModal(); Screens.providers(); }
-    catch (e) { toast('Error: ' + e.message, 'error'); }
+    try {
+        await validateProviderCredentials(provider, api_key, hasSavedApiKey);
+        await api('PUT', '/api/providers/' + name, payload);
+        window.modelRolesCache = null;
+        toast('Provider profile updated', 'success');
+        closeModal();
+        Screens.providers();
+    } catch (e) { toast('Error: ' + e.message, 'error'); }
 };
 window.deleteProvider = function (name) {
-    showModal('Delete Provider', '<p>Delete provider <strong>' + escH(name) + '</strong>?</p>',
+    showModal('Delete Provider Profile', '<p>Delete provider profile <strong>' + escH(name) + '</strong>?</p>',
         '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-danger" onclick="doDeleteProvider(\'' + escA(name) + '\')">Delete</button>'
     );
 };
 window.doDeleteProvider = async function (name) {
-    try { await api('DELETE', '/api/providers/' + name); toast('Provider deleted', 'success'); closeModal(); Screens.providers(); }
-    catch (e) { toast('Error: ' + e.message, 'error'); }
+    try {
+        await api('DELETE', '/api/providers/' + name);
+        window.modelRolesCache = null;
+        toast('Provider profile deleted', 'success');
+        closeModal();
+        Screens.providers();
+    } catch (e) { toast('Error: ' + e.message, 'error'); }
 };
 window.testProvider = async function (btn, name) {
     toast('Testing ' + name + '...', 'info', 2000);
@@ -756,131 +1099,243 @@ window.testProvider = async function (btn, name) {
     finally { setBtnLoading(btn, false); }
 };
 
-function visionPresetConfig(kind) {
-    const presets = {
-        openrouter: {
-            title: 'OpenRouter',
-            intro: 'Use OpenRouter as the OpenAI-compatible vision backend. Add your OpenRouter API key if it is not already set in Env Vars.',
-            provider: 'openrouter',
-            model: '',
-            base_url: 'https://openrouter.ai/api/v1',
-        },
-        openai: {
-            title: 'OpenAI',
-            intro: 'Use OpenAI as the vision backend. Add your OpenAI API key if it is not already set in Env Vars.',
-            provider: 'openai',
-            model: '',
-            base_url: 'https://api.openai.com/v1',
-        },
-        local: {
-            title: 'Local OpenAI-Compatible API',
-            intro: 'Use a local OpenAI-compatible server that supports image inputs. Replace the example URL and model with your local server details.',
-            provider: 'auto',
-            model: '',
-            base_url: 'http://127.0.0.1:8000/v1',
-        },
-    };
-    return presets[kind] || null;
-}
-
 window.startVisionWizard = function (kind) {
     navigate('providers');
-    setTimeout(function () {
-        if (window.editAuxProvider) window.editAuxProvider('vision', kind);
-    }, 50);
+    setTimeout(function () { addProvider(kind); }, 50);
 };
 
-window.editAuxProvider = async function (purpose, presetKind = null) {
-    try {
-        const aux = await api('GET', '/api/config/auxiliary');
-        const current = aux[purpose] || {};
-        const preset = visionPresetConfig(presetKind);
-        const merged = {
-            provider: preset ? preset.provider : (current.provider || 'auto'),
-            model: current.model || (preset ? preset.model : ''),
-            base_url: current.base_url || (preset ? preset.base_url : ''),
-            api_key: current.api_key || '',
-        };
-        const title = preset ? ('Configure ' + purpose + ' via ' + preset.title) : ('Configure ' + purpose);
-        const intro = preset
-            ? preset.intro
-            : 'Use this for Hermes auxiliary providers like vision. Leave base URL and API key blank to inherit the app-level API settings.';
-        showModal(
-            title,
-            '<p class="text-sm text-secondary mb-16">' + escH(intro) + '</p>' +
-            '<div class="form-group"><label class="form-label">Provider</label>' + inputH('aux-provider', merged.provider || 'auto', 'text', 'auto or provider name') + '</div>' +
-            '<div class="form-group"><label class="form-label">Model</label>' + inputH('aux-model', merged.model || '', 'text', 'Enter your image-capable model ID') + '</div>' +
-            '<div class="form-group"><label class="form-label">Base URL</label>' + inputH('aux-base-url', merged.base_url || '', 'url', 'Optional OpenAI-compatible base URL') + '</div>' +
-            '<div class="form-group"><label class="form-label">API Key</label>' + inputH('aux-api-key', '', 'password', merged.api_key ? 'Leave blank to keep current secret' : 'Optional API key') + '</div>',
-            '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn" onclick="disableAuxProvider(\'' + escA(purpose) + '\')">Disable</button><button class="btn btn-primary" onclick="saveAuxProvider(\'' + escA(purpose) + '\')">Save</button>'
-        );
-    } catch (e) { toast('Error: ' + e.message, 'error'); }
-};
-
-window.saveAuxProvider = async function (purpose) {
-    const provider = document.getElementById('aux-provider').value.trim() || 'auto';
-    const model = document.getElementById('aux-model').value.trim();
-    const base_url = document.getElementById('aux-base-url').value.trim();
-    const api_key = document.getElementById('aux-api-key').value;
-    const payload = {};
-    payload[purpose] = { provider, model, base_url };
-    if (api_key) payload[purpose].api_key = api_key;
-    try {
-        await api('PUT', '/api/config/auxiliary', payload);
-        toast('Saved ' + purpose + ' config', 'success');
-        closeModal();
-        await chatRefreshCapabilities();
-        Screens.providers();
-    } catch (e) { toast('Error: ' + e.message, 'error'); }
-};
-
-window.disableAuxProvider = async function (purpose) {
-    const payload = {};
-    payload[purpose] = { provider: 'auto', model: '', base_url: '', api_key: '' };
-    try {
-        await api('PUT', '/api/config/auxiliary', payload);
-        toast('Disabled ' + purpose + ' config', 'success');
-        closeModal();
-        await chatRefreshCapabilities();
-        Screens.providers();
-    } catch (e) { toast('Error: ' + e.message, 'error'); }
+window.editAuxProvider = function (purpose, presetKind = null) {
+    if (purpose !== 'vision') {
+        toast('Only the Vision role is editable from this shortcut right now', 'warning');
+        return;
+    }
+    if (presetKind) {
+        startVisionWizard(presetKind);
+        return;
+    }
+    navigate('models');
+    setTimeout(function () { editModelRole('vision'); }, 50);
 };
 
 // ── MODELS ─────────────────────────────────────────────────
+function modelRoleProfileOptions(profiles) {
+    return [{ value: '', label: profiles.length ? 'Choose a provider profile' : 'No provider profiles available yet' }]
+        .concat((profiles || []).map(p => ({ value: p.name, label: p.name + ' — ' + (p.provider_label || p.provider || 'Provider') })));
+}
+
+function modelRoleSummaryH(profile) {
+    if (!profile) return '<p class="text-sm text-secondary mb-16">Select a provider profile from your saved profiles or current Hermes config to choose a model.</p>';
+    return '' +
+        '<div class="card mb-16"><div class="card-body">' +
+            '<div class="form-row">' +
+                '<div class="form-group"><label class="form-label">Provider Type</label><div class="text-sm">' + escH(profile.provider_label || profile.provider || '') + '</div></div>' +
+                '<div class="form-group"><label class="form-label">Base URL</label><div class="font-mono text-sm">' + escH(profile.base_url || '(not set)') + '</div></div>' +
+                '<div class="form-group"><label class="form-label">Suggested Model</label><div class="font-mono text-sm">' + escH(profile.model || '(none)') + '</div></div>' +
+            '</div>' +
+        '</div></div>';
+}
+
+async function renderModelRoleEditor(role, forceDiscovery = false) {
+    const modalBody = document.getElementById('modal-body');
+    const state = window.modelRoleEditorState || {};
+    if (!modalBody || state.role !== role) return;
+    const profiles = state.profiles || [];
+    const currentRole = state.currentRole || {};
+    const profileName = (document.getElementById('role-profile')?.value || '').trim();
+    const profile = profiles.find(item => item.name === profileName) || null;
+    const summary = document.getElementById('role-profile-summary');
+    const modelField = document.getElementById('role-model-fields');
+    const routingField = document.getElementById('role-routing-fields');
+    if (summary) summary.innerHTML = modelRoleSummaryH(profile);
+    if (!modelField || !routingField) return;
+
+    const currentModel = (document.getElementById('role-model')?.value || currentRole.model || profile?.model || '').trim();
+    let modelHtml = '<div class="form-group"><label class="form-label">Model ID</label>' + inputH('role-model', currentModel, 'text', role === 'vision' ? 'Enter a vision-capable model ID' : 'Enter model ID') + '</div>';
+    let modelSelectMarkup = '';
+
+    if (profile && String(profile.provider || '').toLowerCase() === 'openrouter') {
+        modelHtml += '<div class="text-sm text-secondary mb-12">OpenRouter live model discovery is available for this profile.</div>';
+        modelField.innerHTML = modelHtml + '<div class="text-sm text-secondary">Loading OpenRouter models…</div>';
+        try {
+            const discovery = await loadProviderDiscoveryModels(profile.name, role === 'vision', forceDiscovery);
+            const options = [{ value: '', label: 'Choose from OpenRouter' }];
+            const models = discovery.models || [];
+            models.forEach(item => {
+                const badge = item.supports_image ? ' [image]' : '';
+                options.push({ value: item.id, label: item.id + badge });
+            });
+            if (currentModel && !models.find(item => item.id === currentModel)) {
+                options.push({ value: currentModel, label: currentModel + ' (current)' });
+            }
+            modelSelectMarkup = '' +
+                '<div class="form-group">' +
+                    '<label class="form-label">OpenRouter Model List</label>' +
+                    selectH('role-model-select', options, currentModel) +
+                    '<div class="text-xs text-secondary mt-8">' + escH(role === 'vision' ? 'Showing only models that advertise image input support.' : 'Choose from OpenRouter’s live model catalog, or type a custom model ID below.') + '</div>' +
+                '</div>' +
+                '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:-4px;margin-bottom:12px">' +
+                    '<button class="btn btn-sm" onclick="renderModelRoleEditor(\'' + escA(role) + '\', true)">Refresh Model List</button>' +
+                '</div>';
+        } catch (e) {
+            modelSelectMarkup = '<div class="text-sm text-danger mb-12">Could not load OpenRouter models: ' + escH(e.message) + '</div>';
+        }
+    }
+    modelField.innerHTML = modelSelectMarkup + modelHtml;
+
+    const modelInput = document.getElementById('role-model');
+    const modelSelect = document.getElementById('role-model-select');
+    if (modelSelect && modelInput) {
+        modelSelect.addEventListener('change', function () {
+            if (this.value) modelInput.value = this.value;
+            renderModelRoleRouting(role);
+        });
+    }
+    if (modelInput) {
+        modelInput.addEventListener('change', function () { renderModelRoleRouting(role); });
+        modelInput.addEventListener('input', function () { renderModelRoleRouting(role); });
+    }
+
+    await renderModelRoleRouting(role, forceDiscovery);
+}
+
+async function renderModelRoleRouting(role, forceDiscovery = false) {
+    const state = window.modelRoleEditorState || {};
+    const routingField = document.getElementById('role-routing-fields');
+    if (!routingField || state.role !== role) return;
+    const profileName = (document.getElementById('role-profile')?.value || '').trim();
+    const profile = (state.profiles || []).find(item => item.name === profileName) || null;
+    const currentRole = state.currentRole || {};
+    const modelId = (document.getElementById('role-model')?.value || '').trim();
+    if (!profile || String(profile.provider || '').toLowerCase() !== 'openrouter') {
+        routingField.innerHTML = '';
+        return;
+    }
+    if (!modelId) {
+        routingField.innerHTML = '<div class="text-sm text-secondary mb-12">Choose a model first to load the available OpenRouter endpoint providers.</div>';
+        return;
+    }
+    routingField.innerHTML = '<div class="text-sm text-secondary mb-12">Loading OpenRouter endpoint providers…</div>';
+    try {
+        const discovery = await loadProviderDiscoveryEndpoints(profile.name, modelId, forceDiscovery);
+        const endpoints = discovery.endpoints || [];
+        const options = [{ value: '', label: 'Auto route within OpenRouter' }];
+        endpoints.forEach(item => {
+            const uptime = item.uptime_last_30m != null ? ' · ' + Number(item.uptime_last_30m).toFixed(1) + '% uptime' : '';
+            const label = (item.provider_name || item.tag || 'Provider') + (item.tag ? ' (' + item.tag + ')' : '') + uptime;
+            options.push({ value: item.tag || item.provider_name || '', label });
+        });
+        const selected = (document.getElementById('role-routing-provider')?.value || currentRole.routing_provider || '').trim();
+        if (selected && !options.find(option => option.value === selected)) {
+            options.push({ value: selected, label: selected + ' (current)' });
+        }
+        routingField.innerHTML = '' +
+            '<div class="form-group">' +
+                '<label class="form-label">Preferred OpenRouter Endpoint</label>' +
+                selectH('role-routing-provider', options, selected) +
+                '<div class="text-xs text-secondary mt-8">This biases OpenRouter toward one endpoint provider while still allowing OpenRouter routing. Leave it on Auto for normal routing.</div>' +
+            '</div>' +
+            '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:-4px">' +
+                '<button class="btn btn-sm" onclick="renderModelRoleRouting(\'' + escA(role) + '\', true)">Refresh Endpoint List</button>' +
+            '</div>';
+    } catch (e) {
+        routingField.innerHTML = '<div class="text-sm text-danger mb-12">Could not load OpenRouter endpoint providers: ' + escH(e.message) + '</div>';
+    }
+}
+
+window.editModelRole = async function (role) {
+    try {
+        const data = await loadModelRoles(true);
+        const profiles = data.profiles || [];
+        const currentRole = data.roles?.[role];
+        const meta = MODEL_ROLE_META[role];
+        if (!meta) { toast('Unknown model role', 'error'); return; }
+        if (!profiles.length) {
+            showModal(
+                'No Provider Profiles Yet',
+                '<p class="text-sm text-secondary mb-16">Create at least one provider profile in Providers before assigning it to ' + escH(meta.title) + '.</p>',
+                '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="closeModal(); navigate(\'providers\'); setTimeout(function(){ addProvider(); }, 50)">Add Provider Profile</button>'
+            );
+            return;
+        }
+        window.modelRoleEditorState = { role, profiles, currentRole };
+        showModal(
+            meta.title,
+            '<p class="text-sm text-secondary mb-16">' + escH(meta.description) + '</p>' +
+            '<div class="form-group"><label class="form-label">Provider Profile</label>' + selectH('role-profile', modelRoleProfileOptions(profiles), currentRole?.profile || '') + '</div>' +
+            '<div id="role-profile-summary"></div>' +
+            '<div id="role-model-fields"></div>' +
+            '<div id="role-routing-fields"></div>',
+            '<button class="btn" onclick="closeModal()">Cancel</button>' +
+            (meta.disableAllowed ? '<button class="btn" onclick="disableModelRole(\'' + escA(role) + '\')">Disable</button>' : '') +
+            '<button class="btn btn-primary" onclick="saveModelRole(\'' + escA(role) + '\')">Save</button>'
+        );
+        const profileSelect = document.getElementById('role-profile');
+        if (profileSelect) {
+            profileSelect.addEventListener('change', function () {
+                renderModelRoleEditor(role);
+            });
+        }
+        await renderModelRoleEditor(role);
+    } catch (e) { toast('Error: ' + e.message, 'error'); }
+};
+
+window.saveModelRole = async function (role) {
+    const profile = (document.getElementById('role-profile')?.value || '').trim();
+    const model = (document.getElementById('role-model')?.value || '').trim();
+    const routing_provider = (document.getElementById('role-routing-provider')?.value || '').trim();
+    if (role === 'primary' && (!profile || !model)) {
+        toast('Primary Chat requires both a provider profile and a model', 'error');
+        return;
+    }
+    try {
+        await api('PUT', '/api/model-roles/' + role, { profile, model, routing_provider });
+        window.modelRolesCache = null;
+        toast(MODEL_ROLE_META[role].title + ' updated', 'success');
+        closeModal();
+        if (role === 'vision') await chatRefreshCapabilities();
+        Screens.models();
+    } catch (e) { toast('Error: ' + e.message, 'error'); }
+};
+
+window.disableModelRole = async function (role) {
+    if (role === 'primary') return;
+    try {
+        await api('PUT', '/api/model-roles/' + role, { profile: '', model: '', routing_provider: '' });
+        window.modelRolesCache = null;
+        toast(MODEL_ROLE_META[role].title + ' disabled', 'success');
+        closeModal();
+        if (role === 'vision') await chatRefreshCapabilities();
+        Screens.models();
+    } catch (e) { toast('Error: ' + e.message, 'error'); }
+};
+
 Screens.models = async function () {
     const content = document.getElementById('content');
     try {
-        const data = await api('GET', '/api/models');
-        let html = '<div class="stats-grid"><div class="stat-card blue"><div class="stat-value font-mono" style="font-size:16px">' + escH(data.default_model || '?') + '</div><div class="stat-label">Default Model</div></div>';
-        html += '<div class="stat-card blue"><div class="stat-value font-mono" style="font-size:16px">' + escH(data.default_provider || '?') + '</div><div class="stat-label">Default Provider</div></div>';
-        html += '<div class="stat-card green"><div class="stat-value font-mono" style="font-size:16px">' + escH(data.fallback_model || 'None') + '</div><div class="stat-label">Fallback Model</div></div></div>';
+        const data = await loadModelRoles(true);
+        const roles = data.roles || {};
+        const profiles = data.profiles || [];
+        let html = '<div class="card mb-16"><div class="card-body">';
+        html += '<p class="text-sm text-secondary">Model Roles decide which saved provider profile and model Hermes uses for primary chat, fallback chat, and vision. Provider Profiles live in the Providers screen; this screen is where you assign them.</p>';
+        html += '</div></div>';
+        html += '<div class="model-role-grid">';
+        ['primary', 'fallback', 'vision'].forEach(role => { html += modelRoleCardH(role, roles[role] || {}); });
+        html += '</div>';
 
-        html += '<div class="card"><div class="card-header"><span>All Models</span><button class="btn btn-primary" onclick="addModel()">+ Add Model</button></div><div class="table-container"><table class="table"><thead><tr><th>Model ID</th></tr></thead><tbody>';
-        (data.all_models || []).forEach(m => { html += '<tr><td class="font-mono text-sm">' + escH(m.provider + ' / ' + m.model) + '</td></tr>'; });
-        if (!data.all_models || data.all_models.length === 0) html += '<tr><td class="text-muted">No models listed</td></tr>';
-        html += '</tbody></table></div></div>';
+        html += '<div class="card mt-16"><div class="card-header"><span>Saved Provider Profiles</span><button class="btn btn-primary" onclick="navigate(\'providers\')">Open Providers</button></div>';
+        if (!profiles.length) {
+            html += '<div class="card-body"><p class="text-sm text-secondary">No provider profiles are saved yet.</p></div></div>';
+        } else {
+            html += '<div class="table-container"><table class="table"><thead><tr><th>Name</th><th>Type</th><th>Suggested Model</th><th>Used By</th></tr></thead><tbody>';
+            profiles.forEach(profile => {
+                html += '<tr><td class="font-mono text-sm">' + escH(profile.name) + '</td><td class="text-sm">' + escH(profile.provider_label || profile.provider || '') + '</td><td class="font-mono text-sm">' + escH(profile.model || '') + '</td><td>' + providerUsageBadgesH(profile.used_by) + '</td></tr>';
+            });
+            html += '</tbody></table></div></div>';
+        }
         content.innerHTML = html;
     } catch (e) {
         content.innerHTML = '<div class="empty-state"><div class="empty-icon">\u26a0\ufe0f</div><h3>Error</h3><p>' + escH(e.message) + '</p></div>';
     }
-};
-window.addModel = function () {
-    showModal('Set Default Model',
-        '<div class="form-group"><label class="form-label">Provider</label>' + inputH('model-provider', '', 'text', 'e.g. OpenRouter') + '</div>' +
-        '<div class="form-group"><label class="form-label">Model ID</label>' + inputH('model-name', '', 'text', 'e.g. openai/gpt-4o') + '</div>',
-        '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="saveModel()">Save</button>'
-    );
-};
-window.saveModel = async function () {
-    const provider = document.getElementById('model-provider').value.trim();
-    const model = document.getElementById('model-name').value.trim();
-    if (!provider || !model) { toast('Provider and Model ID are required', 'error'); return; }
-    try {
-        await api('PUT', '/api/config/model', { default_provider: provider, default_model: model });
-        toast('Default model updated', 'success');
-        closeModal();
-        Screens.models();
-    } catch (e) { toast('Error: ' + e.message, 'error'); }
 };
 
 // ── AGENTS ─────────────────────────────────────────────────
@@ -964,12 +1419,201 @@ window.doDeleteAgent = async function (name) {
 };
 
 // ── SKILLS ─────────────────────────────────────────────────
+function starterPackBadgeClass(status) {
+    if (status === 'ready') return 'badge-success';
+    if (status === 'attention') return 'badge-warning';
+    return 'badge-secondary';
+}
+
+function starterPackBadgeLabel(status) {
+    if (status === 'ready') return 'Ready';
+    if (status === 'attention') return 'Needs Setup';
+    return 'Missing';
+}
+
+const starterPackState = {
+    items: {},
+};
+
+function renderStarterPackGrid(items) {
+    const list = Array.isArray(items) ? items : [];
+    starterPackState.items = {};
+    list.forEach(item => {
+        if (item && item.id) starterPackState.items[item.id] = item;
+    });
+    if (!list.length) {
+        return '<div class="empty-state"><p>No starter-pack recommendations available right now.</p></div>';
+    }
+    return '<div class="starter-pack-grid">' + list.map(item =>
+        '<div class="starter-pack-item">' +
+            '<div class="starter-pack-item-top">' +
+                '<div class="starter-pack-item-title">' + escH(item.label || item.id || 'Item') + '</div>' +
+                '<span class="badge ' + starterPackBadgeClass(item.status) + '">' + escH(starterPackBadgeLabel(item.status)) + '</span>' +
+            '</div>' +
+            '<div class="starter-pack-item-kind">' + escH((item.kind || 'runtime').replace(/_/g, ' ')) + '</div>' +
+            '<div class="starter-pack-item-detail">' + escH(item.detail || '') + '</div>' +
+            '<div class="starter-pack-item-actions">' +
+                ((item.supports_install && item.status === 'missing')
+                    ? '<button class="btn btn-sm btn-primary" onclick="starterPackInstallPrompt(\'' + escA(item.id) + '\')">Install</button>'
+                    : '') +
+                ((Array.isArray(item.setup_notes) && item.setup_notes.length)
+                    ? '<button class="btn btn-sm" onclick="starterPackShowNotes(\'' + escA(item.id) + '\')">' + (item.status === 'missing' ? 'Preview Setup' : 'Setup Notes') + '</button>'
+                    : '') +
+            '</div>' +
+        '</div>'
+    ).join('') + '</div>';
+}
+
+window.starterPackShowNotes = function (itemId) {
+    const item = starterPackState.items[itemId];
+    if (!item) {
+        toast('Starter-pack item not found', 'error');
+        return;
+    }
+    const notes = Array.isArray(item.setup_notes) ? item.setup_notes : [];
+    const issues = Array.isArray(item.issues) ? item.issues : [];
+    let html = '<p class="text-sm text-secondary mb-16">' + escH(item.label || itemId) + '</p>';
+    if (issues.length) {
+        html += '<div class="card mb-16"><div class="card-header"><span>Still Needed</span></div><div class="card-body"><ul class="plain-list">' +
+            issues.map(issue => '<li>' + escH(issue) + '</li>').join('') +
+            '</ul></div></div>';
+    }
+    if (notes.length) {
+        html += '<div class="card"><div class="card-header"><span>Setup Notes</span></div><div class="card-body"><ul class="plain-list">' +
+            notes.map(note => '<li>' + escH(note) + '</li>').join('') +
+            '</ul></div></div>';
+    } else {
+        html += '<div class="empty-state"><p>No extra setup notes for this item.</p></div>';
+    }
+    showModal(
+        item.label || 'Starter Pack Item',
+        html,
+        '<button class="btn" onclick="closeModal()">Close</button>' +
+        ((item.supports_install && item.status === 'missing')
+            ? '<button class="btn btn-primary" onclick="starterPackInstallPrompt(\'' + escA(item.id) + '\')">Install</button>'
+            : '')
+    );
+};
+
+window.starterPackInstallPrompt = function (itemId) {
+    const item = starterPackState.items[itemId];
+    if (!item) {
+        toast('Starter-pack item not found', 'error');
+        return;
+    }
+    const candidates = Array.isArray(item.install_candidates) ? item.install_candidates : [];
+    if (!candidates.length) {
+        toast('No install targets available for this item', 'warning');
+        return;
+    }
+    let html = '<p class="text-sm text-secondary mb-16">Choose the install target for ' + escH(item.label || itemId) + '.</p>';
+    html += '<div class="starter-pack-candidate-list">' + candidates.map(candidate =>
+        '<div class="starter-pack-candidate">' +
+            '<div class="starter-pack-candidate-top">' +
+                '<div>' +
+                    '<div class="starter-pack-candidate-title">' + escH(candidate.label || candidate.identifier) + '</div>' +
+                    '<div class="starter-pack-candidate-meta">' + escH(candidate.source || 'registry') + ' · <span class="font-mono">' + escH(candidate.identifier) + '</span></div>' +
+                '</div>' +
+                (candidate.recommended ? '<span class="badge badge-info">Recommended</span>' : '') +
+            '</div>' +
+            '<div class="starter-pack-candidate-detail">' + escH(candidate.description || '') + '</div>' +
+            '<div class="starter-pack-candidate-actions"><button class="btn btn-sm btn-primary" onclick="starterPackInstall(\'' + escA(item.id) + '\', \'' + escA(candidate.identifier) + '\')">Install This</button></div>' +
+        '</div>'
+    ).join('') + '</div>';
+    if (Array.isArray(item.setup_notes) && item.setup_notes.length) {
+        html += '<div class="card mt-16"><div class="card-header"><span>After Install</span></div><div class="card-body"><ul class="plain-list">' +
+            item.setup_notes.map(note => '<li>' + escH(note) + '</li>').join('') +
+            '</ul></div></div>';
+    }
+    showModal(
+        'Install ' + (item.label || itemId),
+        html,
+        '<button class="btn" onclick="closeModal()">Cancel</button>'
+    );
+};
+
+window.starterPackInstall = async function (itemId, identifier) {
+    const item = starterPackState.items[itemId];
+    const label = item && item.label ? item.label : itemId;
+    toast('Installing ' + label + '...', 'info', 2500);
+    try {
+        const resp = await api('POST', '/api/starter-pack/' + encodeURIComponent(itemId) + '/install', {
+            identifier: identifier || '',
+        });
+        closeModal();
+        let html = '<p class="text-sm text-secondary mb-16">' + escH((resp.candidate || {}).label || label) + ' installed.</p>';
+        const setupNotes = Array.isArray(resp.setup_notes) ? resp.setup_notes : [];
+        if (setupNotes.length) {
+            html += '<div class="card mb-16"><div class="card-header"><span>Next Steps</span></div><div class="card-body"><ul class="plain-list">' +
+                setupNotes.map(note => '<li>' + escH(note) + '</li>').join('') +
+                '</ul></div></div>';
+        }
+        if (resp.output) {
+            html += '<div class="card"><div class="card-header"><span>Hermes Output</span></div><div class="card-body"><pre class="font-mono text-xs" style="max-height:260px;overflow:auto">' + escH(resp.output) + '</pre></div></div>';
+        }
+        showModal(
+            'Installed ' + label,
+            html,
+            '<button class="btn btn-primary" onclick="closeModal()">Close</button>'
+        );
+        toast(label + ' installed', 'success');
+        Screens.skills();
+    } catch (e) {
+        toast('Install failed: ' + e.message, 'error');
+    }
+};
+
+function renderRuntimeReadinessCard(runtime, policy) {
+    const memory = (runtime && runtime.memory) || {};
+    const integrations = (runtime && runtime.integrations) || {};
+    const skills = (runtime && runtime.skills) || {};
+    const hooks = (runtime && runtime.hooks) || {};
+    const reasons = Array.isArray(policy?.reasons) ? policy.reasons : [];
+    let html = '<div class="card mb-16"><div class="card-header"><span>Runtime Readiness</span></div><div class="card-body">';
+    html += '<div class="runtime-readiness-grid">';
+    html += '<div class="runtime-readiness-item"><div class="runtime-readiness-label">Transport</div><div class="runtime-readiness-value">' + escH(policy?.requires_cli ? 'CLI Required' : 'API Allowed') + '</div><div class="runtime-readiness-detail">' + escH(policy?.reason || 'Hermes API replay is available when you want it.') + '</div></div>';
+    html += '<div class="runtime-readiness-item"><div class="runtime-readiness-label">Memory</div><div class="runtime-readiness-value">' + escH(memory.enabled ? (memory.semantic_search_ready ? 'OpenAI Ready' : 'Enabled') : 'Off') + '</div><div class="runtime-readiness-detail">' + escH(memory.detail || 'Memory status unavailable.') + '</div></div>';
+    html += '<div class="runtime-readiness-item"><div class="runtime-readiness-label">Skills</div><div class="runtime-readiness-value">' + escH(String(skills.enabled_count || 0)) + ' enabled</div><div class="runtime-readiness-detail">' + escH(
+        skills.tool_enabled === false
+            ? 'The CLI skills tool is not enabled for chat sessions.'
+            : 'Enabled skills are only available through Hermes CLI turns.'
+    ) + '</div></div>';
+    html += '<div class="runtime-readiness-item"><div class="runtime-readiness-label">Integrations</div><div class="runtime-readiness-value">' + escH(String(integrations.configured_count || 0)) + ' configured</div><div class="runtime-readiness-detail">' + escH(
+        integrations.configured_count
+            ? 'Configured integrations should run through Hermes CLI.'
+            : 'No Discord, WhatsApp, Slack, Telegram, Matrix, or webhook integrations are configured yet.'
+    ) + '</div></div>';
+    html += '</div>';
+    if (reasons.length) {
+        html += '<div class="runtime-reason-list">' + reasons.map(reason =>
+            '<span class="runtime-reason-pill">' + escH(reason) + '</span>'
+        ).join('') + '</div>';
+    }
+    if (hooks.configured) {
+        html += '<p class="text-sm text-secondary mt-16">Hooks configured: ' + escH((hooks.keys || []).join(', ')) + '</p>';
+    }
+    html += '</div></div>';
+    return html;
+}
+
 Screens.skills = async function () {
     const content = document.getElementById('content');
     try {
-        const data = await api('GET', '/api/skills');
+        const [data, status] = await Promise.all([
+            api('GET', '/api/skills'),
+            api('GET', '/api/chat/status').catch(() => ({})),
+        ]);
         const skills = data.skills || [];
+        const runtime = status.runtime || {};
+        const policy = status.transport_policy || {};
         let html = '<div class="section-header"><span>' + skills.length + ' Skills</span><div class="search-box"><span class="search-icon">' + UI_ICONS.search + '</span><input type="text" class="form-input" id="skill-search" placeholder="Search skills..." oninput="filterSkills()"></div></div>';
+        html += '<div class="card mb-16"><div class="card-header"><span>Starter Pack</span><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-sm" onclick="navigate(\'integrations\')">Open Integrations</button><button class="btn btn-sm" onclick="navigate(\'env-vars\')">Open Env Vars</button></div></div><div class="card-body">';
+        html += '<p class="text-sm text-secondary mb-16">Safe-route defaults for everyday use. Missing items are shown here so you can decide what to add next without auto-installing anything behind your back.</p>';
+        if (policy.reason) {
+            html += '<p class="text-sm text-secondary mb-16">' + escH(policy.reason) + '</p>';
+        }
+        html += renderStarterPackGrid((runtime.starter_pack || {}).items || []);
+        html += '</div></div>';
 
         const categories = {};
         skills.forEach(s => { const cat = s.category || 'general'; if (!categories[cat]) categories[cat] = []; categories[cat].push(s); });
@@ -1015,24 +1659,38 @@ window.toggleSkill = async function (name) {
 Screens.channels = async function () {
     const content = document.getElementById('content');
     try {
-        const data = await api('GET', '/api/channels');
-        const channels = data.channels || [];
+        const [data, status] = await Promise.all([
+            api('GET', '/api/channels'),
+            api('GET', '/api/chat/status').catch(() => ({})),
+        ]);
+        const channels = data.integrations || data.channels || [];
+        const runtime = status.runtime || {};
+        const policy = status.transport_policy || {};
+        let html = renderRuntimeReadinessCard(runtime, policy);
+        html += '<div class="card mb-16"><div class="card-body">';
+        html += '<p class="text-sm text-secondary mb-16">This screen edits Hermes integration config directly. Top-level sections like <span class="font-mono">discord</span> and <span class="font-mono">whatsapp</span> appear here, while Hooks remains a separate editor for the raw <span class="font-mono">hooks</span> block.</p>';
+        html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+        html += '<button class="btn" onclick="navigate(\'hooks\')">Open Hooks</button>';
+        html += '<button class="btn" onclick="navigate(\'skills\')">Open Skills</button>';
+        html += '<button class="btn" onclick="navigate(\'env-vars\')">Open Env Vars</button>';
+        html += '</div></div></div>';
         if (channels.length === 0) {
-            content.innerHTML = '<div class="empty-state"><div class="empty-icon">' + UI_ICONS.speechBubble + '</div><h3>No Channels</h3><p>No messaging channels configured.</p></div>';
+            html += '<div class="empty-state"><div class="empty-icon">' + UI_ICONS.speechBubble + '</div><h3>No Integrations</h3><p>No Discord, WhatsApp, Slack, Telegram, Matrix, or webhook integrations were found in your Hermes config.</p></div>';
+            content.innerHTML = html;
             return;
         }
-        let html = '';
         channels.forEach(ch => {
-            html += '<div class="card mb-16"><div class="card-header"><span>' + escH(ch.name) + '</span><span class="badge ' + (ch.enabled ? 'badge-success' : 'badge-danger') + '">' + (ch.enabled ? 'Enabled' : 'Disabled') + '</span></div>';
+            const configured = !!ch.configured;
+            const kindLabel = ch.kind === 'legacy_channel' ? 'Legacy Channel' : 'Integration';
+            html += '<div class="card mb-16"><div class="card-header"><span>' + escH(ch.label || ch.name) + '</span><div style="display:flex;gap:8px;flex-wrap:wrap"><span class="badge ' + (configured ? 'badge-success' : 'badge-secondary') + '">' + (configured ? 'Configured' : 'Empty') + '</span><span class="badge badge-info">' + escH(kindLabel) + '</span></div></div>';
             html += '<div class="card-body">';
-            if (ch.config && typeof ch.config === 'object') {
-                html += '<div class="form-section">';
-                for (const [key, val] of Object.entries(ch.config)) {
-                    html += '<div class="form-row"><div class="form-group"><label class="form-label">' + escH(key) + '</label><div>' + fmtVal(val) + '</div></div></div>';
-                }
-                html += '</div>';
-            }
-            html += '<button class="btn btn-sm" onclick="editChannel(\'' + escA(ch.name) + '\')">Edit Configuration</button>';
+            html += '<p class="text-sm text-secondary mb-12">' + escH(
+                ch.kind === 'legacy_channel'
+                    ? 'This entry comes from the legacy channels map in Hermes config.'
+                    : 'This entry comes from a top-level Hermes integration section.'
+            ) + '</p>';
+            html += '<div class="form-group"><label class="form-label">Config</label><div>' + fmtVal(ch.config || {}) + '</div></div>';
+            html += '<button class="btn btn-sm" onclick="editChannel(\'' + escA(ch.name) + '\')">Edit JSON</button>';
             html += '</div></div>';
         });
         content.innerHTML = html;
@@ -1044,34 +1702,29 @@ Screens.channels = async function () {
 window.editChannel = async function (name) {
     try {
         const data = await api('GET', '/api/channels');
-        const ch = (data.channels || []).find(c => c.name === name);
-        if (!ch) { toast('Channel not found', 'error'); return; }
-        let fields = '';
-        if (ch.config && typeof ch.config === 'object') {
-            for (const [key, val] of Object.entries(ch.config)) {
-                if (typeof val === 'boolean') fields += '<div class="form-group"><label class="form-label">' + escH(key) + '</label>' + toggleH('ch-' + key, val) + '</div>';
-                else if (typeof val === 'number') fields += '<div class="form-group"><label class="form-label">' + escH(key) + '</label>' + inputH('ch-' + key, val, 'number') + '</div>';
-                else fields += '<div class="form-group"><label class="form-label">' + escH(key) + '</label>' + inputH('ch-' + key, val) + '</div>';
-            }
-        }
-        showModal('Edit Channel: ' + name, fields || '<p>No configurable fields.</p>',
+        const ch = (data.integrations || data.channels || []).find(c => c.name === name);
+        if (!ch) { toast('Integration not found', 'error'); return; }
+        showModal('Edit Integration: ' + (ch.label || name),
+            '<p class="text-sm text-secondary mb-16">Edit the raw JSON for this Hermes integration block. Saving replaces the current block with the JSON below.</p>' +
+            '<div class="form-group"><label class="form-label">Config JSON</label>' + textareaH('channel-config-json', JSON.stringify(ch.config || {}, null, 2), 12, true) + '</div>',
             '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="saveChannel(\'' + escA(name) + '\')">Save</button>'
         );
     } catch (e) { toast('Error: ' + e.message, 'error'); }
 };
 
 window.saveChannel = async function (name) {
-    const updates = {};
-    document.querySelectorAll('#modal-body .form-group').forEach(g => {
-        const label = g.querySelector('.form-label');
-        const input = g.querySelector('input, select');
-        if (!label || !input) return;
-        const key = input.id.replace('ch-', '');
-        if (input.type === 'checkbox') updates[key] = input.checked;
-        else if (input.type === 'number') updates[key] = parseFloat(input.value);
-        else updates[key] = input.value;
-    });
-    try { await api('PUT', '/api/channels/' + name, updates); toast('Channel updated', 'success'); closeModal(); Screens.channels(); }
+    let updates;
+    try {
+        updates = JSON.parse(document.getElementById('channel-config-json').value || '{}');
+    } catch (e) {
+        toast('Config JSON is invalid', 'error');
+        return;
+    }
+    if (!updates || typeof updates !== 'object' || Array.isArray(updates)) {
+        toast('Integration config must be a JSON object', 'error');
+        return;
+    }
+    try { await api('PUT', '/api/channels/' + name, updates); toast('Integration updated', 'success'); closeModal(); Screens.channels(); }
     catch (e) { toast('Error: ' + e.message, 'error'); }
 };
 
@@ -1079,9 +1732,19 @@ window.saveChannel = async function (name) {
 Screens.hooks = async function () {
     const content = document.getElementById('content');
     try {
-        const data = await api('GET', '/api/hooks');
+        const [data, status] = await Promise.all([
+            api('GET', '/api/hooks'),
+            api('GET', '/api/chat/status').catch(() => ({})),
+        ]);
         const cfg = data.config || data;
+        const runtime = status.runtime || {};
         let fields = '';
+        let intro = '<p class="text-sm text-secondary mb-16">This screen edits the raw <span class="font-mono">hooks</span> block in Hermes config. The web UI does not execute hooks by itself; whether they run depends on your Hermes runtime.</p>';
+        let recommended = '<div class="card mb-16"><div class="card-header"><span>Recommended Default</span></div><div class="card-body"><p class="text-sm text-secondary mb-12">Safe route: leave hooks empty unless you want a very specific approval, retry, or logging workflow. Memory, skills, and integrations do not need extra hooks to work.</p>';
+        if (runtime.hooks && runtime.hooks.configured) {
+            recommended += '<p class="text-sm text-secondary">Currently configured hooks: ' + escH((runtime.hooks.keys || []).join(', ')) + '</p>';
+        }
+        recommended += '</div></div>';
         for (const [key, val] of Object.entries(cfg)) {
             if (typeof val === 'boolean') fields += '<div class="form-group"><label class="form-label">' + escH(key) + '</label>' + toggleH('hook-' + key, val) + '</div>';
             else if (typeof val === 'number') fields += '<div class="form-group"><label class="form-label">' + escH(key) + '</label>' + inputH('hook-' + key, val, 'number') + '</div>';
@@ -1089,7 +1752,7 @@ Screens.hooks = async function () {
             else fields += '<div class="form-group"><label class="form-label">' + escH(key) + '</label>' + inputH('hook-' + key, val) + '</div>';
         }
         if (!fields) fields = '<div class="empty-state"><p>No hooks configured yet.</p></div>';
-        content.innerHTML = '<div class="card"><div class="card-header"><span>Webhooks / Hooks</span></div><div class="card-body">' + fields + '<button class="btn btn-primary mt-16" onclick="saveHooks()">Save Hooks</button></div></div>';
+        content.innerHTML = recommended + '<div class="card"><div class="card-header"><span>Webhooks / Hooks</span></div><div class="card-body">' + intro + fields + '<button class="btn btn-primary mt-16" onclick="saveHooks()">Save Hooks</button></div></div>';
     } catch (e) {
         content.innerHTML = '<div class="empty-state"><div class="empty-icon">\u26a0\ufe0f</div><h3>Error</h3><p>' + escH(e.message) + '</p></div>';
     }
@@ -1204,6 +1867,15 @@ const chatState = {
         audioAttachments: '',
     },
     apiServerEnabled: false,
+    apiTransportSelectable: false,
+    transportPolicy: {
+        requiresCli: false,
+        apiSelectable: false,
+        reason: '',
+        reasons: [],
+    },
+    runtimeStatus: null,
+    transportPreference: 'auto',
     currentTransport: null,
     currentContinuity: null,
     currentTransportNotice: '',
@@ -1342,6 +2014,7 @@ function chatResetComposerAfterRequest() {
 
 function chatApplySessionMetadata(meta = null) {
     const session = meta || {};
+    chatState.transportPreference = session.transport_preference || chatState.transportPreference || 'auto';
     chatState.currentTransport = session.transport_mode || null;
     chatState.currentContinuity = session.continuity_mode || null;
     chatState.currentTransportNotice = session.transport_notice || '';
@@ -1363,6 +2036,7 @@ function chatApplySessionMetadata(meta = null) {
     }
     chatRenderSessionBanner();
     chatRenderContextPanel();
+    chatRenderTransportControls();
 }
 
 function chatGoHome() {
@@ -1372,7 +2046,7 @@ function chatGoHome() {
     chatState.selectedFolderId = '';
     chatState.draftFolderId = '';
     chatReplacePendingFiles([]);
-    chatApplySessionMetadata(null);
+    chatApplySessionMetadata({ transport_preference: chatState.transportPreference || 'auto' });
     const input = document.getElementById('chat-input');
     if (input) {
         input.value = '';
@@ -1483,14 +2157,75 @@ function chatRenderContextPanel() {
 }
 
 function chatExpectedTransport() {
-    if (chatState.currentTransport === 'api') return 'api';
-    if (chatState.currentTransport === 'cli') return 'cli';
+    if (chatState.transportPolicy && chatState.transportPolicy.requiresCli) return 'cli';
+    if (chatState.transportPreference === 'api') return 'api';
+    if (chatState.transportPreference === 'cli') return 'cli';
     if (chatState.apiServerEnabled) return 'api';
     return 'cli';
 }
 
 function chatExpectedCancelSupport() {
     return chatExpectedTransport() === 'cli';
+}
+
+function chatTransportPreferenceLabel(value) {
+    if (value === 'cli') return 'Hermes CLI';
+    if (value === 'api') return 'API Replay';
+    return 'Auto';
+}
+
+function chatTransportDescription(value) {
+    if (chatState.transportPolicy && chatState.transportPolicy.requiresCli) {
+        return chatState.transportPolicy.reason || 'Hermes CLI is required for the active runtime features in this chat.';
+    }
+    if (value === 'cli') return 'Hermes CLI keeps Hermes-side continuity and is where Hermes skills run.';
+    if (value === 'api') {
+        return chatState.apiServerEnabled
+            ? 'API replay uses the configured API path and bypasses Hermes CLI skills.'
+            : 'API replay is unavailable right now because the Hermes API server is not reachable.';
+    }
+    return chatState.apiServerEnabled
+        ? 'Auto uses API when available and falls back to Hermes CLI when it is not.'
+        : 'Auto will use Hermes CLI right now because the API server is unavailable.';
+}
+
+function chatRenderTransportControls() {
+    const mount = document.getElementById('chat-transport-controls');
+    if (!mount) return;
+    let current = chatState.transportPreference || 'auto';
+    if (current === 'api' && !chatState.apiTransportSelectable) {
+        current = chatState.transportPolicy && chatState.transportPolicy.requiresCli ? 'cli' : 'auto';
+        chatState.transportPreference = current;
+    }
+    const apiDisabled = !chatState.apiTransportSelectable;
+    const options = [
+        { value: 'auto', label: 'Auto', disabled: false },
+        { value: 'cli', label: 'CLI', disabled: false },
+        { value: 'api', label: 'API', disabled: apiDisabled },
+    ];
+    const buttons = options.map(option =>
+        '<button class="chat-transport-btn' +
+        (current === option.value ? ' active' : '') +
+        (option.disabled ? ' disabled' : '') +
+        '" type="button" ' +
+        (option.disabled ? 'disabled ' : '') +
+        'onclick="chatSetTransportPreference(\'' + escA(option.value) + '\')">' +
+        escH(option.label) +
+        '</button>'
+    ).join('');
+    let note = chatTransportDescription(current);
+    if (!chatState.transportPolicy.requiresCli && current !== 'cli') {
+        note += ' Hermes skills require CLI.';
+    }
+    if (chatState.currentSessionId && chatState.currentTransport && current !== chatState.currentTransport) {
+        note += ' Next turn preference: ' + chatTransportPreferenceLabel(current) + '.';
+    }
+    mount.innerHTML =
+        '<div class="chat-transport-wrap">' +
+            '<div class="chat-transport-label">Transport</div>' +
+            '<div class="chat-transport-buttons">' + buttons + '</div>' +
+        '</div>' +
+        '<div class="chat-transport-note">' + escH(note) + '</div>';
 }
 
 function chatRenderSessionBanner() {
@@ -1567,6 +2302,7 @@ function chatApplyComposerCapabilities() {
             ? 'Voice input (click to start/stop)'
             : 'Voice input is unavailable here because this browser cannot transcribe speech and Hermes does not support audio uploads';
     }
+    chatRenderTransportControls();
     chatRenderSessionBanner();
 }
 
@@ -1575,7 +2311,16 @@ async function chatRefreshCapabilities() {
         const data = await api('GET', '/api/chat/status');
         const caps = data.capabilities || {};
         const reasons = data.capability_reasons || {};
+        const policy = data.transport_policy || {};
         chatState.apiServerEnabled = !!data.api_server;
+        chatState.apiTransportSelectable = !!policy.api_selectable;
+        chatState.transportPolicy = {
+            requiresCli: !!policy.requires_cli,
+            apiSelectable: !!policy.api_selectable,
+            reason: policy.reason || '',
+            reasons: Array.isArray(policy.reasons) ? policy.reasons.slice() : [],
+        };
+        chatState.runtimeStatus = data.runtime || null;
         chatState.capabilities = {
             textAttachments: caps.text_attachments !== false,
             imageAttachments: !!caps.image_attachments,
@@ -1587,6 +2332,14 @@ async function chatRefreshCapabilities() {
         };
     } catch (e) {
         chatState.apiServerEnabled = false;
+        chatState.apiTransportSelectable = false;
+        chatState.transportPolicy = {
+            requiresCli: false,
+            apiSelectable: false,
+            reason: '',
+            reasons: [],
+        };
+        chatState.runtimeStatus = null;
         chatState.capabilities = {
             textAttachments: true,
             imageAttachments: false,
@@ -1681,8 +2434,8 @@ Screens.chat = function () {
                 <button class="clear-files" onclick="chatClearFiles()">Clear</button>
             </div>
 
-            <div class="chat-composer">
-                <div class="chat-composer-row">
+	            <div class="chat-composer">
+	                <div class="chat-composer-row">
                     <button class="chat-btn" id="chat-attach-btn" title="Attach text files" onclick="document.getElementById('chat-file-input').click()">
                         <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
                     </button>
@@ -1693,11 +2446,12 @@ Screens.chat = function () {
                     </button>
                     <button class="chat-send-btn" id="chat-send-btn" onclick="chatSend()" disabled>
                         <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
-                    </button>
-                </div>
-                <div class="chat-composer-footer">
-                    <div class="chat-composer-actions">
-                        <button class="chat-action-btn" title="Export Chat" onclick="chatExport()">
+	                    </button>
+	                </div>
+	                <div class="chat-composer-footer">
+	                    <div id="chat-transport-controls" class="chat-transport-controls"></div>
+	                    <div class="chat-composer-actions">
+	                        <button class="chat-action-btn" title="Export Chat" onclick="chatExport()">
                             <svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                         </button>
                         <button class="chat-action-btn" title="New Chat" onclick="chatNewSession()">
@@ -1708,11 +2462,11 @@ Screens.chat = function () {
                         </button>
                         <button class="chat-action-btn" title="Clear chat" onclick="chatClearCurrent()">
                             <svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-                        </button>
-                    </div>
-                    <span class="chat-composer-hint">Enter to send, Shift+Enter for new line, text files only in this mode</span>
-                    <span id="chat-voice-status" class="chat-voice-status"></span>
-                </div>
+	                        </button>
+	                    </div>
+	                    <span class="chat-composer-hint">Enter to send, Shift+Enter for new line, text files only in this mode</span>
+	                    <span id="chat-voice-status" class="chat-voice-status"></span>
+	                </div>
             </div>
         </div>
     </div>`;
@@ -1772,6 +2526,7 @@ Screens.chat = function () {
     }
 
     chatRenderFileBar();
+    chatRenderTransportControls();
     chatApplyComposerCapabilities();
     chatRefreshCapabilities();
 
@@ -2189,7 +2944,7 @@ window.chatDeleteSession = async function (sid) {
                 if (folder) chatRenderFolderOverview(folder);
                 else chatShowWelcome();
             } else {
-                chatApplySessionMetadata(null);
+                chatApplySessionMetadata({ transport_preference: chatState.transportPreference || 'auto' });
                 chatShowWelcome();
             }
         }
@@ -2575,6 +3330,7 @@ window.chatNewSession = function (folderId = '') {
     if (chatState.selectedFolderId) {
         const folder = chatFindFolder(chatState.selectedFolderId);
         chatApplySessionMetadata({
+            transport_preference: chatState.transportPreference || 'auto',
             folder_id: folder ? folder.id : chatState.selectedFolderId,
             folder_title: folder ? folder.title : chatState.currentFolderTitle,
             folder_workspace_roots: folder ? (folder.workspace_roots || []) : [],
@@ -2585,7 +3341,7 @@ window.chatNewSession = function (folderId = '') {
         if (folder) chatRenderFolderOverview(folder);
         else chatShowWelcome();
     } else {
-        chatApplySessionMetadata(null);
+        chatApplySessionMetadata({ transport_preference: chatState.transportPreference || 'auto' });
         chatShowWelcome();
     }
     chatLoadHistory();
@@ -2598,6 +3354,7 @@ async function chatEnsureSessionRecord() {
     if (chatState.currentSessionId) return chatState.currentSessionId;
     const resp = await api('POST', '/api/chat/sessions', {
         folder_id: chatState.draftFolderId || chatState.selectedFolderId || '',
+        transport_preference: chatState.transportPreference || 'auto',
     });
     chatState.currentSessionId = resp.session_id;
     chatState.localMessages = [];
@@ -2605,6 +3362,30 @@ async function chatEnsureSessionRecord() {
     chatLoadHistory();
     return chatState.currentSessionId;
 }
+
+window.chatSetTransportPreference = async function (value) {
+    const next = ['cli', 'api'].includes(value) ? value : 'auto';
+    if (next === 'api' && !chatState.apiTransportSelectable) {
+        toast(chatState.transportPolicy.reason || 'API transport is unavailable right now', 'warning');
+        return;
+    }
+    try {
+        if (chatState.currentSessionId) {
+            const resp = await api('PUT', '/api/chat/sessions/' + chatState.currentSessionId + '/transport', {
+                transport_preference: next,
+            });
+            chatApplySessionMetadata(resp.session || null);
+        } else {
+            chatState.transportPreference = next;
+            chatRenderTransportControls();
+            chatRenderSessionBanner();
+        }
+        chatApplyComposerCapabilities();
+        toast('Transport preference set to ' + chatTransportPreferenceLabel(next), 'success', 1500);
+    } catch (e) {
+        toast('Failed to update transport: ' + e.message, 'error');
+    }
+};
 
 window.chatCreateFolderPrompt = function () {
     showModal(
@@ -2935,6 +3716,7 @@ window.chatSend = async function () {
         const resp = await api('POST', '/api/chat', {
             message, session_id: chatState.currentSessionId,
             folder_id: chatState.currentSessionId ? '' : (chatState.draftFolderId || chatState.selectedFolderId || ''),
+            transport_preference: chatState.transportPreference || 'auto',
             request_id: chatState.currentRequestId,
             files: pendingUploads.map(f => ({ stored_as: f.stored_as, name: f.name })),
         }, controller.signal);

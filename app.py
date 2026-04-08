@@ -92,6 +92,22 @@ def _runtime_env_value(key: str, default: str = "", allow_repo_env: bool = True)
             return str(hermes_value)
     return default
 
+
+def _runtime_env_source(key: str, allow_repo_env: bool = True) -> str:
+    value = os.environ.get(key)
+    if value not in (None, ""):
+        return "process_env"
+    if allow_repo_env:
+        repo_value = _repo_env_values().get(key)
+        if repo_value not in (None, ""):
+            return "repo_env"
+    hermes_env_path = globals().get("ENV_PATH")
+    if hermes_env_path:
+        hermes_value = _hermes_env_values().get(key)
+        if hermes_value not in (None, ""):
+            return "hermes_env"
+    return ""
+
 HERMES_HOME = Path.home() / ".hermes"
 CONFIG_PATH = HERMES_HOME / "config.yaml"
 ENV_PATH = HERMES_HOME / ".env"
@@ -157,9 +173,161 @@ chat_folders: dict = {}  # runtime cache: folder_id -> folder dict
 
 CHAT_TRANSPORT_CLI = "cli"
 CHAT_TRANSPORT_API = "api"
+CHAT_TRANSPORT_AUTO = "auto"
 CHAT_CONTINUITY_HERMES = "hermes_resume"
 CHAT_CONTINUITY_LOCAL = "local_replay"
 CHAT_CONTINUITY_LIMITED = "cli_without_resume"
+AUXILIARY_MODEL_KEYS = (
+    "vision",
+    "web_extract",
+    "compression",
+    "session_search",
+    "summarization",
+    "embedding",
+    "tts",
+    "stt",
+)
+MODEL_ROLE_LABELS = {
+    "primary": "Primary Chat",
+    "fallback": "Fallback Chat",
+    "vision": "Vision",
+}
+PROVIDER_TYPE_LABELS = {
+    "auto": "Generic OpenAI-Compatible",
+    "openrouter": "OpenRouter",
+    "openai": "OpenAI",
+    "openai-codex": "OpenAI",
+    "azure": "Azure OpenAI",
+    "anthropic": "Anthropic",
+    "groq": "Groq",
+    "google": "Google",
+    "gemini": "Google",
+    "mistral": "Mistral",
+    "together": "Together",
+    "fireworks": "Fireworks",
+    "deepseek": "DeepSeek",
+    "cohere": "Cohere",
+}
+PROVIDER_DEFAULT_BASE_URLS = {
+    "openrouter": "https://openrouter.ai/api/v1",
+    "openai": "https://api.openai.com/v1",
+    "openai-codex": "https://api.openai.com/v1",
+    "groq": "https://api.groq.com/openai/v1",
+    "mistral": "https://api.mistral.ai/v1",
+    "fireworks": "https://api.fireworks.ai/inference/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+}
+PROVIDER_ENV_KEY_MAP = {
+    "openrouter": "OPENROUTER_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "openai-codex": "OPENAI_API_KEY",
+    "azure": "AZURE_OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "gemini": "GOOGLE_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "together": "TOGETHER_API_KEY",
+    "fireworks": "FIREWORKS_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "cohere": "COHERE_API_KEY",
+}
+PROVIDER_PRESETS = [
+    {
+        "id": "openrouter",
+        "label": "OpenRouter",
+        "provider": "openrouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "name": "openrouter",
+        "intro": "Use OpenRouter as an OpenAI-compatible provider profile.",
+    },
+    {
+        "id": "openai",
+        "label": "OpenAI",
+        "provider": "openai",
+        "base_url": "https://api.openai.com/v1",
+        "name": "openai",
+        "intro": "Use OpenAI directly as a provider profile.",
+    },
+    {
+        "id": "local",
+        "label": "Local API",
+        "provider": "auto",
+        "base_url": "http://127.0.0.1:8000/v1",
+        "name": "local-api",
+        "intro": "Use a local OpenAI-compatible server as a provider profile.",
+    },
+]
+INTEGRATION_SECTION_LABELS = {
+    "discord": "Discord",
+    "whatsapp": "WhatsApp",
+    "telegram": "Telegram",
+    "slack": "Slack",
+    "matrix": "Matrix",
+    "webhook": "Webhook",
+}
+INTEGRATION_SECTION_ORDER = tuple(INTEGRATION_SECTION_LABELS.keys())
+STARTER_PACK_SKILL_GROUPS = (
+    {
+        "id": "google_workspace",
+        "label": "Google Workspace",
+        "terms": ("google-workspace", "gog"),
+        "description": "Gmail, Calendar, Drive, Docs, and Sheets helpers.",
+        "query": "gog",
+        "setup_notes": [
+            "Google Workspace usually needs OAuth setup after install.",
+            "Expect to add Google client credentials and authorize the account before Gmail, Calendar, Drive, Sheets, or Docs actions will work.",
+        ],
+        "install_candidates": (
+            {
+                "identifier": "skills-sh/steipete/clawdis/gog",
+                "label": "Gog",
+                "source": "skills.sh",
+                "description": "Google Workspace helpers from the Clawdis skill set.",
+                "recommended": True,
+            },
+        ),
+    },
+    {
+        "id": "summaries",
+        "label": "Docs & Video Summaries",
+        "terms": ("summarize", "youtube-content", "ocr-and-documents"),
+        "description": "Useful summarization helpers for documents, scans, and YouTube.",
+        "query": "summarize",
+        "setup_notes": [
+            "The summarize skill may need the local summarize CLI after the skill files are installed.",
+            "If it still is not ready, install the tool with `brew install steipete/tap/summarize`.",
+        ],
+        "install_candidates": (
+            {
+                "identifier": "skills-sh/steipete/clawdis/summarize",
+                "label": "summarize",
+                "source": "skills.sh",
+                "description": "Summaries and transcripts for URLs, videos, and local files.",
+                "recommended": True,
+            },
+        ),
+    },
+    {
+        "id": "weather",
+        "label": "Weather",
+        "terms": ("weather",),
+        "description": "Quick forecast and current weather lookups.",
+        "query": "weather",
+        "setup_notes": [
+            "The recommended weather skill works without an API key.",
+        ],
+        "install_candidates": (
+            {
+                "identifier": "skills-sh/steipete/clawdis/weather",
+                "label": "weather",
+                "source": "skills.sh",
+                "description": "Weather helpers from the Clawdis skill set.",
+                "recommended": True,
+            },
+        ),
+    },
+)
 VISION_REFERENCE_HINT_RE = re.compile(
     r"\b("
     r"screenshot|screen|image|photo|picture|diagram|ui"
@@ -197,8 +365,32 @@ def _chat_session_path(session_id: str) -> Path:
     return CHAT_DATA_DIR / f"{secure_filename(session_id)}.json"
 
 
+def _normalize_transport_preference(value) -> str | None:
+    normalized = str(value or "").strip().lower()
+    if normalized in ("", CHAT_TRANSPORT_AUTO):
+        return None
+    if normalized in (CHAT_TRANSPORT_CLI, CHAT_TRANSPORT_API):
+        return normalized
+    return None
+
+
+def _transport_preference_label(value) -> str:
+    normalized = _normalize_transport_preference(value)
+    if normalized == CHAT_TRANSPORT_CLI:
+        return "Hermes CLI"
+    if normalized == CHAT_TRANSPORT_API:
+        return "API Replay"
+    return "Auto"
+
+
 def _normalize_chat_session(session: dict) -> dict:
     transport_mode = session.get("transport_mode")
+    transport_preference = session.get("transport_preference")
+    if "transport_preference" not in session and transport_mode in (CHAT_TRANSPORT_CLI, CHAT_TRANSPORT_API):
+        # Preserve legacy session behavior by treating existing explicit mode
+        # as the preferred transport when no separate preference exists yet.
+        transport_preference = transport_mode
+    transport_preference = _normalize_transport_preference(transport_preference)
     continuity_mode = session.get("continuity_mode")
     if transport_mode == CHAT_TRANSPORT_CLI and not continuity_mode:
         continuity_mode = CHAT_CONTINUITY_HERMES if session.get("hermes_session_id") else CHAT_CONTINUITY_LIMITED
@@ -207,8 +399,9 @@ def _normalize_chat_session(session: dict) -> dict:
     folder_id = session.get("folder_id")
     if not isinstance(folder_id, str):
         folder_id = ""
-    session.setdefault("transport_mode", transport_mode)
-    session.setdefault("continuity_mode", continuity_mode)
+    session["transport_mode"] = transport_mode
+    session["transport_preference"] = transport_preference
+    session["continuity_mode"] = continuity_mode
     session.setdefault("transport_notice", "")
     session["messages"] = _normalize_chat_messages(session.get("messages"))
     session["vision_assets"] = _normalize_vision_assets(session.get("vision_assets"))
@@ -1355,11 +1548,394 @@ def _normalized_model_config() -> dict:
         normalized["default_model"] = model_cfg.get("default")
     if "default_provider" not in normalized and model_cfg.get("provider"):
         normalized["default_provider"] = model_cfg.get("provider")
-    for aux_key in ("vision", "web_extract", "compression", "session_search",
-                    "summarization", "embedding", "tts", "stt"):
+    for aux_key in AUXILIARY_MODEL_KEYS:
         if aux_key not in normalized and aux_key in auxiliary_cfg:
             normalized[aux_key] = copy.deepcopy(auxiliary_cfg.get(aux_key))
     return normalized
+
+
+def _provider_display_name(provider_type: str) -> str:
+    normalized = str(provider_type or "").strip().lower()
+    return PROVIDER_TYPE_LABELS.get(normalized, normalized or "Custom")
+
+
+def _infer_provider_type(name: str = "", base_url: str = "") -> str:
+    haystack = f"{name} {base_url}".lower()
+    if "openrouter" in haystack:
+        return "openrouter"
+    if "api.openai.com" in haystack or re.search(r"\bopenai\b", haystack):
+        return "openai"
+    if "azure" in haystack:
+        return "azure"
+    if "anthropic" in haystack or "claude" in haystack:
+        return "anthropic"
+    if "groq" in haystack:
+        return "groq"
+    if "google" in haystack or "gemini" in haystack:
+        return "google"
+    if "mistral" in haystack:
+        return "mistral"
+    if "together" in haystack:
+        return "together"
+    if "fireworks" in haystack:
+        return "fireworks"
+    if "deepseek" in haystack:
+        return "deepseek"
+    if "cohere" in haystack:
+        return "cohere"
+    return "auto"
+
+
+def _normalize_provider_type(value: str = "", *, name: str = "", base_url: str = "") -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in ("", "default", "custom", "generic", "local", "openai-compatible"):
+        return _infer_provider_type(name=name, base_url=base_url)
+    return normalized
+
+
+def _provider_default_base_url(provider: str = "") -> str:
+    normalized = _normalize_provider_type(provider)
+    return PROVIDER_DEFAULT_BASE_URLS.get(normalized, "")
+
+
+def _normalize_provider_profile(entry: dict) -> dict:
+    normalized = copy.deepcopy(entry or {})
+    normalized["name"] = str(normalized.get("name") or "").strip()
+    normalized["base_url"] = str(normalized.get("base_url") or "").strip()
+    normalized["model"] = str(normalized.get("model") or "").strip()
+    normalized["provider"] = _normalize_provider_type(
+        normalized.get("provider", ""),
+        name=normalized.get("name", ""),
+        base_url=normalized.get("base_url", ""),
+    )
+    if not normalized["base_url"]:
+        normalized["base_url"] = _provider_default_base_url(normalized.get("provider", ""))
+    api_key = normalized.get("api_key")
+    normalized["api_key"] = str(api_key or "").strip() if api_key is not None else ""
+    normalized["implicit"] = bool(normalized.get("implicit"))
+    return normalized
+
+
+def _custom_provider_profiles(raw: dict | None = None) -> list[dict]:
+    raw = raw if raw is not None else cfg.get_raw()
+    return [_normalize_provider_profile(item) for item in (raw.get("custom_providers", []) or [])]
+
+
+def _raw_role_profile_candidate(role: str, *, model_cfg: dict | None = None, raw: dict | None = None) -> dict | None:
+    raw = raw if raw is not None else cfg.get_raw()
+    model_cfg = model_cfg if model_cfg is not None else _normalized_model_config()
+    if role == "primary":
+        explicit_profile = str(model_cfg.get("default_profile") or "").strip()
+        provider = _normalize_provider_type(model_cfg.get("default_provider", ""))
+        model = str(model_cfg.get("default_model") or "").strip()
+        base_url = str(model_cfg.get("base_url") or _provider_default_base_url(provider) or "").strip()
+        api_key = str(model_cfg.get("api_key") or "").strip()
+        routing_provider = _role_routing_provider("primary", model_cfg=model_cfg)
+    elif role == "fallback":
+        explicit_profile = str(model_cfg.get("fallback_profile") or "").strip()
+        provider = _normalize_provider_type(model_cfg.get("fallback_provider", ""))
+        model = str(model_cfg.get("fallback_model") or "").strip()
+        base_url = str(model_cfg.get("fallback_base_url") or _provider_default_base_url(provider) or "").strip()
+        api_key = str(model_cfg.get("fallback_api_key") or "").strip()
+        routing_provider = _role_routing_provider("fallback", model_cfg=model_cfg)
+    elif role == "vision":
+        vision_cfg = model_cfg.get("vision")
+        if isinstance(vision_cfg, str):
+            explicit_profile = ""
+            provider = _normalize_provider_type(model_cfg.get("default_provider", ""))
+            model = vision_cfg.strip()
+            base_url = str(model_cfg.get("base_url") or _provider_default_base_url(provider) or "").strip()
+            api_key = str(model_cfg.get("api_key") or "").strip()
+            routing_provider = ""
+        elif isinstance(vision_cfg, dict):
+            explicit_profile = str(vision_cfg.get("profile") or "").strip()
+            provider = _normalize_provider_type(vision_cfg.get("provider", ""), base_url=vision_cfg.get("base_url", ""))
+            model = str(vision_cfg.get("model") or "").strip()
+            base_url = str(vision_cfg.get("base_url") or _provider_default_base_url(provider) or "").strip()
+            api_key = str(vision_cfg.get("api_key") or "").strip()
+            routing_provider = _role_routing_provider("vision", model_cfg=model_cfg)
+        else:
+            return None
+    else:
+        return None
+
+    if not any((explicit_profile, provider, model, base_url, api_key)):
+        return None
+    if not explicit_profile and provider in ("", "auto") and not any((model, base_url, api_key)):
+        return None
+    name = explicit_profile or provider or role
+    return _normalize_provider_profile({
+        "name": name,
+        "provider": provider,
+        "base_url": base_url,
+        "model": model,
+        "api_key": api_key,
+        "routing_provider": routing_provider,
+        "implicit": True,
+        "source_role": role,
+    })
+
+
+def _available_provider_profiles(raw: dict | None = None, model_cfg: dict | None = None) -> list[dict]:
+    raw = raw if raw is not None else cfg.get_raw()
+    model_cfg = model_cfg if model_cfg is not None else _normalized_model_config()
+    profiles = []
+    by_name: dict[str, dict] = {}
+
+    def add_profile(profile: dict | None):
+        if not profile:
+            return
+        normalized = _normalize_provider_profile(profile)
+        name = normalized.get("name", "")
+        if not name:
+            return
+        existing = by_name.get(name)
+        if existing:
+            same_target = (
+                existing.get("provider") == normalized.get("provider")
+                and existing.get("base_url") == normalized.get("base_url")
+            )
+            if same_target:
+                if not existing.get("model") and normalized.get("model"):
+                    existing["model"] = normalized["model"]
+                return
+            suffix_name = f"{name}-{normalized.get('source_role') or 'profile'}"
+            normalized["name"] = suffix_name
+            name = suffix_name
+            if name in by_name:
+                return
+        by_name[name] = normalized
+        profiles.append(normalized)
+
+    for profile in _custom_provider_profiles(raw):
+        add_profile(profile)
+    for role in MODEL_ROLE_LABELS:
+        candidate = _raw_role_profile_candidate(role, model_cfg=model_cfg, raw=raw)
+        explicit_name = candidate.get("name", "") if candidate else ""
+        if explicit_name and explicit_name in by_name:
+            continue
+        add_profile(candidate)
+    return profiles
+
+
+def _get_provider_profile(name: str, raw: dict | None = None) -> dict | None:
+    name = str(name or "").strip()
+    if not name:
+        return None
+    for profile in _available_provider_profiles(raw):
+        if profile.get("name") == name:
+            return profile
+    return None
+
+
+def _role_linked_profile_name(role: str, *, model_cfg: dict | None = None, raw: dict | None = None) -> str:
+    raw = raw if raw is not None else cfg.get_raw()
+    model_cfg = model_cfg if model_cfg is not None else _normalized_model_config()
+    profile_names = {item.get("name") for item in _custom_provider_profiles(raw)}
+
+    if role == "primary":
+        explicit = str(model_cfg.get("default_profile") or "").strip()
+        fallback = str(model_cfg.get("default_provider") or "").strip()
+    elif role == "fallback":
+        explicit = str(model_cfg.get("fallback_profile") or "").strip()
+        fallback = str(model_cfg.get("fallback_provider") or "").strip()
+    elif role == "vision":
+        vision_cfg = model_cfg.get("vision")
+        explicit = str(vision_cfg.get("profile") or "").strip() if isinstance(vision_cfg, dict) else ""
+        fallback = str(vision_cfg.get("provider") or "").strip() if isinstance(vision_cfg, dict) else ""
+    else:
+        return ""
+
+    if explicit:
+        return explicit
+    if fallback in profile_names:
+        return fallback
+    candidate = _raw_role_profile_candidate(role, model_cfg=model_cfg, raw=raw)
+    if candidate:
+        return candidate.get("name", "")
+    return ""
+
+
+def _provider_usage_map(raw: dict | None = None, model_cfg: dict | None = None) -> dict[str, list[str]]:
+    raw = raw if raw is not None else cfg.get_raw()
+    model_cfg = model_cfg if model_cfg is not None else _normalized_model_config()
+    usage: dict[str, list[str]] = {}
+    for role, label in MODEL_ROLE_LABELS.items():
+        profile_name = _role_linked_profile_name(role, model_cfg=model_cfg, raw=raw)
+        if not profile_name:
+            continue
+        usage.setdefault(profile_name, []).append(label)
+    return usage
+
+
+def _role_routing_provider(role: str, *, model_cfg: dict | None = None) -> str:
+    model_cfg = model_cfg if model_cfg is not None else _normalized_model_config()
+    if role == "primary":
+        return str(model_cfg.get("routing_provider") or "").strip()
+    if role == "fallback":
+        return str(model_cfg.get("fallback_routing_provider") or "").strip()
+    if role == "vision":
+        vision_cfg = model_cfg.get("vision")
+        if isinstance(vision_cfg, dict):
+            return str(vision_cfg.get("routing_provider") or "").strip()
+    return ""
+
+
+def _resolve_role_target(role: str) -> dict:
+    raw = cfg.get_raw()
+    model_cfg = _normalized_model_config()
+    default_provider = _normalize_provider_type(
+        model_cfg.get("default_provider", ""),
+        base_url=model_cfg.get("base_url", ""),
+    )
+    default_target = {
+        "base_url": (model_cfg.get("base_url") or _provider_default_base_url(default_provider) or _runtime_env_value("HERMES_API_URL", "") or HERMES_API_URL or "").strip(),
+        "api_key": str(model_cfg.get("api_key") or "").strip(),
+        "model": str(model_cfg.get("default_model") or "").strip(),
+        "provider": default_provider,
+        "profile": _role_linked_profile_name("primary", model_cfg=model_cfg, raw=raw),
+        "routing_provider": _role_routing_provider("primary", model_cfg=model_cfg),
+    }
+
+    primary_profile = _get_provider_profile(default_target.get("profile"), raw)
+    if primary_profile:
+        default_target["provider"] = primary_profile.get("provider") or default_target["provider"]
+        default_target["base_url"] = primary_profile.get("base_url") or default_target["base_url"]
+        if primary_profile.get("api_key"):
+            default_target["api_key"] = primary_profile.get("api_key")
+        if not default_target["model"]:
+            default_target["model"] = primary_profile.get("model") or default_target["model"]
+    default_target["api_key"] = _resolved_target_api_key(default_target)
+
+    if role == "primary":
+        return default_target
+
+    if role == "fallback":
+        fallback_provider = _normalize_provider_type(
+            model_cfg.get("fallback_provider", ""),
+            base_url=model_cfg.get("fallback_base_url", ""),
+        )
+        fallback_target = {
+            "base_url": str(model_cfg.get("fallback_base_url") or _provider_default_base_url(fallback_provider) or "").strip(),
+            "api_key": str(model_cfg.get("fallback_api_key") or "").strip(),
+            "model": str(model_cfg.get("fallback_model") or "").strip(),
+            "provider": fallback_provider,
+            "profile": _role_linked_profile_name("fallback", model_cfg=model_cfg, raw=raw),
+            "routing_provider": _role_routing_provider("fallback", model_cfg=model_cfg),
+        }
+        fallback_profile = _get_provider_profile(fallback_target.get("profile"), raw)
+        if fallback_profile:
+            fallback_target["provider"] = fallback_profile.get("provider") or fallback_target["provider"]
+            fallback_target["base_url"] = fallback_profile.get("base_url") or fallback_target["base_url"]
+            if fallback_profile.get("api_key"):
+                fallback_target["api_key"] = fallback_profile.get("api_key")
+            if not fallback_target["model"]:
+                fallback_target["model"] = fallback_profile.get("model") or fallback_target["model"]
+        fallback_target["api_key"] = _resolved_target_api_key(fallback_target)
+        return fallback_target
+
+    if role == "vision":
+        merged = dict(default_target)
+        vision_cfg = model_cfg.get("vision")
+        if isinstance(vision_cfg, str) and vision_cfg.strip():
+            merged["model"] = vision_cfg.strip()
+            merged["profile"] = ""
+            merged["routing_provider"] = ""
+            merged["api_key"] = _resolved_target_api_key(merged)
+            return merged
+        if isinstance(vision_cfg, dict):
+            merged["profile"] = _role_linked_profile_name("vision", model_cfg=model_cfg, raw=raw)
+            merged["routing_provider"] = _role_routing_provider("vision", model_cfg=model_cfg)
+            vision_profile = _get_provider_profile(merged.get("profile"), raw)
+            if vision_profile:
+                merged["provider"] = vision_profile.get("provider") or merged["provider"]
+                merged["base_url"] = vision_profile.get("base_url") or merged["base_url"]
+                if vision_profile.get("api_key"):
+                    merged["api_key"] = vision_profile.get("api_key")
+            for key in ("base_url", "api_key", "model", "provider"):
+                if isinstance(vision_cfg.get(key), str) and vision_cfg.get(key).strip():
+                    merged[key] = vision_cfg.get(key).strip()
+            merged["provider"] = _normalize_provider_type(
+                merged.get("provider", ""),
+                base_url=merged.get("base_url", ""),
+            )
+            merged["api_key"] = _resolved_target_api_key(merged)
+        return merged
+
+    raise ValueError(f"Unknown model role: {role}")
+
+
+def _model_role_enabled(role: str, target: dict | None = None) -> bool:
+    if role == "primary":
+        return True
+    target = target if target is not None else _resolve_role_target(role)
+    return bool(str(target.get("model") or "").strip())
+
+
+def _model_role_info(role: str) -> dict:
+    target = _resolve_role_target(role)
+    linked_profile = str(target.get("profile") or "").strip()
+    return {
+        "role": role,
+        "label": MODEL_ROLE_LABELS.get(role, role.title()),
+        "profile": linked_profile,
+        "provider": str(target.get("provider") or "").strip(),
+        "provider_label": _provider_display_name(target.get("provider", "")),
+        "model": str(target.get("model") or "").strip(),
+        "base_url": str(target.get("base_url") or "").strip(),
+        "routing_provider": str(target.get("routing_provider") or "").strip(),
+        "enabled": _model_role_enabled(role, target=target),
+        "supports_live_discovery": str(target.get("provider") or "").strip().lower() == "openrouter",
+    }
+
+
+def _profile_payload_for_role(profile_name: str, model_name: str, routing_provider: str = "") -> dict:
+    profile = _get_provider_profile(profile_name)
+    if not profile:
+        raise ChatBackendError(f"Provider profile '{profile_name}' was not found", status_code=404)
+    return {
+        "profile": profile.get("name", ""),
+        "provider": profile.get("provider", ""),
+        "base_url": profile.get("base_url", ""),
+        "api_key": profile.get("api_key", ""),
+        "model": str(model_name or "").strip(),
+        "routing_provider": str(routing_provider or "").strip(),
+    }
+
+
+def _sync_linked_provider_roles(profile_name: str, profile: dict) -> None:
+    raw = cfg.get_raw()
+    model_cfg = _normalized_model_config()
+    model_updates = {}
+    if _role_linked_profile_name("primary", model_cfg=model_cfg, raw=raw) == profile_name:
+        model_updates.update({
+            "default_profile": profile_name,
+            "default_provider": profile.get("provider", ""),
+            "base_url": profile.get("base_url", ""),
+            "api_key": profile.get("api_key", ""),
+        })
+    if _role_linked_profile_name("fallback", model_cfg=model_cfg, raw=raw) == profile_name:
+        model_updates.update({
+            "fallback_profile": profile_name,
+            "fallback_provider": profile.get("provider", ""),
+            "fallback_base_url": profile.get("base_url", ""),
+            "fallback_api_key": profile.get("api_key", ""),
+        })
+    if model_updates:
+        cfg.update("model", model_updates)
+
+    vision_cfg = model_cfg.get("vision")
+    if _role_linked_profile_name("vision", model_cfg=model_cfg, raw=raw) == profile_name:
+        cfg.update("auxiliary", {
+            "vision": {
+                "profile": profile_name,
+                "provider": profile.get("provider", ""),
+                "base_url": profile.get("base_url", ""),
+                "api_key": profile.get("api_key", ""),
+                "model": str((vision_cfg or {}).get("model") or "").strip() if isinstance(vision_cfg, dict) else "",
+                "routing_provider": str((vision_cfg or {}).get("routing_provider") or "").strip() if isinstance(vision_cfg, dict) else "",
+            }
+        })
 
 
 def _classify_env_key(key: str) -> str:
@@ -1665,17 +2241,18 @@ def _get_providers_info():
     """Build a structured view of providers from config."""
     raw = cfg.get_raw()
     model_cfg = _normalized_model_config()
-    custom = raw.get("custom_providers", []) or []
+    custom = _custom_provider_profiles(raw)
 
     default = {
+        "profile": _role_linked_profile_name("primary", model_cfg=model_cfg, raw=raw),
         "provider": model_cfg.get("default_provider", ""),
         "model": model_cfg.get("default_model", ""),
         "base_url": model_cfg.get("base_url", ""),
+        "routing_provider": model_cfg.get("routing_provider", ""),
     }
 
     auxiliary = {}
-    for aux_key in ("vision", "web_extract", "compression", "session_search",
-                     "summarization", "embedding", "tts", "stt"):
+    for aux_key in AUXILIARY_MODEL_KEYS:
         val = model_cfg.get(aux_key)
         if val:
             if isinstance(val, str):
@@ -1691,12 +2268,26 @@ def _get_providers_info():
 def api_providers_get():
     try:
         default, custom, auxiliary = _get_providers_info()
-        # Mask secrets in custom providers
-        safe_custom = [cfg.mask_secrets(c) for c in custom]
+        usage_map = _provider_usage_map()
+        safe_custom = []
+        for profile in custom:
+            safe = cfg.mask_secrets(profile)
+            safe["used_by"] = usage_map.get(profile.get("name", ""), [])
+            safe["has_api_key"] = bool(profile.get("api_key"))
+            safe["provider_label"] = _provider_display_name(profile.get("provider", ""))
+            safe_custom.append(safe)
+        safe_aux = cfg.mask_secrets(auxiliary)
+        for cfg_value in safe_aux.values():
+            if isinstance(cfg_value, dict):
+                cfg_value["provider_label"] = _provider_display_name(cfg_value.get("provider", ""))
         return jsonify({
-            "default": default,
+            "default": {
+                **default,
+                "provider_label": _provider_display_name(default.get("provider", "")),
+            },
             "custom": safe_custom,
-            "auxiliary": cfg.mask_secrets(auxiliary),
+            "auxiliary": safe_aux,
+            "presets": PROVIDER_PRESETS,
         })
     except Exception as exc:
         return _http_error(str(exc))
@@ -1706,13 +2297,13 @@ def api_providers_get():
 @require_token
 def api_providers_add():
     try:
-        data = request.get_json(force=True)
+        data = _normalize_provider_profile(request.get_json(force=True))
         name = data.get("name")
         if not name:
             return jsonify({"ok": False, "error": "name is required"}), 400
 
         raw = cfg.get_raw()
-        custom = raw.get("custom_providers", []) or []
+        custom = _custom_provider_profiles(raw)
         # Check for duplicate name
         for p in custom:
             if p.get("name") == name:
@@ -1731,18 +2322,20 @@ def api_providers_update(name):
     try:
         data = request.get_json(force=True)
         raw = cfg.get_raw()
-        custom = raw.get("custom_providers", []) or []
+        custom = _custom_provider_profiles(raw)
         found = False
         for i, p in enumerate(custom):
             if p.get("name") == name:
                 sanitized = _preserve_masked_secret_updates(p, data)
-                custom[i] = ConfigManager.deep_merge(p, sanitized)
-                custom[i]["name"] = name  # preserve name if not in payload
+                merged = ConfigManager.deep_merge(p, sanitized)
+                merged["name"] = name
+                custom[i] = _normalize_provider_profile(merged)
                 found = True
                 break
         if not found:
             return jsonify({"ok": False, "error": f"Provider '{name}' not found"}), 404
         cfg.set("custom_providers", custom)
+        _sync_linked_provider_roles(name, custom[i])
         return jsonify({"ok": True})
     except Exception as exc:
         return _http_error(str(exc))
@@ -1753,7 +2346,11 @@ def api_providers_update(name):
 def api_providers_delete(name):
     try:
         raw = cfg.get_raw()
-        custom = raw.get("custom_providers", []) or []
+        usage_map = _provider_usage_map(raw=raw)
+        if usage_map.get(name):
+            used_by = ", ".join(usage_map.get(name, []))
+            return jsonify({"ok": False, "error": f"Provider '{name}' is still used by {used_by}"}), 409
+        custom = _custom_provider_profiles(raw)
         new_custom = [p for p in custom if p.get("name") != name]
         if len(new_custom) == len(custom):
             return jsonify({"ok": False, "error": f"Provider '{name}' not found"}), 404
@@ -1770,22 +2367,12 @@ def api_providers_test(name):
     try:
         raw = cfg.get_raw()
         model_cfg = _normalized_model_config()
-        custom = raw.get("custom_providers", []) or []
-        provider_cfg = None
-        for p in custom:
-            if p.get("name") == name:
-                provider_cfg = p
-                break
+        provider_cfg = _get_provider_profile(name, raw)
 
         if not provider_cfg:
             # Maybe it's the default provider
-            if model_cfg.get("default_provider") == name:
-                provider_cfg = {
-                    "name": name,
-                    "base_url": model_cfg.get("base_url", ""),
-                    "model": model_cfg.get("default_model", ""),
-                    "api_key": model_cfg.get("api_key", ""),
-                }
+            if _role_linked_profile_name("primary", model_cfg=model_cfg, raw=raw) == name:
+                provider_cfg = _resolve_role_target("primary")
             else:
                 return jsonify({"ok": False, "error": f"Provider '{name}' not found"}), 404
 
@@ -1794,16 +2381,14 @@ def api_providers_test(name):
         import urllib.error
 
         base_url = (provider_cfg.get("base_url") or "").rstrip("/")
-        api_key = provider_cfg.get("api_key", "")
         model = provider_cfg.get("model", "gpt-3.5-turbo")
+        provider_type = provider_cfg.get("provider", "")
+        if not base_url:
+            return jsonify({"ok": False, "error": "Base URL is required to test this provider"}), 200
+        if not model:
+            return jsonify({"ok": False, "error": "Suggested model is required to test this provider"}), 200
 
-        # Determine the chat completions endpoint
-        if "/v1" in base_url:
-            url = f"{base_url}/chat/completions"
-        elif "/chat" in base_url:
-            url = base_url
-        else:
-            url = f"{base_url}/v1/chat/completions"
+        url = _build_openai_api_url(base_url, "chat/completions")
 
         payload = json.dumps({
             "model": model,
@@ -1811,9 +2396,8 @@ def api_providers_test(name):
             "max_tokens": 5,
         }).encode("utf-8")
 
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+        headers = _api_server_headers(provider_cfg.get("api_key"), provider_type)
+        headers["Content-Type"] = "application/json"
 
         req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
         start = time.time()
@@ -1845,24 +2429,24 @@ def api_models_get():
     try:
         raw = cfg.get_raw()
         model_cfg = _normalized_model_config()
-        custom = raw.get("custom_providers", []) or []
+        custom = _custom_provider_profiles(raw)
 
         all_models = []
         seen = set()
 
         def _add(provider_name, model_name):
-            if model_name and model_name not in seen:
-                seen.add(model_name)
+            key = (provider_name, model_name)
+            if model_name and key not in seen:
+                seen.add(key)
                 all_models.append({"provider": provider_name, "model": model_name})
 
         _add(model_cfg.get("default_provider", "default"), model_cfg.get("default_model", ""))
-        _add(model_cfg.get("default_provider", "default"), model_cfg.get("fallback_model", ""))
+        _add(model_cfg.get("fallback_provider") or model_cfg.get("default_provider", "default"), model_cfg.get("fallback_model", ""))
 
         for cp in custom:
             _add(cp.get("name", ""), cp.get("model", ""))
 
-        for aux_key in ("vision", "web_extract", "compression", "session_search",
-                         "summarization", "embedding", "tts", "stt"):
+        for aux_key in AUXILIARY_MODEL_KEYS:
             val = model_cfg.get(aux_key)
             if isinstance(val, str):
                 _add(aux_key, val)
@@ -1872,8 +2456,192 @@ def api_models_get():
         return jsonify({
             "default_model": model_cfg.get("default_model", ""),
             "default_provider": model_cfg.get("default_provider", ""),
+            "default_profile": model_cfg.get("default_profile", ""),
             "fallback_model": model_cfg.get("fallback_model", ""),
+            "fallback_provider": model_cfg.get("fallback_provider", ""),
+            "fallback_profile": model_cfg.get("fallback_profile", ""),
             "all_models": all_models,
+            "roles": {
+                "primary": _model_role_info("primary"),
+                "fallback": _model_role_info("fallback"),
+                "vision": _model_role_info("vision"),
+            },
+        })
+    except Exception as exc:
+        return _http_error(str(exc))
+
+
+@app.route("/api/model-roles", methods=["GET"])
+@require_token
+def api_model_roles_get():
+    try:
+        profiles = []
+        usage_map = _provider_usage_map()
+        for profile in _available_provider_profiles():
+            safe = cfg.mask_secrets(profile)
+            safe["used_by"] = usage_map.get(profile.get("name", ""), [])
+            safe["has_api_key"] = bool(profile.get("api_key") or _provider_env_api_key(profile.get("provider")))
+            safe["provider_label"] = _provider_display_name(profile.get("provider", ""))
+            profiles.append(safe)
+        return jsonify({
+            "profiles": profiles,
+            "roles": {
+                "primary": _model_role_info("primary"),
+                "fallback": _model_role_info("fallback"),
+                "vision": _model_role_info("vision"),
+            },
+        })
+    except Exception as exc:
+        return _http_error(str(exc))
+
+
+@app.route("/api/model-roles/<role>", methods=["PUT"])
+@require_token
+def api_model_roles_update(role):
+    try:
+        role = str(role or "").strip().lower()
+        if role not in MODEL_ROLE_LABELS:
+            return jsonify({"ok": False, "error": f"Unknown role '{role}'"}), 404
+
+        data = request.get_json(force=True) or {}
+        profile_name = str(data.get("profile") or "").strip()
+        model_name = str(data.get("model") or "").strip()
+        routing_provider = str(data.get("routing_provider") or "").strip()
+
+        if role == "primary":
+            if not profile_name or not model_name:
+                return jsonify({"ok": False, "error": "Primary Chat requires both a provider profile and a model"}), 400
+            profile_payload = _profile_payload_for_role(profile_name, model_name, routing_provider)
+            cfg.update("model", {
+                "default_profile": profile_payload["profile"],
+                "default_provider": profile_payload["provider"],
+                "default_model": profile_payload["model"],
+                "base_url": profile_payload["base_url"],
+                "api_key": profile_payload["api_key"],
+                "routing_provider": profile_payload["routing_provider"],
+            })
+            return jsonify({"ok": True})
+
+        if not profile_name or not model_name:
+            if role == "fallback":
+                cfg.update("model", {
+                    "fallback_profile": "",
+                    "fallback_provider": "",
+                    "fallback_model": "",
+                    "fallback_base_url": "",
+                    "fallback_api_key": "",
+                    "fallback_routing_provider": "",
+                })
+                return jsonify({"ok": True})
+            if role == "vision":
+                cfg.update("auxiliary", {
+                    "vision": {
+                        "profile": "",
+                        "provider": "auto",
+                        "model": "",
+                        "base_url": "",
+                        "api_key": "",
+                        "routing_provider": "",
+                    }
+                })
+                return jsonify({"ok": True})
+
+        profile_payload = _profile_payload_for_role(profile_name, model_name, routing_provider)
+        if role == "fallback":
+            cfg.update("model", {
+                "fallback_profile": profile_payload["profile"],
+                "fallback_provider": profile_payload["provider"],
+                "fallback_model": profile_payload["model"],
+                "fallback_base_url": profile_payload["base_url"],
+                "fallback_api_key": profile_payload["api_key"],
+                "fallback_routing_provider": profile_payload["routing_provider"],
+            })
+            return jsonify({"ok": True})
+
+        cfg.update("auxiliary", {
+            "vision": {
+                "profile": profile_payload["profile"],
+                "provider": profile_payload["provider"],
+                "model": profile_payload["model"],
+                "base_url": profile_payload["base_url"],
+                "api_key": profile_payload["api_key"],
+                "routing_provider": profile_payload["routing_provider"],
+            }
+        })
+        return jsonify({"ok": True})
+    except ChatBackendError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), exc.status_code
+    except Exception as exc:
+        return _http_error(str(exc))
+
+
+@app.route("/api/providers/<name>/discovery/models", methods=["GET"])
+@require_token
+def api_provider_discovery_models(name):
+    try:
+        profile = _get_provider_profile(name)
+        if not profile:
+            return jsonify({"ok": False, "error": f"Provider '{name}' not found"}), 404
+        vision_only = request.args.get("vision_only", "").lower() in ("1", "true", "yes")
+        if str(profile.get("provider") or "").strip().lower() != "openrouter":
+            return jsonify({
+                "supported": False,
+                "provider": profile.get("provider", ""),
+                "models": [],
+                "reason": "Live model discovery is only available for OpenRouter profiles right now",
+            })
+        return jsonify({
+            "supported": True,
+            "provider": profile.get("provider", ""),
+            "models": _openrouter_discovery_models(vision_only=vision_only),
+        })
+    except Exception as exc:
+        return _http_error(str(exc))
+
+
+@app.route("/api/provider-types/<provider>/discovery/models", methods=["GET"])
+@require_token
+def api_provider_type_discovery_models(provider):
+    try:
+        provider = _normalize_provider_type(provider or "")
+        vision_only = request.args.get("vision_only", "").lower() in ("1", "true", "yes")
+        if provider != "openrouter":
+            return jsonify({
+                "supported": False,
+                "provider": provider,
+                "models": [],
+                "reason": "Live model discovery is only available for OpenRouter right now",
+            })
+        return jsonify({
+            "supported": True,
+            "provider": provider,
+            "models": _openrouter_discovery_models(vision_only=vision_only),
+        })
+    except Exception as exc:
+        return _http_error(str(exc))
+
+
+@app.route("/api/providers/<name>/discovery/endpoints", methods=["GET"])
+@require_token
+def api_provider_discovery_endpoints(name):
+    try:
+        profile = _get_provider_profile(name)
+        if not profile:
+            return jsonify({"ok": False, "error": f"Provider '{name}' not found"}), 404
+        model_id = str(request.args.get("model") or "").strip()
+        if not model_id:
+            return jsonify({"supported": False, "endpoints": [], "reason": "model is required"}), 400
+        if str(profile.get("provider") or "").strip().lower() != "openrouter":
+            return jsonify({
+                "supported": False,
+                "provider": profile.get("provider", ""),
+                "endpoints": [],
+                "reason": "Live endpoint discovery is only available for OpenRouter profiles right now",
+            })
+        return jsonify({
+            "supported": True,
+            "provider": profile.get("provider", ""),
+            "endpoints": _openrouter_discovery_endpoints(model_id),
         })
     except Exception as exc:
         return _http_error(str(exc))
@@ -1991,27 +2759,7 @@ def api_agents_duplicate(name):
 @require_token
 def api_skills_get():
     try:
-        skills = []
-        if not SKILLS_DIR.exists():
-            return jsonify({"skills": skills})
-
-        for root, dirs, files in os.walk(str(SKILLS_DIR)):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]  # skip hidden
-            if "SKILL.md" in files:
-                skill_md = Path(root) / "SKILL.md"
-                fm = _skill_frontmatter(skill_md)
-                rel_path = Path(root).relative_to(SKILLS_DIR)
-                dir_name = str(rel_path)
-                enabled = not dir_name.endswith(".disabled")
-                skills.append({
-                    "name": fm.get("name", rel_path.name),
-                    "category": fm.get("category", ""),
-                    "description": fm.get("description", ""),
-                    "path": str(rel_path),
-                    "enabled": enabled,
-                    "frontmatter": fm,
-                })
-        return jsonify({"skills": skills})
+        return jsonify({"skills": _discover_skill_entries()})
     except Exception as exc:
         return _http_error(str(exc))
 
@@ -2037,6 +2785,53 @@ def api_skill_toggle(name):
         return _http_error(str(exc))
 
 
+@app.route("/api/starter-pack/<item_id>/install", methods=["POST"])
+@require_token
+def api_starter_pack_install(item_id):
+    try:
+        group = _starter_pack_skill_group(item_id)
+        if not group:
+            return jsonify({"ok": False, "error": "Starter-pack item not found"}), 404
+
+        candidates = _starter_pack_install_candidates(group)
+        if not candidates:
+            return jsonify({"ok": False, "error": "This starter-pack item does not support installation"}), 400
+
+        requested_identifier = str((request.get_json(silent=True) or {}).get("identifier") or "").strip()
+        candidate_map = {candidate["identifier"]: candidate for candidate in candidates}
+        if requested_identifier:
+            if requested_identifier not in candidate_map:
+                return jsonify({"ok": False, "error": "Unsupported starter-pack install target"}), 400
+            chosen = candidate_map[requested_identifier]
+        else:
+            chosen = next((candidate for candidate in candidates if candidate.get("recommended")), candidates[0])
+
+        result = _run_hermes("skills", "install", chosen["identifier"], "--yes", timeout=300)
+        combined_output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part and part.strip()).strip()
+        lowered_output = combined_output.lower()
+        if result.returncode != 0 and "already installed" not in lowered_output:
+            message = combined_output or f"Hermes skills install exited with status {result.returncode}"
+            return jsonify({"ok": False, "error": message}), 502
+
+        runtime = _chat_runtime_status()
+        item = next(
+            (entry for entry in (runtime.get("starter_pack", {}).get("items") or []) if entry.get("id") == group.get("id")),
+            None,
+        )
+        return jsonify({
+            "ok": True,
+            "installed": True,
+            "candidate": chosen,
+            "item": item,
+            "output": combined_output,
+            "setup_notes": [str(note).strip() for note in (group.get("setup_notes") or []) if str(note).strip()],
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "error": "Hermes skills install timed out"}), 504
+    except Exception as exc:
+        return _http_error(str(exc))
+
+
 # ===================================================================
 # 23–24. Channels
 # ===================================================================
@@ -2045,23 +2840,8 @@ def api_skill_toggle(name):
 @require_token
 def api_channels_get():
     try:
-        raw = cfg.get_raw()
-        channels_cfg = raw.get("channels", {})
-        toolsets = raw.get("platform_toolsets", {})
-
-        channels = []
-        for ch_name, ch_config in channels_cfg.items():
-            if not isinstance(ch_config, dict):
-                continue
-            # Derive enabled from platform_toolsets
-            enabled = bool(toolsets.get(ch_name))
-            channels.append({
-                "name": ch_name,
-                "config": cfg.mask_secrets(ch_config),
-                "enabled": enabled,
-            })
-
-        return jsonify({"channels": channels})
+        integrations = _integration_entries()
+        return jsonify({"channels": integrations, "integrations": integrations})
     except Exception as exc:
         return _http_error(str(exc))
 
@@ -2073,12 +2853,21 @@ def api_channels_update(name):
         data = request.get_json(force=True)
         raw = cfg.get_raw()
         channels_cfg = raw.get("channels", {})
-        if name not in channels_cfg:
-            return jsonify({"ok": False, "error": f"Channel '{name}' not found"}), 404
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "Integration config must be a JSON object"}), 400
 
-        channels_cfg[name] = ConfigManager.deep_merge(channels_cfg[name], data)
-        cfg.set("channels", channels_cfg)
-        return jsonify({"ok": True})
+        if name in channels_cfg and isinstance(channels_cfg.get(name), dict):
+            current = channels_cfg.get(name, {})
+            channels_cfg[name] = _preserve_masked_secret_updates(current, data)
+            cfg.set("channels", channels_cfg)
+            return jsonify({"ok": True})
+
+        if name in INTEGRATION_SECTION_LABELS and isinstance(raw.get(name), dict):
+            current = raw.get(name, {})
+            cfg.set(name, _preserve_masked_secret_updates(current, data))
+            return jsonify({"ok": True})
+
+        return jsonify({"ok": False, "error": f"Integration '{name}' not found"}), 404
     except Exception as exc:
         return _http_error(str(exc))
 
@@ -2419,9 +3208,9 @@ def api_onboarding_get():
         if not model_cfg.get("default_model"):
             missing.append("default_model")
 
-        # Check at least one channel is configured
-        channels = raw.get("channels", {})
-        if not channels:
+        # Check at least one messaging integration is configured
+        integrations = _integration_entries(raw)
+        if not any(item.get("configured") for item in integrations):
             missing.append("channel")
 
         return jsonify({
@@ -2672,6 +3461,8 @@ def _chat_session_meta(session: dict) -> dict:
     context = _effective_session_context(normalized)
     return {
         "transport_mode": normalized.get("transport_mode"),
+        "transport_preference": normalized.get("transport_preference") or CHAT_TRANSPORT_AUTO,
+        "transport_preference_label": _transport_preference_label(normalized.get("transport_preference")),
         "continuity_mode": normalized.get("continuity_mode"),
         "transport_notice": normalized.get("transport_notice") or "",
         "hermes_session_backed": normalized.get("continuity_mode") == CHAT_CONTINUITY_HERMES,
@@ -2752,6 +3543,381 @@ def _compose_chat_turn_payload(
     context_block = _format_chat_context_block(session)
     sections = [section for section in (context_block, attachment_text) if section]
     return "\n\n".join(sections), image_files
+
+
+def _integration_config_is_configured(value) -> bool:
+    if isinstance(value, dict):
+        if not value:
+            return False
+        return any(_integration_config_is_configured(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_integration_config_is_configured(item) for item in value)
+    if isinstance(value, bool):
+        return value
+    if value in (None, ""):
+        return False
+    return True
+
+
+def _integration_entries(raw: dict | None = None) -> list[dict]:
+    raw = raw if raw is not None else cfg.get_raw()
+    integrations = []
+
+    for key in INTEGRATION_SECTION_ORDER:
+        if key not in raw:
+            continue
+        value = raw.get(key)
+        if not isinstance(value, dict):
+            continue
+        integrations.append({
+            "name": key,
+            "label": INTEGRATION_SECTION_LABELS.get(key, key.title()),
+            "kind": "integration",
+            "config": cfg.mask_secrets(copy.deepcopy(value)),
+            "configured": _integration_config_is_configured(value),
+            "source": "top_level",
+        })
+
+    channels_cfg = raw.get("channels", {})
+    toolsets = raw.get("platform_toolsets", {})
+    if isinstance(channels_cfg, dict):
+        for name, config_value in channels_cfg.items():
+            if not isinstance(config_value, dict):
+                continue
+            integrations.append({
+                "name": name,
+                "label": name,
+                "kind": "legacy_channel",
+                "config": cfg.mask_secrets(copy.deepcopy(config_value)),
+                "configured": _integration_config_is_configured(config_value),
+                "enabled": bool(toolsets.get(name)),
+                "source": "channels",
+            })
+
+    return integrations
+
+
+def _discover_skill_entries() -> list[dict]:
+    skills = []
+    if not SKILLS_DIR.exists():
+        return skills
+
+    for root, dirs, files in os.walk(str(SKILLS_DIR)):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        if "SKILL.md" not in files:
+            continue
+        skill_md = Path(root) / "SKILL.md"
+        fm = _skill_frontmatter(skill_md)
+        rel_path = Path(root).relative_to(SKILLS_DIR)
+        dir_name = str(rel_path)
+        skills.append({
+            "name": fm.get("name", rel_path.name),
+            "category": fm.get("category", ""),
+            "description": fm.get("description", ""),
+            "path": str(rel_path),
+            "enabled": not dir_name.endswith(".disabled"),
+            "frontmatter": fm,
+        })
+    return skills
+
+
+def _configured_hook_keys(raw: dict | None = None) -> list[str]:
+    raw = raw if raw is not None else cfg.get_raw()
+    hooks_cfg = raw.get("hooks")
+    if not isinstance(hooks_cfg, dict):
+        return []
+    return [
+        str(key)
+        for key, value in hooks_cfg.items()
+        if _integration_config_is_configured(value)
+    ]
+
+
+def _skill_matches_terms(skill: dict, terms: tuple[str, ...]) -> bool:
+    haystack = " ".join([
+        str(skill.get("name") or ""),
+        str(skill.get("path") or ""),
+        str(skill.get("description") or ""),
+        str(skill.get("category") or ""),
+    ]).lower()
+    return any(term in haystack for term in terms)
+
+
+def _joined_labels(values: list[str]) -> str:
+    items = [str(value).strip() for value in values if str(value).strip()]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+def _skill_absolute_path(skill: dict) -> Path | None:
+    rel_path = str(skill.get("path") or "").strip()
+    if not rel_path:
+        return None
+    return SKILLS_DIR / rel_path
+
+
+def _skill_setup_readiness(skill: dict) -> dict:
+    frontmatter = skill.get("frontmatter") if isinstance(skill.get("frontmatter"), dict) else {}
+    skill_dir = _skill_absolute_path(skill)
+    issues = []
+
+    required_files = frontmatter.get("required_credential_files")
+    if isinstance(required_files, list):
+        for entry in required_files:
+            if not isinstance(entry, dict):
+                continue
+            rel_path = str(entry.get("path") or "").strip()
+            if not rel_path or not skill_dir:
+                continue
+            target = (skill_dir / rel_path).resolve()
+            if not target.exists():
+                issues.append(f"missing credential file {rel_path}")
+
+    prerequisites = frontmatter.get("prerequisites")
+    env_vars = []
+    if isinstance(prerequisites, dict):
+        env_vars = _clean_string_list(prerequisites.get("env_vars"))
+    for env_key in env_vars:
+        if not _runtime_env_value(env_key, ""):
+            issues.append(f"missing env var {env_key}")
+
+    metadata = frontmatter.get("metadata")
+    required_bins = []
+    if isinstance(metadata, dict):
+        openclaw_meta = metadata.get("openclaw")
+        if isinstance(openclaw_meta, dict):
+            required_bins = _clean_string_list(((openclaw_meta.get("requires") or {}).get("bins")))
+    for binary in required_bins:
+        if shutil.which(binary) is None:
+            issues.append(f"missing command {binary}")
+
+    return {
+        "ready": not issues,
+        "issues": issues,
+    }
+
+
+def _starter_pack_skill_group(item_id: str) -> dict | None:
+    needle = str(item_id or "").strip()
+    if not needle:
+        return None
+    for group in STARTER_PACK_SKILL_GROUPS:
+        if group.get("id") == needle:
+            return group
+    return None
+
+
+def _starter_pack_install_candidates(group: dict) -> list[dict]:
+    candidates = []
+    for candidate in group.get("install_candidates") or ():
+        if not isinstance(candidate, dict):
+            continue
+        candidates.append({
+            "identifier": str(candidate.get("identifier") or "").strip(),
+            "label": str(candidate.get("label") or candidate.get("identifier") or "").strip(),
+            "source": str(candidate.get("source") or "").strip(),
+            "description": str(candidate.get("description") or "").strip(),
+            "recommended": bool(candidate.get("recommended")),
+        })
+    return [candidate for candidate in candidates if candidate.get("identifier")]
+
+
+def _starter_pack_item_from_group(group: dict, enabled_skills: list[dict]) -> dict:
+    terms = tuple(str(term).lower() for term in group.get("terms") or ())
+    matches = [
+        skill for skill in enabled_skills
+        if _skill_matches_terms(skill, terms)
+    ]
+    install_candidates = _starter_pack_install_candidates(group)
+    match_names = [str(skill.get("name") or skill.get("path") or "").strip() for skill in matches]
+    readiness_checks = [_skill_setup_readiness(skill) for skill in matches]
+    readiness_issues = []
+    for check in readiness_checks:
+        readiness_issues.extend(check.get("issues") or [])
+    readiness_issues = list(dict.fromkeys(readiness_issues))
+
+    if matches and not readiness_issues:
+        status = "ready"
+        detail = f"Installed via {_joined_labels(match_names)}."
+        ready = True
+    elif matches:
+        status = "attention"
+        detail = (
+            f"Installed via {_joined_labels(match_names)}, but setup is still needed: "
+            f"{_joined_labels(readiness_issues)}."
+        )
+        ready = False
+    else:
+        status = "missing"
+        detail = group.get("description", "").strip() + " Not installed yet."
+        ready = False
+
+    return {
+        "id": group.get("id"),
+        "label": group.get("label"),
+        "kind": "skill",
+        "status": status,
+        "ready": ready,
+        "detail": detail,
+        "matches": match_names,
+        "query": str(group.get("query") or "").strip(),
+        "install_candidates": install_candidates,
+        "setup_notes": [str(note).strip() for note in (group.get("setup_notes") or []) if str(note).strip()],
+        "supports_install": bool(install_candidates),
+        "issues": readiness_issues,
+    }
+
+
+def _memory_runtime_status(raw: dict | None = None) -> dict:
+    raw = raw if raw is not None else cfg.get_raw()
+    memory_cfg = raw.get("memory") if isinstance(raw.get("memory"), dict) else {}
+    cli_toolsets = set(_clean_string_list(((raw.get("platform_toolsets") or {}).get("cli"))))
+    openai_key_source = _runtime_env_source("OPENAI_API_KEY")
+    memory_enabled = bool(memory_cfg.get("memory_enabled"))
+    user_profile_enabled = bool(memory_cfg.get("user_profile_enabled"))
+    cli_tool_enabled = "memory" in cli_toolsets
+    openai_api_key_present = bool(openai_key_source)
+    semantic_search_ready = memory_enabled and cli_tool_enabled and openai_api_key_present
+
+    if not memory_enabled:
+        detail = "Hermes memory is disabled."
+    elif not cli_tool_enabled:
+        detail = "Memory is enabled in config, but the CLI memory tool is not active for chats."
+    elif not openai_api_key_present:
+        detail = "Add OPENAI_API_KEY to the Hermes environment to enable OpenAI-backed memory search."
+    else:
+        detail = "Hermes memory is enabled and can use your OpenAI API key for semantic recall."
+
+    return {
+        "enabled": memory_enabled,
+        "user_profile_enabled": user_profile_enabled,
+        "cli_tool_enabled": cli_tool_enabled,
+        "openai_api_key_present": openai_api_key_present,
+        "openai_api_key_source": openai_key_source,
+        "semantic_search_ready": semantic_search_ready,
+        "detail": detail,
+    }
+
+
+def _chat_runtime_status(raw: dict | None = None, *, skills: list[dict] | None = None) -> dict:
+    raw = raw if raw is not None else cfg.get_raw()
+    skills = copy.deepcopy(skills) if skills is not None else _discover_skill_entries()
+    enabled_skills = [skill for skill in skills if skill.get("enabled") is not False]
+    integrations = _integration_entries(raw)
+    configured_integrations = [item for item in integrations if item.get("configured")]
+    hook_keys = _configured_hook_keys(raw)
+    cli_toolsets = set(_clean_string_list(((raw.get("platform_toolsets") or {}).get("cli"))))
+    memory = _memory_runtime_status(raw)
+
+    active_features = []
+    reasons = []
+    if memory.get("enabled") and memory.get("cli_tool_enabled"):
+        active_features.append("memory")
+        reasons.append("Hermes memory is enabled for chat sessions.")
+    if enabled_skills and "skills" in cli_toolsets:
+        active_features.append("skills")
+        reasons.append(f"{len(enabled_skills)} Hermes skill{'s are' if len(enabled_skills) != 1 else ' is'} enabled.")
+    if configured_integrations:
+        active_features.append("integrations")
+        reasons.append(
+            f"{len(configured_integrations)} integration{'s are' if len(configured_integrations) != 1 else ' is'} configured."
+        )
+    if hook_keys:
+        active_features.append("hooks")
+        reasons.append(f"Hooks are configured: {_joined_labels(hook_keys)}.")
+
+    requires_cli = bool(active_features)
+    if requires_cli:
+        cli_reason = "Hermes CLI is required because " + _joined_labels(active_features) + " " + (
+            "is active."
+            if len(active_features) == 1
+            else "are active."
+        )
+    else:
+        cli_reason = ""
+
+    starter_items = []
+    memory_status = "ready" if memory.get("semantic_search_ready") else ("attention" if memory.get("enabled") else "missing")
+    starter_items.append({
+        "id": "memory",
+        "label": "Memory",
+        "kind": "runtime",
+        "status": memory_status,
+        "ready": bool(memory.get("semantic_search_ready")),
+        "detail": memory.get("detail"),
+        "supports_install": False,
+        "setup_notes": [
+            "OpenAI-backed memory search uses your OPENAI_API_KEY from the Hermes environment.",
+        ],
+    })
+
+    configured_integrations_by_name = {
+        str(item.get("name") or "").strip().lower(): item
+        for item in configured_integrations
+    }
+    for integration_name, integration_label in (("discord", "Discord"), ("whatsapp", "WhatsApp")):
+        integration = configured_integrations_by_name.get(integration_name)
+        starter_items.append({
+            "id": integration_name,
+            "label": integration_label,
+            "kind": "integration",
+            "status": "ready" if integration else "missing",
+            "ready": bool(integration),
+            "detail": (
+                f"{integration_label} integration is configured."
+                if integration
+                else f"{integration_label} is not configured in Hermes yet."
+            ),
+            "supports_install": False,
+            "setup_notes": [
+                f"Configure the {integration_label} block in Hermes config before expecting messages to flow through it.",
+            ],
+        })
+
+    for group in STARTER_PACK_SKILL_GROUPS:
+        starter_items.append(_starter_pack_item_from_group(group, enabled_skills))
+
+    return {
+        "requires_cli": requires_cli,
+        "cli_reason": cli_reason,
+        "reasons": reasons,
+        "active_features": active_features,
+        "memory": memory,
+        "skills": {
+            "detected_count": len(skills),
+            "enabled_count": len(enabled_skills),
+            "tool_enabled": "skills" in cli_toolsets,
+        },
+        "integrations": {
+            "configured_count": len(configured_integrations),
+            "configured_names": [item.get("label") or item.get("name") for item in configured_integrations],
+        },
+        "hooks": {
+            "configured": bool(hook_keys),
+            "keys": hook_keys,
+        },
+        "starter_pack": {
+            "items": starter_items,
+        },
+    }
+
+
+def _validated_transport_preference(value) -> tuple[str | None, str]:
+    normalized = _normalize_transport_preference(value)
+    if normalized != CHAT_TRANSPORT_API:
+        return normalized, ""
+
+    runtime = _chat_runtime_status()
+    if runtime.get("requires_cli"):
+        return CHAT_TRANSPORT_CLI, runtime.get("cli_reason") or "Hermes CLI is required right now."
+    if not _check_api_server():
+        return CHAT_TRANSPORT_CLI, "API replay is unavailable right now, so Hermes CLI will be used."
+    return normalized, ""
 
 
 def _vision_reanalysis_requested(message: str, session: dict) -> bool:
@@ -3037,12 +4203,54 @@ def _chat_backend_error_is_rate_limited(exc: Exception) -> bool:
     )
 
 
+def _chat_backend_error_is_retryable(exc: Exception) -> bool:
+    status_code = int(getattr(exc, "status_code", 502) or 502)
+    if status_code >= 500 or _chat_backend_error_is_rate_limited(exc):
+        return True
+    detail = _chat_backend_error_detail(exc).lower()
+    retryable_terms = (
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "service unavailable",
+        "unreachable",
+        "overloaded",
+        "connection refused",
+        "connection reset",
+        "upstream request failed",
+    )
+    return any(term in detail for term in retryable_terms)
+
+
+def _targets_equivalent(left: dict | None, right: dict | None) -> bool:
+    left = left or {}
+    right = right or {}
+    return (
+        str(left.get("provider") or "").strip().lower(),
+        str(left.get("base_url") or "").strip().rstrip("/"),
+        str(left.get("model") or "").strip(),
+        str(left.get("routing_provider") or "").strip(),
+    ) == (
+        str(right.get("provider") or "").strip().lower(),
+        str(right.get("base_url") or "").strip().rstrip("/"),
+        str(right.get("model") or "").strip(),
+        str(right.get("routing_provider") or "").strip(),
+    )
+
+
 def _chat_completion_request(target: dict, messages: list[dict]) -> str:
     import socket
     import urllib.error
     import urllib.request
 
     payload = {"model": target["model"] or "hermes-agent", "messages": messages, "stream": False}
+    provider_type = str(target.get("provider") or "").strip().lower()
+    routing_provider = str(target.get("routing_provider") or "").strip()
+    if provider_type == "openrouter" and routing_provider:
+        payload["provider"] = {
+            "order": [routing_provider],
+            "allow_fallbacks": True,
+        }
     headers = _api_server_headers(target.get("api_key"), target.get("provider"))
     headers["Content-Type"] = "application/json"
     req = urllib.request.Request(
@@ -3209,19 +4417,27 @@ def _compose_cli_prompt_with_sidecar(
 
 def _plan_chat_request(session: dict, files: list[Path]) -> dict:
     normalized = _normalize_chat_session(copy.deepcopy(session))
-    transport_mode = normalized.get("transport_mode")
+    transport_preference = _normalize_transport_preference(normalized.get("transport_preference"))
     has_image_files = any(f.suffix.lower() in IMAGE_EXTENSIONS for f in files or [])
     image_support, image_reason = _image_attachment_support_status()
     api_server_enabled = _check_api_server()
+    runtime = _chat_runtime_status()
+    notice = normalized.get("transport_notice") or ""
 
-    if transport_mode == CHAT_TRANSPORT_API:
+    if runtime.get("requires_cli"):
+        transport = CHAT_TRANSPORT_CLI
+        notice = runtime.get("cli_reason") or notice
+    elif transport_preference == CHAT_TRANSPORT_API and api_server_enabled:
         transport = CHAT_TRANSPORT_API
-    elif transport_mode == CHAT_TRANSPORT_CLI:
+    elif transport_preference == CHAT_TRANSPORT_API:
+        transport = CHAT_TRANSPORT_CLI
+        notice = "API replay is unavailable right now, so Hermes CLI will be used."
+    elif transport_preference == CHAT_TRANSPORT_CLI:
         transport = CHAT_TRANSPORT_CLI
     else:
         transport = CHAT_TRANSPORT_API if api_server_enabled else CHAT_TRANSPORT_CLI
-
-    notice = normalized.get("transport_notice") or ""
+        if transport == CHAT_TRANSPORT_CLI and transport_preference is None and runtime.get("cli_reason"):
+            notice = runtime.get("cli_reason")
 
     return {
         "transport": transport,
@@ -3231,6 +4447,7 @@ def _plan_chat_request(session: dict, files: list[Path]) -> dict:
         "api_server_enabled": api_server_enabled,
         "transport_notice": notice,
         "use_sidecar_vision": transport == CHAT_TRANSPORT_CLI and has_image_files,
+        "runtime": runtime,
     }
 
 
@@ -3392,29 +4609,37 @@ def _call_api_server(
     target = _resolve_api_target(prefer_vision=use_vision_target)
     try:
         return _chat_completion_request(target, msgs)
-    except ChatBackendError:
-        raise
+    except ChatBackendError as exc:
+        if use_vision_target or not _chat_backend_error_is_retryable(exc):
+            raise
+        fallback_target = _resolve_fallback_api_target()
+        if (
+            not _model_role_enabled("fallback", target=fallback_target)
+            or _targets_equivalent(target, fallback_target)
+        ):
+            raise
+        try:
+            return _chat_completion_request(fallback_target, msgs)
+        except ChatBackendError as fallback_exc:
+            primary_detail = _chat_backend_error_detail(exc) or str(exc)
+            fallback_detail = _chat_backend_error_detail(fallback_exc) or str(fallback_exc)
+            raise ChatBackendError(
+                "Primary chat model failed"
+                f" ({target.get('model') or 'primary'}): {primary_detail}. "
+                "Fallback chat model also failed"
+                f" ({fallback_target.get('model') or 'fallback'}): {fallback_detail}",
+                status_code=max(
+                    int(getattr(exc, "status_code", 502) or 502),
+                    int(getattr(fallback_exc, "status_code", 502) or 502),
+                ),
+            ) from fallback_exc
     except Exception as exc:
         raise ChatBackendError(f"API server error: {exc}") from exc
 
 
 def _provider_env_api_key(provider: str | None) -> str:
-    provider_name = (provider or "").strip().lower()
-    provider_env_map = {
-        "openrouter": "OPENROUTER_API_KEY",
-        "openai": "OPENAI_API_KEY",
-        "openai-codex": "OPENAI_API_KEY",
-        "anthropic": "ANTHROPIC_API_KEY",
-        "groq": "GROQ_API_KEY",
-        "google": "GOOGLE_API_KEY",
-        "gemini": "GOOGLE_API_KEY",
-        "mistral": "MISTRAL_API_KEY",
-        "together": "TOGETHER_API_KEY",
-        "fireworks": "FIREWORKS_API_KEY",
-        "deepseek": "DEEPSEEK_API_KEY",
-        "cohere": "COHERE_API_KEY",
-    }
-    env_key = provider_env_map.get(provider_name)
+    provider_name = _normalize_provider_type(provider or "")
+    env_key = PROVIDER_ENV_KEY_MAP.get(provider_name)
     return _runtime_env_value(env_key, "") if env_key else ""
 
 
@@ -3448,30 +4673,11 @@ def _api_server_headers(api_key: str | None = None, provider: str | None = None)
 
 
 def _resolve_api_target(prefer_vision: bool = False) -> dict:
-    model_cfg = _normalized_model_config()
-    default_target = {
-        "base_url": (_runtime_env_value("HERMES_API_URL", "") or model_cfg.get("base_url") or HERMES_API_URL or "").strip(),
-        "api_key": (model_cfg.get("api_key") or "").strip(),
-        "model": (model_cfg.get("default_model") or "").strip(),
-        "provider": (model_cfg.get("default_provider") or "").strip(),
-    }
-    default_target["api_key"] = _resolved_target_api_key(default_target)
-    if not prefer_vision:
-        return default_target
+    return _resolve_role_target("vision" if prefer_vision else "primary")
 
-    vision_cfg = model_cfg.get("vision")
-    if isinstance(vision_cfg, str) and vision_cfg.strip():
-        merged = dict(default_target)
-        merged["model"] = vision_cfg.strip()
-        return merged
-    if isinstance(vision_cfg, dict):
-        merged = dict(default_target)
-        for key in ("base_url", "api_key", "model", "provider"):
-            if isinstance(vision_cfg.get(key), str) and vision_cfg.get(key).strip():
-                merged[key] = vision_cfg.get(key).strip()
-        merged["api_key"] = _resolved_target_api_key(merged)
-        return merged
-    return default_target
+
+def _resolve_fallback_api_target() -> dict:
+    return _resolve_role_target("fallback")
 
 
 def _openrouter_model_supports_images(target: dict, timeout: int = 3) -> tuple[bool | None, str]:
@@ -3507,6 +4713,60 @@ def _openrouter_model_supports_images(target: dict, timeout: int = 3) -> tuple[b
         return False, f"The configured OpenRouter model {model_id} does not advertise image input support"
 
     return None, f"Could not find model metadata for {model_id} on OpenRouter"
+
+
+def _openrouter_fetch_json(path: str, timeout: int = 10) -> dict:
+    import urllib.request
+
+    req = urllib.request.Request(
+        _build_openai_api_url("https://openrouter.ai/api/v1", path),
+        headers={"User-Agent": "hermes-web-ui"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _openrouter_discovery_models(*, vision_only: bool = False, timeout: int = 10) -> list[dict]:
+    payload = _openrouter_fetch_json("models", timeout=timeout)
+    models = []
+    for item in payload.get("data", []) or []:
+        model_id = str(item.get("id") or "").strip()
+        if not model_id:
+            continue
+        architecture = item.get("architecture") or {}
+        input_modalities = architecture.get("input_modalities") or []
+        modality = str(architecture.get("modality") or "")
+        supports_image = "image" in input_modalities or "image" in modality.lower()
+        if vision_only and not supports_image:
+            continue
+        models.append({
+            "id": model_id,
+            "name": str(item.get("name") or model_id).strip(),
+            "description": str(item.get("description") or "").strip(),
+            "supports_image": supports_image,
+            "input_modalities": input_modalities,
+        })
+    return sorted(models, key=lambda item: item.get("id", ""))
+
+
+def _openrouter_discovery_endpoints(model_id: str, timeout: int = 10) -> list[dict]:
+    import urllib.parse
+
+    encoded_model = urllib.parse.quote(str(model_id or "").strip(), safe="")
+    payload = _openrouter_fetch_json(f"models/{encoded_model}/endpoints", timeout=timeout)
+    data = payload.get("data", payload) if isinstance(payload, dict) else payload
+    endpoints = data.get("endpoints", []) if isinstance(data, dict) else []
+    normalized = []
+    for endpoint in endpoints or []:
+        normalized.append({
+            "provider_name": str(endpoint.get("provider_name") or endpoint.get("name") or "").strip(),
+            "tag": str(endpoint.get("tag") or "").strip(),
+            "status": endpoint.get("status"),
+            "uptime_last_30m": endpoint.get("uptime_last_30m"),
+            "context_length": endpoint.get("context_length"),
+        })
+    return normalized
 
 
 def _summarize_upstream_error_detail(raw_body: str, fallback: str = "") -> str:
@@ -3680,6 +4940,7 @@ def _get_or_create_chat_session(session_id=None):
         "updated": now,
         "hermes_session_id": None,
         "transport_mode": None,
+        "transport_preference": None,
         "continuity_mode": None,
         "transport_notice": "",
         "folder_id": "",
@@ -3709,6 +4970,7 @@ def api_chat():
     data = request.get_json(silent=True) or {}
     message = data.get("message", "").strip()
     session_id = data.get("session_id")
+    requested_transport_preference = _normalize_transport_preference(data.get("transport_preference"))
     requested_folder_id = str(data.get("folder_id") or "").strip()
     request_id = (data.get("request_id") or str(uuid.uuid4())).strip()
     files = []
@@ -3732,6 +4994,10 @@ def api_chat():
     if not message and not files:
         return jsonify({"error": "Message or attachment is required"}), 400
     sess = _get_or_create_chat_session(session_id)
+    if data.get("transport_preference") is not None:
+        validated_preference, preference_notice = _validated_transport_preference(requested_transport_preference)
+        sess["transport_preference"] = validated_preference
+        sess["transport_notice"] = preference_notice or ""
     if requested_folder_id:
         ensured = _ensure_folder_exists(requested_folder_id)
         requested_folder_id = ensured["id"] if ensured else requested_folder_id
@@ -4189,6 +5455,7 @@ def api_chat_sessions_create():
     data = request.get_json() or {}
     session = _get_or_create_chat_session()
     context_update, errors = _parse_chat_context_update(data)
+    transport_preference, transport_notice = _validated_transport_preference(data.get("transport_preference"))
     folder_id = context_update.get("folder_id") or ""
     if folder_id:
         ensured = _ensure_folder_exists(folder_id)
@@ -4197,6 +5464,9 @@ def api_chat_sessions_create():
         _delete_session_from_disk(session["id"])
         return jsonify({"error": "Invalid chat context", "details": errors}), 400
     session.update(context_update)
+    session["transport_preference"] = transport_preference
+    if transport_notice:
+        session["transport_notice"] = transport_notice
     session["updated"] = datetime.now().isoformat()
     _write_session(session)
     return jsonify({
@@ -4252,6 +5522,22 @@ def api_chat_context_update(session_id):
     return jsonify({"ok": True, "session": _chat_session_meta(session)})
 
 
+@app.route("/api/chat/sessions/<session_id>/transport", methods=["PUT"])
+@require_token
+def api_chat_session_transport_update(session_id):
+    session = _load_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    data = request.get_json() or {}
+    requested = str(data.get("transport_preference") or "").strip().lower()
+    if requested not in ("", CHAT_TRANSPORT_AUTO, CHAT_TRANSPORT_CLI, CHAT_TRANSPORT_API):
+        return jsonify({"error": "Invalid transport preference"}), 400
+    session["transport_preference"], session["transport_notice"] = _validated_transport_preference(requested)
+    session["updated"] = datetime.now().isoformat()
+    _write_session(session)
+    return jsonify({"ok": True, "session": _chat_session_meta(session)})
+
+
 @app.route("/api/chat/sessions/<session_id>/folder", methods=["PUT"])
 @require_token
 def api_chat_session_folder_update(session_id):
@@ -4302,6 +5588,8 @@ def api_chat_status():
     image_support, image_reason = _image_attachment_support_status()
     vision_ready, vision_reason = _vision_configured()
     vision_target = _resolve_api_target(prefer_vision=True)
+    runtime = _chat_runtime_status()
+    api_selectable = api_server and not runtime.get("requires_cli")
     return jsonify({
         "api_server": api_server,
         "api_url": _runtime_env_value("HERMES_API_URL", HERMES_API_URL),
@@ -4334,6 +5622,13 @@ def api_chat_status():
             "max_upload_bytes": MAX_UPLOAD_SIZE,
             "max_request_body_bytes": MAX_REQUEST_BODY_SIZE,
         },
+        "transport_policy": {
+            "requires_cli": runtime.get("requires_cli"),
+            "api_selectable": api_selectable,
+            "reason": runtime.get("cli_reason") or "",
+            "reasons": runtime.get("reasons") or [],
+        },
+        "runtime": runtime,
         "readiness": {
             "screenshots_ready": image_support,
             "vision_sidecar_ready": image_support,

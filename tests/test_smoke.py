@@ -29,6 +29,54 @@ class FakeHTTPResponse:
         return False
 
 
+def runtime_status_stub(
+    *,
+    requires_cli=False,
+    cli_reason="",
+    reasons=None,
+    memory=None,
+    skills=None,
+    integrations=None,
+    hooks=None,
+    starter_items=None,
+):
+    return {
+        "requires_cli": requires_cli,
+        "cli_reason": cli_reason,
+        "reasons": list(reasons or []),
+        "active_features": ["memory"] if requires_cli else [],
+        "memory": {
+            "enabled": False,
+            "user_profile_enabled": False,
+            "cli_tool_enabled": False,
+            "openai_api_key_present": False,
+            "openai_api_key_source": "",
+            "semantic_search_ready": False,
+            "detail": "Hermes memory is disabled.",
+            **(memory or {}),
+        },
+        "skills": {
+            "detected_count": 0,
+            "enabled_count": 0,
+            "tool_enabled": False,
+            **(skills or {}),
+        },
+        "integrations": {
+            "configured_count": 0,
+            "configured_names": [],
+            **(integrations or {}),
+        },
+        "hooks": {
+            "configured": False,
+            "keys": [],
+            **(hooks or {}),
+        },
+        "starter_pack": {
+            "items": list(starter_items or []),
+        },
+    }
+
+
 class HermesWebUISmokeTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -217,18 +265,102 @@ class HermesWebUISmokeTests(unittest.TestCase):
              patch.object(mod, "_api_server_probe", return_value=(False, "models probe returned HTTP 401", None)), \
              patch.object(mod, "_image_attachment_support_status", return_value=(False, "OpenAI-compatible image chat API is not reachable")), \
              patch.object(mod, "_vision_configured", return_value=(True, "")), \
-             patch.object(mod, "_resolve_api_target", return_value={"base_url": "https://vision.example.test/v1", "model": "vision-model", "api_key": "secret"}):
+             patch.object(mod, "_resolve_api_target", return_value={"base_url": "https://vision.example.test/v1", "model": "vision-model", "api_key": "secret"}), \
+             patch.object(mod, "_chat_runtime_status", return_value=runtime_status_stub(
+                 requires_cli=True,
+                 cli_reason="Hermes CLI is required because memory is active.",
+                 reasons=["Hermes memory is enabled for chat sessions."],
+                 memory={
+                     "enabled": True,
+                     "cli_tool_enabled": True,
+                     "openai_api_key_present": True,
+                     "semantic_search_ready": True,
+                     "detail": "Hermes memory is enabled and can use your OpenAI API key for semantic recall.",
+                 },
+                 starter_items=[
+                     {"id": "memory", "label": "Memory", "kind": "runtime", "status": "ready", "detail": "ready"},
+                 ],
+             )):
             resp = self.client.get("/api/chat/status", headers=self.headers)
 
         self.assertEqual(resp.status_code, 200, resp.data)
         data = resp.get_json()
         self.assertIn("readiness", data)
+        self.assertIn("runtime", data)
+        self.assertTrue(data["transport_policy"]["requires_cli"])
+        self.assertEqual(data["transport_policy"]["reason"], "Hermes CLI is required because memory is active.")
+        self.assertTrue(data["runtime"]["memory"]["semantic_search_ready"])
         self.assertEqual(data["readiness"]["vision_api_url"], "https://vision.example.test/v1")
         self.assertEqual(data["readiness"]["vision_model"], "vision-model")
         self.assertFalse(data["readiness"]["screenshots_ready"])
         self.assertEqual(data["request_lifecycle"]["server_timeout_seconds"], mod.CHAT_SERVER_TIMEOUT)
         self.assertEqual(data["limits"]["max_upload_bytes"], mod.MAX_UPLOAD_SIZE)
         self.assertEqual(data["limits"]["max_request_body_bytes"], mod.MAX_REQUEST_BODY_SIZE)
+
+    def test_skill_setup_readiness_detects_missing_requirements(self):
+        skill_root = Path(self.tmpdir.name) / "skills"
+        skill_dir = skill_root / "productivity" / "google-workspace"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            """---
+name: google-workspace
+required_credential_files:
+  - path: google_token.json
+prerequisites:
+  env_vars: [GOOGLE_API_KEY]
+metadata:
+  openclaw:
+    requires:
+      bins: [gog]
+---
+""",
+            encoding="utf-8",
+        )
+        skill = {
+            "name": "google-workspace",
+            "path": "productivity/google-workspace",
+            "frontmatter": mod._skill_frontmatter(skill_dir / "SKILL.md"),
+        }
+
+        with patch.object(mod, "SKILLS_DIR", skill_root), \
+             patch.object(mod, "REPO_ENV_PATH", Path(self.tmpdir.name) / "repo.env"), \
+             patch.object(mod, "ENV_PATH", Path(self.tmpdir.name) / "hermes.env"), \
+             patch.dict(mod.os.environ, {}, clear=True), \
+             patch.object(mod.shutil, "which", return_value=None):
+            readiness = mod._skill_setup_readiness(skill)
+
+        self.assertFalse(readiness["ready"])
+        self.assertIn("missing credential file google_token.json", readiness["issues"])
+        self.assertIn("missing env var GOOGLE_API_KEY", readiness["issues"])
+        self.assertIn("missing command gog", readiness["issues"])
+
+    def test_chat_runtime_status_marks_installed_skill_needing_setup_as_attention(self):
+        skill_root = Path(self.tmpdir.name) / "skills"
+        skill_dir = skill_root / "productivity" / "google-workspace"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            """---
+name: google-workspace
+required_credential_files:
+  - path: google_token.json
+  - path: google_client_secret.json
+---
+""",
+            encoding="utf-8",
+        )
+        raw = {
+            "memory": {"memory_enabled": False},
+            "platform_toolsets": {"cli": ["skills"]},
+        }
+        with patch.object(mod, "SKILLS_DIR", skill_root):
+            runtime = mod._chat_runtime_status(raw=raw)
+
+        items = {item["id"]: item for item in runtime["starter_pack"]["items"]}
+        google = items["google_workspace"]
+        self.assertEqual(google["status"], "attention")
+        self.assertTrue(google["supports_install"])
+        self.assertIn("missing credential file google_token.json", google["issues"])
+        self.assertTrue(any(candidate["identifier"] == "skills-sh/steipete/clawdis/gog" for candidate in google["install_candidates"]))
 
     def test_parse_sidecar_payload_extracts_embedded_json_and_normalizes_lists(self):
         raw = """
@@ -572,6 +704,7 @@ Sidecar output:
         image_path.write_bytes(b"\x89PNG\r\n\x1a\nstub")
 
         with patch.object(mod, "_check_api_server", return_value=True), \
+             patch.object(mod, "_chat_runtime_status", return_value=runtime_status_stub()), \
              patch.object(mod, "_image_attachment_support_status", return_value=(True, "")), \
              patch.object(mod, "_call_api_server", return_value="api ok"), \
              patch.object(mod, "_call_hermes_direct", side_effect=AssertionError("CLI should not be used in explicit API mode")), \
@@ -587,6 +720,20 @@ Sidecar output:
         self.assertEqual(session_meta["transport_mode"], "api")
         self.assertEqual(session_meta["continuity_mode"], "local_replay")
         self.assertFalse(session_meta["hermes_session_backed"])
+
+    def test_auto_transport_preference_is_not_sticky_to_last_transport(self):
+        with patch.object(mod, "_check_api_server", return_value=True), \
+             patch.object(mod, "_chat_runtime_status", return_value=runtime_status_stub()), \
+             patch.object(mod, "_image_attachment_support_status", return_value=(False, "")):
+            plan = mod._plan_chat_request(
+                {
+                    "transport_mode": "cli",
+                    "transport_preference": None,
+                },
+                [],
+            )
+
+        self.assertEqual(plan["transport"], "api")
 
     def test_sidecar_failure_does_not_silently_downgrade_thread(self):
         image_path = mod.UPLOAD_FOLDER / "shot.png"
@@ -693,6 +840,86 @@ Sidecar output:
         self.assertEqual(target["provider"], "openrouter")
         self.assertEqual(target["api_key"], "router-secret")
 
+    def test_resolve_api_target_uses_linked_provider_profile(self):
+        mod.cfg._config = {
+            "model": {
+                "default_profile": "router-prod",
+                "default_provider": "openai",
+                "default_model": "openai/gpt-5.4-mini",
+                "base_url": "https://stale.example.test/v1",
+                "api_key": "",
+                "fallback_profile": "router-fallback",
+                "fallback_provider": "openai",
+                "fallback_model": "openai/gpt-4o-mini",
+                "fallback_base_url": "https://stale.example.test/v1",
+                "fallback_api_key": "",
+            },
+            "custom_providers": [
+                {
+                    "name": "router-prod",
+                    "provider": "openrouter",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": "openai/gpt-5.4-mini",
+                    "api_key": "",
+                },
+                {
+                    "name": "router-fallback",
+                    "provider": "openrouter",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": "openai/gpt-4o-mini",
+                    "api_key": "",
+                },
+            ],
+        }
+
+        with patch.dict(mod.os.environ, {"OPENROUTER_API_KEY": "router-secret"}, clear=True):
+            primary = mod._resolve_api_target()
+            fallback = mod._resolve_fallback_api_target()
+
+        self.assertEqual(primary["provider"], "openrouter")
+        self.assertEqual(primary["base_url"], "https://openrouter.ai/api/v1")
+        self.assertEqual(primary["api_key"], "router-secret")
+        self.assertEqual(fallback["provider"], "openrouter")
+        self.assertEqual(fallback["model"], "openai/gpt-4o-mini")
+
+    def test_model_roles_expose_implicit_profile_from_legacy_config(self):
+        mod.cfg._config = {
+            "model": {
+                "provider": "openrouter",
+                "default": "minimax/minimax-m2.7",
+            },
+            "auxiliary": {
+                "vision": {
+                    "provider": "openrouter",
+                    "model": "qwen/qwen3.6-plus:free",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key": "",
+                }
+            },
+        }
+
+        resp = self.client.get("/api/model-roles", headers=self.headers)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        data = resp.get_json()
+        profiles = data["profiles"]
+        self.assertTrue(any(profile["name"] == "openrouter" for profile in profiles))
+        self.assertEqual(data["roles"]["primary"]["profile"], "openrouter")
+        self.assertEqual(data["roles"]["vision"]["profile"], "openrouter")
+
+    def test_resolve_api_target_defaults_known_provider_base_url(self):
+        with patch.dict(mod.os.environ, {"OPENROUTER_API_KEY": "router-secret"}, clear=True):
+            mod.cfg._config = {
+                "model": {
+                    "provider": "openrouter",
+                    "default": "minimax/minimax-m2.7",
+                }
+            }
+            target = mod._resolve_api_target()
+
+        self.assertEqual(target["provider"], "openrouter")
+        self.assertEqual(target["base_url"], "https://openrouter.ai/api/v1")
+        self.assertEqual(target["api_key"], "router-secret")
+
     def test_frontend_source_does_not_contain_python_unicode_escapes(self):
         source = (Path(mod.APP_ROOT) / "static" / "app.js").read_text(encoding="utf-8")
         self.assertNotIn("\\U000", source)
@@ -726,6 +953,95 @@ Sidecar output:
         self.assertEqual(provider["api_key"], "sk-real-secret")
         self.assertEqual(provider["base_url"], "https://example.test/v2")
         self.assertEqual(provider["model"], "demo-model-2")
+
+    def test_provider_update_syncs_linked_primary_role_fields(self):
+        mod.cfg._config = {
+            "model": {
+                "default_profile": "router-prod",
+                "default_provider": "openrouter",
+                "default_model": "openai/gpt-5.4-mini",
+                "base_url": "https://old.example.test/v1",
+                "api_key": "sk-router-secret",
+            },
+            "custom_providers": [
+                {
+                    "name": "router-prod",
+                    "provider": "openrouter",
+                    "base_url": "https://old.example.test/v1",
+                    "model": "openai/gpt-5.4-mini",
+                    "api_key": "sk-router-secret",
+                }
+            ],
+        }
+        masked = mod.cfg.mask_secrets({"api_key": "sk-router-secret"})["api_key"]
+
+        with patch.object(mod.cfg, "save", return_value=None):
+            resp = self.client.put(
+                "/api/providers/router-prod",
+                json={
+                    "provider": "openrouter",
+                    "base_url": "https://new.example.test/v1",
+                    "model": "openai/gpt-5.4",
+                    "api_key": masked,
+                },
+                headers=self.headers,
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(mod.cfg._config["model"]["base_url"], "https://new.example.test/v1")
+        self.assertEqual(mod.cfg._config["model"]["default_provider"], "openrouter")
+        self.assertEqual(mod.cfg._config["model"]["api_key"], "sk-router-secret")
+
+    def test_provider_delete_is_rejected_when_profile_is_in_use(self):
+        mod.cfg._config = {
+            "model": {
+                "default_profile": "demo",
+                "default_provider": "openrouter",
+                "default_model": "text-model",
+            },
+            "custom_providers": [
+                {
+                    "name": "demo",
+                    "provider": "openrouter",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": "text-model",
+                    "api_key": "",
+                }
+            ],
+        }
+
+        resp = self.client.delete("/api/providers/demo", headers=self.headers)
+        self.assertEqual(resp.status_code, 409, resp.data)
+        self.assertIn("Primary Chat", resp.get_json()["error"])
+
+    def test_call_api_server_retries_with_fallback_role(self):
+        seen_models = []
+
+        def fake_completion(target, messages):
+            seen_models.append(target["model"])
+            if len(seen_models) == 1:
+                raise mod.ChatBackendError("API server returned HTTP 503: upstream overloaded", status_code=503)
+            return "fallback ok"
+
+        with patch.object(mod, "_chat_completion_request", side_effect=fake_completion), \
+             patch.object(mod, "_resolve_api_target", return_value={
+                 "provider": "openrouter",
+                 "model": "primary-model",
+                 "base_url": "https://openrouter.ai/api/v1",
+                 "api_key": "secret",
+                 "routing_provider": "",
+             }), \
+             patch.object(mod, "_resolve_fallback_api_target", return_value={
+                 "provider": "openrouter",
+                 "model": "fallback-model",
+                 "base_url": "https://openrouter.ai/api/v1",
+                 "api_key": "secret",
+                 "routing_provider": "",
+             }):
+            result = mod._call_api_server({}, [{"role": "user", "content": "hello"}], "sid-1")
+
+        self.assertEqual(result, "fallback ok")
+        self.assertEqual(seen_models, ["primary-model", "fallback-model"])
 
     def test_config_auxiliary_update_preserves_existing_secret_when_masked_value_is_sent(self):
         mod.cfg._config = {
@@ -802,6 +1118,175 @@ Sidecar output:
         )
         self.assertEqual(resp.status_code, 400, resp.data)
         self.assertEqual(resp.get_json()["error"], "Invalid chat context")
+
+    def test_chat_session_transport_preference_round_trip(self):
+        with patch.object(mod, "_chat_runtime_status", return_value=runtime_status_stub()), \
+             patch.object(mod, "_check_api_server", return_value=True):
+            created = self.client.post(
+                "/api/chat/sessions",
+                json={"transport_preference": "cli"},
+                headers=self.headers,
+            )
+            self.assertEqual(created.status_code, 200, created.data)
+            session_id = created.get_json()["session_id"]
+            self.assertEqual(created.get_json()["session"]["transport_preference"], "cli")
+
+            updated = self.client.put(
+                f"/api/chat/sessions/{session_id}/transport",
+                json={"transport_preference": "api"},
+                headers=self.headers,
+            )
+            self.assertEqual(updated.status_code, 200, updated.data)
+            self.assertEqual(updated.get_json()["session"]["transport_preference"], "api")
+
+            persisted = mod._load_session(session_id)
+            self.assertEqual(persisted["transport_preference"], "api")
+
+            reset = self.client.put(
+                f"/api/chat/sessions/{session_id}/transport",
+                json={"transport_preference": "auto"},
+                headers=self.headers,
+            )
+            self.assertEqual(reset.status_code, 200, reset.data)
+            self.assertEqual(reset.get_json()["session"]["transport_preference"], "auto")
+
+            persisted = mod._load_session(session_id)
+            self.assertIsNone(persisted["transport_preference"])
+
+    def test_transport_preference_clamps_api_when_runtime_requires_cli(self):
+        runtime = runtime_status_stub(
+            requires_cli=True,
+            cli_reason="Hermes CLI is required because memory and skills are active.",
+            reasons=["Hermes memory is enabled for chat sessions.", "2 Hermes skills are enabled."],
+        )
+
+        with patch.object(mod, "_chat_runtime_status", return_value=runtime):
+            created = self.client.post(
+                "/api/chat/sessions",
+                json={"transport_preference": "api"},
+                headers=self.headers,
+            )
+
+        self.assertEqual(created.status_code, 200, created.data)
+        session = created.get_json()["session"]
+        self.assertEqual(session["transport_preference"], "cli")
+        self.assertEqual(session["transport_notice"], "Hermes CLI is required because memory and skills are active.")
+
+    def test_chat_request_forces_cli_when_runtime_requires_it(self):
+        runtime = runtime_status_stub(
+            requires_cli=True,
+            cli_reason="Hermes CLI is required because memory is active.",
+            reasons=["Hermes memory is enabled for chat sessions."],
+        )
+
+        with patch.object(mod, "_chat_runtime_status", return_value=runtime), \
+             patch.object(mod, "_check_api_server", return_value=True), \
+             patch.object(mod, "_image_attachment_support_status", return_value=(False, "")), \
+             patch.object(mod, "_call_hermes_direct", return_value=("cli ok", "hermes-session-1")), \
+             patch.object(mod, "_call_api_server", side_effect=AssertionError("API replay should not be used when CLI is required")):
+            resp = self.client.post(
+                "/api/chat",
+                json={"message": "hello", "transport_preference": "api"},
+                headers=self.headers,
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        session = resp.get_json()["session"]
+        self.assertEqual(session["transport_mode"], "cli")
+        self.assertEqual(session["transport_notice"], "")
+
+    def test_starter_pack_install_endpoint_runs_hermes_install(self):
+        runtime = runtime_status_stub(
+            starter_items=[
+                {
+                    "id": "weather",
+                    "label": "Weather",
+                    "kind": "skill",
+                    "status": "ready",
+                    "ready": True,
+                    "detail": "Installed via Weather.",
+                }
+            ]
+        )
+
+        with patch.object(mod, "_run_hermes", return_value=SimpleNamespace(returncode=0, stdout="installed ok", stderr="")) as run_mock, \
+             patch.object(mod, "_chat_runtime_status", return_value=runtime):
+            resp = self.client.post("/api/starter-pack/weather/install", json={}, headers=self.headers)
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        run_mock.assert_called_once_with("skills", "install", "skills-sh/steipete/clawdis/weather", "--yes", timeout=300)
+        body = resp.get_json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["candidate"]["identifier"], "skills-sh/steipete/clawdis/weather")
+        self.assertEqual(body["item"]["status"], "ready")
+        self.assertTrue(body["setup_notes"])
+
+    def test_starter_pack_install_endpoint_rejects_unknown_candidate(self):
+        resp = self.client.post(
+            "/api/starter-pack/weather/install",
+            json={"identifier": "totally-unknown-skill"},
+            headers=self.headers,
+        )
+        self.assertEqual(resp.status_code, 400, resp.data)
+        self.assertEqual(resp.get_json()["error"], "Unsupported starter-pack install target")
+
+    def test_channels_api_exposes_top_level_integrations(self):
+        mod.cfg._config = {
+            "discord": {
+                "require_mention": True,
+                "free_response_channels": "",
+            },
+            "whatsapp": {},
+        }
+
+        resp = self.client.get("/api/channels", headers=self.headers)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        entries = {
+            item["name"]: item for item in (resp.get_json().get("integrations") or [])
+        }
+        self.assertIn("discord", entries)
+        self.assertIn("whatsapp", entries)
+        self.assertEqual(entries["discord"]["kind"], "integration")
+        self.assertTrue(entries["discord"]["configured"])
+        self.assertFalse(entries["whatsapp"]["configured"])
+
+    def test_channels_update_replaces_top_level_integration_block(self):
+        mod.cfg._config = {
+            "discord": {
+                "require_mention": True,
+                "auto_thread": True,
+            }
+        }
+
+        with patch.object(mod.cfg, "save", return_value=None):
+            resp = self.client.put(
+                "/api/channels/discord",
+                json={"free_response_channels": "general,alerts"},
+                headers=self.headers,
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(
+            mod.cfg._config["discord"],
+            {"free_response_channels": "general,alerts"},
+        )
+
+    def test_onboarding_accepts_top_level_integration_without_channels_map(self):
+        mod.cfg._config = {
+            "model": {
+                "default_provider": "openrouter",
+                "default_model": "openai/gpt-5.4-mini",
+            },
+            "discord": {
+                "require_mention": True,
+            },
+        }
+
+        with patch.dict(mod.os.environ, {"OPENROUTER_API_KEY": "router-secret", "HERMES_WEBUI_TOKEN": "test-token"}, clear=True):
+            resp = self.client.get("/api/onboarding", headers=self.headers)
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertNotIn("channel", resp.get_json()["missing"])
 
     def test_compose_chat_turn_payload_includes_folder_and_source_doc_text(self):
         workspace_root = Path(self.tmpdir.name) / "repo"
