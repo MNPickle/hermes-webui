@@ -356,8 +356,24 @@ def main() -> int:
         ).first
         expect(temp_chat_entry.count() == 1, "Temporary chat did not appear in the folder UI")
         temp_chat_entry.locator(".chat-folder-chat-delete").click()
-        wait(page, 900)
         expect(wait_for_toast(page, "chat deleted"), "Chat deleted toast missing")
+        page.wait_for_function(
+            """
+            ({ folderName, chatName }) => {
+                const cards = [...document.querySelectorAll('.folder-admin-card')];
+                const card = cards.find(item => {
+                    const title = item.querySelector('.folder-admin-title');
+                    return title && (title.textContent || '').trim() === folderName;
+                });
+                if (!card) return false;
+                return ![...card.querySelectorAll('.chat-folder-chat-pill')].some(item =>
+                    (item.textContent || '').trim() === chatName
+                );
+            }
+            """,
+            arg={"folderName": temp_folder_name, "chatName": temp_chat_name},
+            timeout=5000,
+        )
         expect(
             temp_card.locator(".chat-folder-chat-entry").filter(
                 has=page.locator(".chat-folder-chat-pill", has_text=temp_chat_name)
@@ -379,10 +395,18 @@ def main() -> int:
         temp_card.locator('button:has-text("Delete")').click()
         page.wait_for_selector("#modal-overlay.active", timeout=5000)
         page.click('#modal-footer .btn.btn-danger')
-        wait(page, 1000)
         expect(wait_for_toast(page, "folder deleted"), "Folder deleted toast missing")
-        page.click('button[data-screen="folders"]')
-        page.wait_for_selector(".folder-admin-card", timeout=10000)
+        page.wait_for_function(
+            """
+            folderName => {
+                return ![...document.querySelectorAll('.folder-admin-title')].some(item =>
+                    (item.textContent || '').trim() === folderName
+                );
+            }
+            """,
+            arg=temp_folder_name,
+            timeout=5000,
+        )
         expect(
             page.locator(".folder-admin-card").filter(
                 has=page.locator(".folder-admin-title", has_text=temp_folder_name)

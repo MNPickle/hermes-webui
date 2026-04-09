@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## v1.2.0 - 2026-04-09
+
+- Added Hermes update monitoring with installed-version detection, official upstream checks, and explicit state handling for checking, available, in-progress, failed, and unknown-latest cases.
+- Added in-app Hermes update actions with confirmation, live progress/logging, and exact manual commands when direct updating is not supported for the active install method.
+- Added a persistent update card and banner so the dashboard and service views clearly show installed version, update status, update source, and manual remediation steps.
+- Aligned Hermes Web UI with the current Hermes installer layout by preferring the repo-managed `~/.hermes/hermes-agent` install and ignoring stale legacy gateway records.
+- Cleaned up browser validation tooling and deployment guidance so the web UI uses its repo-local virtualenv while Hermes itself is managed from the official repo install.
+
 ## v1.1.0 - 2026-04-07
 
 - Kept Hermes CLI as the canonical browser-chat backend, even when image turns use vision.

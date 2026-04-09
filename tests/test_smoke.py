@@ -2861,8 +2861,8 @@ description: Reviews code carefully.
     def test_release_version_marker_matches_first_stable_release(self):
         template = (mod.APP_ROOT / "templates" / "index.html").read_text(encoding="utf-8")
         script = (mod.APP_ROOT / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("UI v1.1.0", template)
-        self.assertIn("const WEB_UI_VERSION = '1.1.0';", script)
+        self.assertIn("UI v1.2.0", template)
+        self.assertIn("const WEB_UI_VERSION = '1.2.0';", script)
         self.assertNotIn("v0.4.0", template)
 
 

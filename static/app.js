@@ -1,7 +1,7 @@
 /* Hermes Admin Panel - Main Application JavaScript */
 
 const API = { base: '' };
-const WEB_UI_VERSION = '1.1.0';
+const WEB_UI_VERSION = '1.2.0';
 const UI_ICONS = {
     search: '&#128269;',
     books: '&#128218;',
