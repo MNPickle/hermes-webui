@@ -250,8 +250,8 @@ function screenTitle(s) {
     return {
         dashboard: 'Dashboard', settings: 'Settings', 'env-vars': 'Environment Variables',
         folders: 'Folders', service: 'Service Controls', providers: 'Providers', models: 'Models',
-        agents: 'Agents', skills: 'Skills', channels: 'Apps & Integrations',
-        hooks: 'Hooks / Webhooks', cron: 'Cron Jobs', sessions: 'Session Reset', logs: 'Log File Tail', chat: 'Chat'
+        agents: 'Agents', capabilities: 'Create Capability', skills: 'Skills', channels: 'Apps & Integrations',
+        hooks: 'Raw Hooks', cron: 'Cron Jobs', sessions: 'Session Reset', logs: 'Log File Tail', chat: 'Chat'
     }[s] || s;
 }
 
@@ -277,6 +277,10 @@ function navigate(screen) {
 
 function currentScreenId() {
     return document.querySelector('.nav-item.active')?.dataset.screen || 'dashboard';
+}
+
+function screenIsActive(screen) {
+    return currentScreenId() === screen;
 }
 
 function refreshCurrentScreen() {
@@ -1513,28 +1517,51 @@ Screens.agents = async function () {
     const content = document.getElementById('content');
     try {
         const data = await api('GET', '/api/agents');
+        if (!screenIsActive('agents')) return;
         const personalities = data.personalities || {};
         const defaults = data.defaults || {};
+        const entries = Array.isArray(data.entries)
+            ? data.entries
+            : Object.entries(personalities).map(([name, value]) => ({
+                name,
+                kind: 'personality',
+                description: '',
+                system_prompt: typeof value === 'string' ? value : JSON.stringify(value),
+                value,
+            }));
+        const focusPresetName = agentCatalogState.focusNameOnRender || '';
+        const orderedEntries = entries.slice().sort((a, b) => {
+            if (focusPresetName && a.name === focusPresetName && b.name !== focusPresetName) return -1;
+            if (focusPresetName && b.name === focusPresetName && a.name !== focusPresetName) return 1;
+            return 0;
+        });
 
         let html = '<div class="card mb-16"><div class="card-header"><span>Default Agent Settings</span></div><div class="card-body"><div class="form-row">';
         html += '<div class="form-group"><label class="form-label">Max Turns</label><div>' + (defaults.max_turns || '?') + '</div></div>';
         html += '<div class="form-group"><label class="form-label">Reasoning Effort</label><div>' + (defaults.reasoning_effort || '?') + '</div></div>';
         html += '</div></div></div>';
 
-        html += '<div class="section-header"><span>Agents / Personalities</span><button class="btn btn-primary" onclick="addAgent()">+ Add Agent</button></div>';
-        const entries = Object.entries(personalities);
-        if (entries.length === 0) {
+        html += '<div class="section-header"><span>Agents / Personalities</span><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" onclick="openCreateCapability(\'agent_preset\')">Create Agent Preset</button><button class="btn btn-primary" onclick="addAgent()">+ Add Agent</button></div></div>';
+        if (orderedEntries.length === 0) {
             html += '<div class="empty-state"><p>No agents configured</p></div>';
         } else {
             html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px">';
-            entries.forEach(([name, prompt]) => {
-                html += '<div class="card"><div class="card-header"><span>' + escH(name) + '</span></div><div class="card-body"><p class="text-sm text-muted" style="max-height:80px;overflow:hidden">' + escH(typeof prompt === 'string' ? prompt.substring(0, 150) + (prompt.length > 150 ? '...' : '') : JSON.stringify(prompt).substring(0, 150)) + '</p>';
-                html += '<div class="mt-16" style="display:flex;gap:8px"><button class="btn btn-sm" onclick="editAgent(\'' + escA(name) + '\')">Edit</button><button class="btn btn-sm" onclick="duplicateAgent(\'' + escA(name) + '\')">Duplicate</button><button class="btn btn-sm btn-danger" onclick="deleteAgent(\'' + escA(name) + '\')">Delete</button></div></div></div>';
+            orderedEntries.forEach(entry => {
+                const preview = (entry.description || entry.system_prompt || '').trim();
+                const recent = !!agentCatalogState.recentNames[entry.name || ''];
+                html += '<div class="card" id="' + escA(agentElementId(entry.name || '')) + '"><div class="card-header"><span>' + escH(entry.name || '') + '</span><div style="display:flex;gap:8px;flex-wrap:wrap"><span class="badge ' + (entry.kind === 'agent_preset' ? 'badge-info' : 'badge-secondary') + '">' + escH(entry.kind === 'agent_preset' ? 'Preset' : 'Personality') + '</span>' + (recent ? '<span class="badge badge-success">New</span>' : '') + '</div></div><div class="card-body">';
+                html += '<p class="text-sm text-muted" style="max-height:80px;overflow:hidden">' + escH(preview.substring(0, 150) + (preview.length > 150 ? '...' : '')) + '</p>';
+                html += '<div class="mt-16" style="display:flex;gap:8px"><button class="btn btn-sm" onclick="editAgent(\'' + escA(entry.name || '') + '\')">Edit</button><button class="btn btn-sm" onclick="duplicateAgent(\'' + escA(entry.name || '') + '\')">Duplicate</button><button class="btn btn-sm btn-danger" onclick="deleteAgent(\'' + escA(entry.name || '') + '\')">Delete</button></div></div></div>';
             });
             html += '</div>';
         }
         content.innerHTML = html;
+        if (focusPresetName) {
+            agentCatalogState.focusNameOnRender = '';
+            requestAnimationFrame(() => focusInventoryCardById(agentElementId(focusPresetName)));
+        }
     } catch (e) {
+        if (!screenIsActive('agents')) return;
         content.innerHTML = '<div class="empty-state"><div class="empty-icon">\u26a0\ufe0f</div><h3>Error</h3><p>' + escH(e.message) + '</p></div>';
     }
 };
@@ -1542,7 +1569,7 @@ Screens.agents = async function () {
 window.agentModal = function (title, name, prompt, nameReadonly, saveFn) {
     showModal(title,
         '<div class="form-group"><label class="form-label">Name</label>' + inputH('agent-name', name, 'text', '', nameReadonly ? 'disabled' : '') + '</div>' +
-        '<div class="form-group"><label class="form-label">Prompt / Instructions</label>' + textareaH('agent-prompt', prompt, 8) + '</div>',
+        '<div class="form-group"><label class="form-label">System Prompt / Instructions</label>' + textareaH('agent-prompt', prompt, 8) + '</div>',
         '<button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="' + saveFn + '">Save</button>'
     );
 };
@@ -1550,7 +1577,9 @@ window.addAgent = function () { window.agentModal('Add Agent', '', '', false, 's
 window.editAgent = async function (name) {
     try {
         const data = await api('GET', '/api/agents');
-        const prompt = (data.personalities || {})[name];
+        const entries = Array.isArray(data.entries) ? data.entries : [];
+        const entry = entries.find(item => item.name === name) || null;
+        const prompt = entry ? (entry.system_prompt || '') : '';
         window.agentModal('Edit Agent: ' + name, name, prompt, true, 'saveEditAgent()');
     } catch (e) { toast('Error: ' + e.message, 'error'); }
 };
@@ -1558,13 +1587,13 @@ window.saveNewAgent = async function () {
     const name = document.getElementById('agent-name').value.trim();
     const prompt = document.getElementById('agent-prompt').value;
     if (!name) { toast('Name required', 'error'); return; }
-    try { await api('POST', '/api/agents', { name, prompt }); toast('Agent created', 'success'); closeModal(); Screens.agents(); }
+    try { await api('POST', '/api/agents', { name, system_prompt: prompt }); toast('Agent created', 'success'); closeModal(); Screens.agents(); }
     catch (e) { toast('Error: ' + e.message, 'error'); }
 };
 window.saveEditAgent = async function () {
     const name = document.getElementById('agent-name').value.trim();
     const prompt = document.getElementById('agent-prompt').value;
-    try { await api('PUT', '/api/agents/' + name, { prompt }); toast('Agent updated', 'success'); closeModal(); Screens.agents(); }
+    try { await api('PUT', '/api/agents/' + name, { system_prompt: prompt }); toast('Agent updated', 'success'); closeModal(); Screens.agents(); }
     catch (e) { toast('Error: ' + e.message, 'error'); }
 };
 window.duplicateAgent = function (name) {
@@ -1601,6 +1630,914 @@ function starterPackBadgeLabel(status) {
     return 'Missing';
 }
 
+const capabilityBuilderState = {
+    catalog: null,
+    selectedType: 'skill',
+    drafts: {},
+    previews: {},
+    lastCreated: null,
+    focusBuilderOnRender: false,
+    focusPreviewOnRender: false,
+};
+
+function capabilityContext() {
+    return (capabilityBuilderState.catalog || {}).context || {};
+}
+
+function capabilityClone(value) {
+    if (value === null || value === undefined) return value;
+    return JSON.parse(JSON.stringify(value));
+}
+
+function defaultSkillCapabilityDraft() {
+    return {
+        name: '',
+        slug: '',
+        category: '',
+        description: '',
+        instructions: '',
+        env_vars: [],
+        credential_files: [],
+        required_commands: [],
+        include_scripts: false,
+        include_references: false,
+    };
+}
+
+function capabilityIntegrationOptions() {
+    return Array.isArray(capabilityContext().integration_options) ? capabilityContext().integration_options : [];
+}
+
+function capabilityProfileList() {
+    return Array.isArray(capabilityContext().provider_profiles) ? capabilityContext().provider_profiles : [];
+}
+
+function capabilitySkillList() {
+    return Array.isArray(capabilityContext().skills) ? capabilityContext().skills : [];
+}
+
+function capabilityDefaultIntegrationOption(kind = '') {
+    const options = capabilityIntegrationOptions();
+    return options.find(item => item && item.name === kind) || options[0] || {
+        name: kind || 'discord',
+        label: kind || 'discord',
+        config_template: {},
+        suggested_env_vars: [],
+    };
+}
+
+function defaultIntegrationCapabilityDraft(kind = '') {
+    const option = capabilityDefaultIntegrationOption(kind);
+    const template = capabilityClone(option.config_template || option.config || {}) || {};
+    return {
+        kind: option.name || kind || 'discord',
+        config: JSON.stringify(template, null, 2),
+        env_vars: (option.suggested_env_vars || []).map(item => ({
+            key: item.key || '',
+            label: item.label || '',
+            group: item.group || 'Channel',
+            description: item.description || '',
+            value: '',
+        })),
+    };
+}
+
+function defaultAgentPresetDraft() {
+    const context = capabilityContext();
+    const roles = context.model_roles || {};
+    const defaults = context.agent_defaults || {};
+    return {
+        name: '',
+        description: '',
+        system_prompt: '',
+        roles: {
+            primary: {
+                enabled: true,
+                profile: ((roles.primary || {}).profile) || '',
+                model: ((roles.primary || {}).model) || '',
+                routing_provider: ((roles.primary || {}).routing_provider) || '',
+            },
+            fallback: {
+                enabled: !!((roles.fallback || {}).enabled),
+                profile: ((roles.fallback || {}).profile) || '',
+                model: ((roles.fallback || {}).model) || '',
+                routing_provider: ((roles.fallback || {}).routing_provider) || '',
+            },
+            vision: {
+                enabled: !!((roles.vision || {}).enabled),
+                profile: ((roles.vision || {}).profile) || '',
+                model: ((roles.vision || {}).model) || '',
+                routing_provider: ((roles.vision || {}).routing_provider) || '',
+            },
+        },
+        skills: [],
+        integrations: [],
+        reasoning_effort: (defaults.reasoning_effort || ''),
+        max_turns: defaults.max_turns || '',
+    };
+}
+
+function capabilitySlugify(value) {
+    return String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+}
+
+function capabilityCatalogType(type) {
+    return ((capabilityBuilderState.catalog || {}).types || []).find(item => item && item.id === type) || {
+        id: type,
+        label: type,
+        status: 'planned',
+        phase: '',
+        summary: '',
+        data_model: [],
+        ui_flow: [],
+        layout: [],
+        mvp_scope: [],
+    };
+}
+
+function capabilityDraft(type = capabilityBuilderState.selectedType) {
+    if (!capabilityBuilderState.drafts[type]) {
+        if (type === 'skill') capabilityBuilderState.drafts[type] = defaultSkillCapabilityDraft();
+        else if (type === 'integration') capabilityBuilderState.drafts[type] = defaultIntegrationCapabilityDraft();
+        else if (type === 'agent_preset') capabilityBuilderState.drafts[type] = defaultAgentPresetDraft();
+        else capabilityBuilderState.drafts[type] = {};
+    }
+    return capabilityBuilderState.drafts[type];
+}
+
+function capabilityPreview(type = capabilityBuilderState.selectedType) {
+    return capabilityBuilderState.previews[type] || null;
+}
+
+function clearCapabilityPreview(type = capabilityBuilderState.selectedType) {
+    delete capabilityBuilderState.previews[type];
+    if (capabilityBuilderState.lastCreated && capabilityBuilderState.lastCreated.type === type) {
+        capabilityBuilderState.lastCreated = null;
+    }
+}
+
+function capabilityStatusBadgeClass(status) {
+    if (status === 'active') return 'badge-success';
+    if (status === 'planned') return 'badge-info';
+    return 'badge-secondary';
+}
+
+function capabilityStatusLabel(statusLabel, status) {
+    return statusLabel || (status === 'active' ? 'Active' : (status === 'planned' ? 'Planned Next' : 'Preview'));
+}
+
+function capabilitySelectButtonClass(type) {
+    return capabilityBuilderState.selectedType === type ? 'btn btn-primary' : 'btn';
+}
+
+function captureCapabilityEditorState() {
+    const content = document.getElementById('content');
+    const active = document.activeElement;
+    if (!active || !active.id) {
+        return {
+            scrollX: window.scrollX || 0,
+            scrollY: window.scrollY || 0,
+            contentScrollTop: content ? content.scrollTop : 0,
+            contentScrollLeft: content ? content.scrollLeft : 0,
+        };
+    }
+    const canRestoreSelection = typeof active.selectionStart === 'number' && typeof active.selectionEnd === 'number';
+    return {
+        id: active.id,
+        selectionStart: canRestoreSelection ? active.selectionStart : null,
+        selectionEnd: canRestoreSelection ? active.selectionEnd : null,
+        scrollX: window.scrollX || 0,
+        scrollY: window.scrollY || 0,
+        contentScrollTop: content ? content.scrollTop : 0,
+        contentScrollLeft: content ? content.scrollLeft : 0,
+    };
+}
+
+function restoreCapabilityEditorState(state) {
+    if (!state) return;
+    const scrollX = Number.isFinite(state.scrollX) ? state.scrollX : 0;
+    const scrollY = Number.isFinite(state.scrollY) ? state.scrollY : 0;
+    const contentScrollTop = Number.isFinite(state.contentScrollTop) ? state.contentScrollTop : 0;
+    const contentScrollLeft = Number.isFinite(state.contentScrollLeft) ? state.contentScrollLeft : 0;
+    const restore = () => {
+        const content = document.getElementById('content');
+        if (content) {
+            content.scrollTop = contentScrollTop;
+            content.scrollLeft = contentScrollLeft;
+        }
+        const el = state.id ? document.getElementById(state.id) : null;
+        if (el && typeof el.focus === 'function') {
+            try { el.focus({ preventScroll: true }); }
+            catch (e) { el.focus(); }
+            if (typeof state.selectionStart === 'number' && typeof state.selectionEnd === 'number' && typeof el.setSelectionRange === 'function') {
+                try { el.setSelectionRange(state.selectionStart, state.selectionEnd); } catch (e) { /* ignore */ }
+            }
+        }
+        if (content) {
+            content.scrollTop = contentScrollTop;
+            content.scrollLeft = contentScrollLeft;
+        }
+        window.scrollTo(scrollX, scrollY);
+    };
+    requestAnimationFrame(restore);
+}
+
+function focusCapabilityBuilder() {
+    const target = document.getElementById('capability-builder-anchor');
+    if (!target) return;
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function focusCapabilityPreview() {
+    const target = document.getElementById('capability-preview-actions') || document.getElementById('capability-preview-anchor');
+    if (!target) return;
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    const approveButton = document.getElementById('capability-approve-button');
+    if (approveButton && typeof approveButton.focus === 'function') {
+        try { approveButton.focus({ preventScroll: true }); }
+        catch (e) { approveButton.focus(); }
+    }
+}
+
+function resetCapabilityDraftState(type = capabilityBuilderState.selectedType) {
+    if (type === 'skill') capabilityBuilderState.drafts.skill = defaultSkillCapabilityDraft();
+    else if (type === 'integration') capabilityBuilderState.drafts.integration = defaultIntegrationCapabilityDraft();
+    else if (type === 'agent_preset') capabilityBuilderState.drafts.agent_preset = defaultAgentPresetDraft();
+    clearCapabilityPreview(type);
+}
+
+function renderCapabilityBulletCard(title, items) {
+    const list = Array.isArray(items) ? items.filter(Boolean) : [];
+    if (!list.length) return '';
+    return '<div class="card"><div class="card-header"><span>' + escH(title) + '</span></div><div class="card-body"><ul class="plain-list">' +
+        list.map(item => '<li>' + escH(item) + '</li>').join('') +
+        '</ul></div></div>';
+}
+
+function renderCapabilityLayoutCard(items) {
+    const list = Array.isArray(items) ? items : [];
+    if (!list.length) return '';
+    return '<div class="card"><div class="card-header"><span>File / Config Layout</span></div><div class="card-body"><div class="capability-layout-list">' +
+        list.map(item =>
+            '<div class="capability-layout-item">' +
+                '<div class="capability-layout-kind">' + escH((item.kind || 'item').toUpperCase()) + '</div>' +
+                '<div class="font-mono text-sm">' + escH(item.path || '') + '</div>' +
+                '<div class="capability-layout-detail">' + escH(item.purpose || '') + '</div>' +
+            '</div>'
+        ).join('') +
+        '</div></div></div>';
+}
+
+function renderCapabilityOverview(catalog) {
+    let html = '<div class="capability-overview-grid">';
+    html += renderCapabilityBulletCard('Architecture Rules', catalog.architecture_rules || []);
+    html += renderCapabilityBulletCard('MVP Scope', catalog.mvp_scope || []);
+    html += renderCapabilityBulletCard('Implementation Order', catalog.recommended_order || []);
+    html += '</div>';
+    return html;
+}
+
+function renderCapabilityTypeCards() {
+    const types = ((capabilityBuilderState.catalog || {}).types || []);
+    return '<div class="capability-type-grid">' + types.map(type =>
+        '<button class="capability-type-card' + (capabilityBuilderState.selectedType === type.id ? ' active' : '') + '" onclick="selectCapabilityType(\'' + escA(type.id) + '\')">' +
+            '<div class="capability-type-card-top"><div class="capability-type-title">' + escH(type.label || type.id) + '</div>' +
+            '<span class="badge ' + capabilityStatusBadgeClass(type.status) + '">' + escH(capabilityStatusLabel(type.status_label, type.status)) + '</span></div>' +
+            '<div class="capability-type-phase">' + escH(type.phase || '') + '</div>' +
+            '<div class="capability-type-summary">' + escH(type.summary || '') + '</div>' +
+        '</button>'
+    ).join('') + '</div>';
+}
+
+function renderCapabilityCreatedCard(type) {
+    const created = capabilityBuilderState.lastCreated;
+    if (!created || created.type !== type) return '';
+    const title = type === 'integration' ? 'Integration Created' : type === 'agent_preset' ? 'Agent Preset Created' : 'Skill Created';
+    const target = created.kind || created.slug || created.name || '';
+    const openAction = type === 'skill'
+        ? 'openCreatedSkillInventory(\'' + escA(created.slug || created.path || '') + '\')'
+        : (type === 'integration'
+            ? 'openCreatedIntegrationInventory(\'' + escA(created.kind || created.name || '') + '\')'
+            : 'openCreatedAgentInventory(\'' + escA(created.name || '') + '\')');
+    const openLabel = type === 'integration' ? 'Apps & Integrations' : type === 'agent_preset' ? 'Agents' : 'Skills';
+    return '<div class="card mb-16 capability-created-card"><div class="card-header"><span>' + escH(title) + '</span><span class="badge badge-success">Saved</span></div><div class="card-body">' +
+        '<p class="text-sm text-secondary mb-12"><span class="font-mono">' + escH(target) + '</span> was written to <span class="font-mono">' + escH(created.target_dir || '') + '</span>.</p>' +
+        '<div class="capability-builder-actions"><button class="btn btn-primary" onclick="' + openAction + '">Open ' + escH(openLabel) + '</button><button class="btn" onclick="clearCreatedCapabilityNotice()">Create Another</button></div>' +
+        '</div></div>';
+}
+
+function capabilityEnvVarRowH(entry, index) {
+    const groupOptions = Object.keys(envVarsState.groupHelp || { Provider: true, Channel: true, System: true });
+    return '<div class="capability-list-row">' +
+        '<div class="form-group"><label class="form-label">Key</label>' + inputH('capability-env-key-' + index, entry.key || '', 'text', 'OPENAI_API_KEY', 'oninput="updateCapabilityListItem(\'env_vars\', ' + index + ', \'key\', this.value)"') + '</div>' +
+        '<div class="form-group"><label class="form-label">Label</label>' + inputH('capability-env-label-' + index, entry.label || '', 'text', 'OpenAI API Key', 'oninput="updateCapabilityListItem(\'env_vars\', ' + index + ', \'label\', this.value)"') + '</div>' +
+        '<div class="form-group"><label class="form-label">Group</label>' + selectH('capability-env-group-' + index, groupOptions, entry.group || 'Provider', 'capability-env-group-' + index).replace('<select', '<select onchange="updateCapabilityListItem(\'env_vars\', ' + index + ', \'group\', this.value)"') + '</div>' +
+        '<div class="form-group capability-list-wide"><label class="form-label">Description</label>' + inputH('capability-env-description-' + index, entry.description || '', 'text', 'What this variable is used for', 'oninput="updateCapabilityListItem(\'env_vars\', ' + index + ', \'description\', this.value)"') + '</div>' +
+        '<div class="form-group capability-inline-action"><label class="form-label">Remove</label><button class="btn btn-sm btn-danger" onclick="removeCapabilityListItem(\'env_vars\', ' + index + ')">Remove</button></div>' +
+    '</div>';
+}
+
+function capabilityCredentialRowH(entry, index) {
+    return '<div class="capability-list-row">' +
+        '<div class="form-group"><label class="form-label">Relative Path</label>' + inputH('capability-file-path-' + index, entry.path || '', 'text', 'credentials/client.json', 'oninput="updateCapabilityListItem(\'credential_files\', ' + index + ', \'path\', this.value)"') + '</div>' +
+        '<div class="form-group"><label class="form-label">Label</label>' + inputH('capability-file-label-' + index, entry.label || '', 'text', 'Google OAuth Client', 'oninput="updateCapabilityListItem(\'credential_files\', ' + index + ', \'label\', this.value)"') + '</div>' +
+        '<div class="form-group capability-list-wide"><label class="form-label">Description</label>' + inputH('capability-file-description-' + index, entry.description || '', 'text', 'Expected credential file', 'oninput="updateCapabilityListItem(\'credential_files\', ' + index + ', \'description\', this.value)"') + '</div>' +
+        '<div class="form-group capability-inline-action"><label class="form-label">Remove</label><button class="btn btn-sm btn-danger" onclick="removeCapabilityListItem(\'credential_files\', ' + index + ')">Remove</button></div>' +
+    '</div>';
+}
+
+function capabilityCommandRowH(entry, index) {
+    return '<div class="capability-list-row">' +
+        '<div class="form-group"><label class="form-label">Command</label>' + inputH('capability-command-name-' + index, entry.name || '', 'text', 'uv', 'oninput="updateCapabilityListItem(\'required_commands\', ' + index + ', \'name\', this.value)"') + '</div>' +
+        '<div class="form-group capability-list-wide"><label class="form-label">Description</label>' + inputH('capability-command-description-' + index, entry.description || '', 'text', 'Why Hermes needs this command', 'oninput="updateCapabilityListItem(\'required_commands\', ' + index + ', \'description\', this.value)"') + '</div>' +
+        '<div class="form-group capability-inline-action"><label class="form-label">Remove</label><button class="btn btn-sm btn-danger" onclick="removeCapabilityListItem(\'required_commands\', ' + index + ')">Remove</button></div>' +
+    '</div>';
+}
+
+function capabilityIntegrationEnvVarRowH(entry, index) {
+    const groupOptions = Object.keys(envVarsState.groupHelp || { Provider: true, Channel: true, System: true });
+    return '<div class="capability-list-row">' +
+        '<div class="form-group"><label class="form-label">Key</label>' + inputH('capability-int-env-key-' + index, entry.key || '', 'text', 'DISCORD_TOKEN', 'oninput="updateCapabilityListItem(\'env_vars\', ' + index + ', \'key\', this.value)"') + '</div>' +
+        '<div class="form-group"><label class="form-label">Label</label>' + inputH('capability-int-env-label-' + index, entry.label || '', 'text', 'Discord Token', 'oninput="updateCapabilityListItem(\'env_vars\', ' + index + ', \'label\', this.value)"') + '</div>' +
+        '<div class="form-group"><label class="form-label">Group</label>' + selectH('capability-int-env-group-' + index, groupOptions, entry.group || 'Channel', 'capability-int-env-group-' + index).replace('<select', '<select onchange="updateCapabilityListItem(\'env_vars\', ' + index + ', \'group\', this.value)"') + '</div>' +
+        '<div class="form-group"><label class="form-label">Value</label>' + inputH('capability-int-env-value-' + index, entry.value || '', 'text', 'Paste the token or secret', 'oninput="updateCapabilityListItem(\'env_vars\', ' + index + ', \'value\', this.value)"') + '</div>' +
+        '<div class="form-group capability-list-wide"><label class="form-label">Description</label>' + inputH('capability-int-env-description-' + index, entry.description || '', 'text', 'What this variable is used for', 'oninput="updateCapabilityListItem(\'env_vars\', ' + index + ', \'description\', this.value)"') + '</div>' +
+        '<div class="form-group capability-inline-action"><label class="form-label">Remove</label><button class="btn btn-sm btn-danger" onclick="removeCapabilityListItem(\'env_vars\', ' + index + ')">Remove</button></div>' +
+    '</div>';
+}
+
+function renderCapabilityListSection(title, key, rows, emptyText, addLabel) {
+    const list = rows || [];
+    let html = '<div class="card"><div class="card-header"><span>' + escH(title) + '</span><button class="btn btn-sm" onclick="addCapabilityListItem(\'' + escA(key) + '\')">' + escH(addLabel) + '</button></div><div class="card-body">';
+    if (!list.length) {
+        html += '<div class="empty-state capability-empty-inline"><p>' + escH(emptyText) + '</p></div>';
+    } else {
+        html += list.join('');
+    }
+    html += '</div></div>';
+    return html;
+}
+
+function renderCapabilitySelectionCard(title, key, items, selectedValues, emptyText) {
+    const list = Array.isArray(items) ? items : [];
+    const selected = new Set(Array.isArray(selectedValues) ? selectedValues : []);
+    let html = '<div class="card"><div class="card-header"><span>' + escH(title) + '</span></div><div class="card-body">';
+    if (!list.length) {
+        html += '<div class="empty-state capability-empty-inline"><p>' + escH(emptyText) + '</p></div>';
+    } else {
+        html += '<div class="capability-layout-list">';
+        list.forEach(item => {
+            const value = item.path || item.name || '';
+            const label = item.name || item.label || value;
+            const detailParts = [];
+            if (item.description) detailParts.push(item.description);
+            if (item.provider_label) detailParts.push(item.provider_label);
+            if (item.configured === false) detailParts.push('Not configured yet');
+            if (item.enabled === false) detailParts.push('Disabled');
+            if (item.ready === false) detailParts.push('Needs setup');
+            html += '<label class="capability-layout-item" style="display:block;cursor:pointer">' +
+                '<div style="display:flex;gap:12px;align-items:flex-start">' +
+                    '<input type="checkbox" ' + (selected.has(value) ? 'checked ' : '') + 'onchange="toggleCapabilitySelection(\'' + escA(key) + '\', \'' + escA(value) + '\', this.checked)">' +
+                    '<div style="flex:1 1 auto">' +
+                        '<div class="capability-layout-kind">' + escH(label) + '</div>' +
+                        '<div class="font-mono text-sm">' + escH(value) + '</div>' +
+                        (detailParts.length ? '<div class="capability-layout-detail">' + escH(detailParts.join(' • ')) + '</div>' : '') +
+                    '</div>' +
+                '</div>' +
+            '</label>';
+        });
+        html += '</div>';
+    }
+    html += '</div></div>';
+    return html;
+}
+
+function renderAgentRoleCard(role, entry, profiles) {
+    const meta = (MODEL_ROLE_META && MODEL_ROLE_META[role]) || { title: role, description: '' };
+    const options = [{ value: '', label: 'Choose profile' }].concat((profiles || []).map(profile => ({
+        value: profile.name || '',
+        label: (profile.name || '') + ((profile.provider_label || profile.provider) ? ' (' + (profile.provider_label || profile.provider) + ')' : ''),
+    })));
+    let html = '<div class="card mb-16"><div class="card-header"><span>' + escH(meta.title || role) + '</span>';
+    if (role !== 'primary') {
+        html += '<label class="skill-select-toggle"><input type="checkbox" ' + (entry.enabled ? 'checked ' : '') + 'onchange="updateCapabilityRoleField(\'' + escA(role) + '\', \'enabled\', this.checked)"><span>Enabled</span></label>';
+    } else {
+        html += '<span class="badge badge-success">Required</span>';
+    }
+    html += '</div><div class="card-body">';
+    if (meta.description) {
+        html += '<p class="text-sm text-secondary mb-12">' + escH(meta.description) + '</p>';
+    }
+    html += '<div class="capability-form-grid">';
+    html += '<div class="form-group"><label class="form-label">Provider Profile</label>' + selectH('capability-role-profile-' + role, options, entry.profile || '', 'capability-role-profile-' + role).replace('<select', '<select onchange="updateCapabilityRoleField(\'' + escA(role) + '\', \'profile\', this.value)"') + '</div>';
+    html += '<div class="form-group"><label class="form-label">Model</label>' + inputH('capability-role-model-' + role, entry.model || '', 'text', 'openai/gpt-5.4-mini', 'oninput="updateCapabilityRoleField(\'' + escA(role) + '\', \'model\', this.value)"') + '</div>';
+    html += '<div class="form-group"><label class="form-label">Routing Provider</label>' + inputH('capability-role-routing-' + role, entry.routing_provider || '', 'text', 'Optional OpenRouter endpoint provider', 'oninput="updateCapabilityRoleField(\'' + escA(role) + '\', \'routing_provider\', this.value)"') + '</div>';
+    html += '</div></div></div>';
+    return html;
+}
+
+function renderSkillCapabilityBuilder(typeMeta) {
+    const draft = capabilityDraft('skill');
+    const preview = capabilityPreview('skill');
+    const skillPreview = ((preview || {}).manifest || {}).skill || {};
+    const setup = skillPreview.setup || {};
+    const blockers = Array.isArray(setup.blockers) ? setup.blockers : [];
+    const writes = Array.isArray((preview || {}).writes) ? preview.writes : [];
+    const markdownWrite = writes.find(item => item && item.kind === 'file' && item.content);
+    const suggestedSlug = capabilitySlugify(draft.name || '');
+
+    let html = '<div class="card mb-16"><div class="card-header"><span>' + escH(typeMeta.label || 'Create Skill') + '</span><span class="badge badge-success">' + escH(typeMeta.phase || 'Phase 1') + '</span></div><div class="card-body">';
+    html += '<p class="text-sm text-secondary mb-16">Phase 1 is live for skills. The draft stays local until you preview it, and nothing is written until you approve the exact generated output.</p>';
+    html += '</div></div>';
+    html += '<div class="capability-builder-grid">';
+    html += '<div class="capability-builder-column">';
+    html += '<div class="card mb-16"><div class="card-header"><span>Skill Draft</span></div><div class="card-body">';
+    html += '<div class="capability-form-grid">';
+    html += '<div class="form-group"><label class="form-label">Name</label>' + inputH('capability-skill-name', draft.name || '', 'text', 'Google Workspace Helper', 'oninput="updateCapabilityDraftField(\'name\', this.value)"') + '</div>';
+    html += '<div class="form-group"><label class="form-label">Slug</label>' + inputH('capability-skill-slug', draft.slug || '', 'text', suggestedSlug || 'google-workspace-helper', 'oninput="updateCapabilityDraftField(\'slug\', this.value)"') + '<div class="capability-field-note">Stored under <span class="font-mono">~/.hermes/skills/' + escH(draft.slug || suggestedSlug || '<slug>') + '/</span></div></div>';
+    html += '<div class="form-group"><label class="form-label">Category</label>' + inputH('capability-skill-category', draft.category || '', 'text', 'productivity', 'oninput="updateCapabilityDraftField(\'category\', this.value)"') + '</div>';
+    html += '<div class="form-group capability-list-wide"><label class="form-label">Description</label>' + textareaH('capability-skill-description', draft.description || '', 3, false).replace('<textarea', '<textarea oninput="updateCapabilityDraftField(\'description\', this.value)"') + '</div>';
+    html += '<div class="form-group capability-list-wide"><label class="form-label">Instructions</label>' + textareaH('capability-skill-instructions', draft.instructions || '', 10, false).replace('<textarea', '<textarea oninput="updateCapabilityDraftField(\'instructions\', this.value)"') + '<div class="capability-field-note">This becomes the main body of <span class="font-mono">SKILL.md</span>.</div></div>';
+    html += '</div>';
+    html += '<div class="capability-toggle-row">';
+    html += '<label class="skill-select-toggle"><input type="checkbox" ' + (draft.include_scripts ? 'checked ' : '') + 'onchange="updateCapabilityDraftField(\'include_scripts\', this.checked)"><span>Include <span class="font-mono">scripts/</span></span></label>';
+    html += '<label class="skill-select-toggle"><input type="checkbox" ' + (draft.include_references ? 'checked ' : '') + 'onchange="updateCapabilityDraftField(\'include_references\', this.checked)"><span>Include <span class="font-mono">references/</span></span></label>';
+    html += '</div>';
+    html += '<div class="capability-builder-actions"><button class="btn btn-primary" onclick="previewCapabilityDraft()">Preview Draft</button><button class="btn" onclick="resetCapabilitySkillDraft()">Reset</button></div>';
+    html += '</div></div>';
+    html += renderCapabilityListSection(
+        'Environment Variables',
+        'env_vars',
+        (draft.env_vars || []).map((entry, index) => capabilityEnvVarRowH(entry, index)),
+        'Add the env vars this skill expects Hermes users to set later.',
+        '+ Add Env Var'
+    );
+    html += renderCapabilityListSection(
+        'Credential Files',
+        'credential_files',
+        (draft.credential_files || []).map((entry, index) => capabilityCredentialRowH(entry, index)),
+        'Declare credential files the user should place inside this skill folder.',
+        '+ Add Credential File'
+    );
+    html += renderCapabilityListSection(
+        'Required Commands',
+        'required_commands',
+        (draft.required_commands || []).map((entry, index) => capabilityCommandRowH(entry, index)),
+        'List commands Hermes should check before this skill is considered ready.',
+        '+ Add Command'
+    );
+    html += '</div>';
+
+    html += '<div class="capability-builder-column">';
+    html += renderCapabilityCreatedCard('skill');
+    html += '<div id="capability-preview-anchor"></div><div class="card mb-16"><div class="card-header"><span>Preview & Approval</span></div><div class="card-body">';
+    if (!preview) {
+        html += '<div class="empty-state"><p>Preview the draft to inspect generated files, setup blockers, and the exact <span class="font-mono">SKILL.md</span> content before approval.</p></div>';
+    } else {
+        const warnings = Array.isArray(preview.warnings) ? preview.warnings : [];
+        html += '<div class="capability-preview-summary">';
+        html += '<div class="capability-preview-item"><div class="runtime-readiness-label">Target</div><div class="runtime-readiness-value">' + escH((preview.summary || {}).slug || '') + '</div><div class="runtime-readiness-detail">' + escH((preview.summary || {}).target_dir || '') + '</div></div>';
+        html += '<div class="capability-preview-item"><div class="runtime-readiness-label">Setup</div><div class="runtime-readiness-value">' + escH(String((preview.summary || {}).env_var_count || 0)) + ' env vars</div><div class="runtime-readiness-detail">' + escH(String((preview.summary || {}).credential_file_count || 0)) + ' credential files, ' + escH(String((preview.summary || {}).required_command_count || 0)) + ' commands</div></div>';
+        html += '<div class="capability-preview-item"><div class="runtime-readiness-label">Approval</div><div class="runtime-readiness-value">' + escH(preview.can_apply ? 'Ready' : 'Blocked') + '</div><div class="runtime-readiness-detail">' + escH(preview.can_apply ? 'Approve to write files.' : 'Resolve the slug conflict before approval.') + '</div></div>';
+        html += '</div>';
+        if (warnings.length) {
+            html += '<div class="card mt-16"><div class="card-header"><span>Warnings</span></div><div class="card-body"><ul class="plain-list">' + warnings.map(warning => '<li>' + escH(warning) + '</li>').join('') + '</ul></div></div>';
+        }
+        html += '<div id="capability-preview-actions" class="capability-builder-actions mt-16"><button id="capability-approve-button" class="btn btn-primary" ' + (preview.can_apply ? '' : 'disabled ') + 'onclick="applyCapabilityDraft()">Approve & Create Skill</button><button class="btn" onclick="previewCapabilityDraft()">Refresh Preview</button></div>';
+        html += '<div class="card mt-16"><div class="card-header"><span>Will Write</span></div><div class="card-body"><div class="capability-layout-list">' +
+            writes.map(item =>
+                '<div class="capability-layout-item"><div class="capability-layout-kind">' + escH((item.kind || 'item').toUpperCase()) + '</div><div class="font-mono text-sm">' + escH(item.path || '') + '</div><div class="capability-layout-detail">' + escH(item.label || item.action || '') + '</div></div>'
+            ).join('') +
+            '</div></div></div>';
+        html += '<div class="card mt-16"><div class="card-header"><span>Readiness After Create</span></div><div class="card-body">';
+        if (!blockers.length) {
+            html += '<p class="text-sm text-secondary">This draft will be immediately ready based on the metadata it declares.</p>';
+        } else {
+            html += '<div class="skill-setup-blocker-list">' + blockers.map(blocker =>
+                '<div class="skill-setup-blocker"><div class="skill-setup-blocker-title">' + escH(blocker.message || 'Setup needed') + '</div>' +
+                (blocker.kind === 'env_var'
+                    ? '<div class="skill-setup-blocker-detail">Group: ' + escH(blocker.group || 'System') + '</div>'
+                    : blocker.kind === 'credential_file'
+                        ? '<div class="skill-setup-blocker-detail">Expected at <span class="font-mono">' + escH(blocker.absolute_path || blocker.path || '') + '</span></div>'
+                        : '<div class="skill-setup-blocker-detail">Install or expose <span class="font-mono">' + escH(blocker.name || '') + '</span> in your PATH before using this skill.</div>') +
+                '</div>'
+            ).join('') + '</div>';
+        }
+        html += '</div></div>';
+        if (markdownWrite) {
+            html += '<div class="card mt-16"><div class="card-header"><span>Generated SKILL.md</span></div><div class="card-body"><pre class="font-mono text-xs capability-code-preview">' + escH(markdownWrite.content || '') + '</pre></div></div>';
+        }
+    }
+    html += '</div></div>';
+    html += renderCapabilityBulletCard('Proposed Data Model', typeMeta.data_model || []);
+    html += renderCapabilityBulletCard('UI Flow', typeMeta.ui_flow || []);
+    html += renderCapabilityLayoutCard(typeMeta.layout || []);
+    html += renderCapabilityBulletCard('Phase 1 Scope', typeMeta.mvp_scope || []);
+    html += '</div></div>';
+    return html;
+}
+
+function renderIntegrationCapabilityBuilder(typeMeta) {
+    const draft = capabilityDraft('integration');
+    const preview = capabilityPreview('integration');
+    const options = capabilityIntegrationOptions();
+    const currentOption = options.find(item => item && item.name === draft.kind) || capabilityDefaultIntegrationOption(draft.kind);
+    const manifest = ((preview || {}).manifest || {}).integration || {};
+    const readiness = manifest.readiness || {};
+    const blockers = Array.isArray(readiness.blockers) ? readiness.blockers : [];
+    const writes = Array.isArray((preview || {}).writes) ? preview.writes : [];
+    const configWrite = writes.find(item => item && item.path && item.path.endsWith('config.yaml'));
+
+    let html = '<div class="card mb-16"><div class="card-header"><span>' + escH(typeMeta.label || 'Create Integration') + '</span><span class="badge badge-success">' + escH(typeMeta.phase || 'Phase 2') + '</span></div><div class="card-body">';
+    html += '<p class="text-sm text-secondary mb-16">Integrations write to the same Hermes config and env files the existing Apps & Integrations screen already manages. Preview first, then approve the exact config and env changes.</p>';
+    html += '</div></div>';
+    html += '<div class="capability-builder-grid">';
+    html += '<div class="capability-builder-column">';
+    html += '<div class="card mb-16"><div class="card-header"><span>Integration Draft</span></div><div class="card-body">';
+    html += '<div class="capability-form-grid">';
+    html += '<div class="form-group"><label class="form-label">Integration Kind</label>' + selectH('capability-integration-kind', options.map(item => ({ value: item.name, label: item.label })), draft.kind || (currentOption.name || 'discord'), 'capability-integration-kind').replace('<select', '<select onchange="updateCapabilityDraftField(\'kind\', this.value)"') + '</div>';
+    html += '<div class="form-group capability-list-wide"><label class="form-label">Config JSON</label>' + textareaH('capability-integration-config', draft.config || '{}', 12, true).replace('<textarea', '<textarea oninput="updateCapabilityDraftField(\'config\', this.value)"') + '<div class="capability-field-note">This writes the top-level <span class="font-mono">' + escH((draft.kind || currentOption.name || 'integration')) + '</span> integration block in <span class="font-mono">~/.hermes/config.yaml</span>.</div></div>';
+    html += '</div>';
+    html += '<div class="capability-builder-actions"><button class="btn btn-primary" onclick="previewCapabilityDraft()">Preview Draft</button><button class="btn" onclick="resetCapabilityDraft(\'integration\')">Reset</button></div>';
+    html += '</div></div>';
+    html += renderCapabilityListSection(
+        'Environment Variables',
+        'env_vars',
+        (draft.env_vars || []).map((entry, index) => capabilityIntegrationEnvVarRowH(entry, index)),
+        'Add tokens or secrets this integration should save into ~/.hermes/.env.',
+        '+ Add Env Var'
+    );
+    html += '</div>';
+
+    html += '<div class="capability-builder-column">';
+    html += renderCapabilityCreatedCard('integration');
+    html += '<div id="capability-preview-anchor"></div><div class="card mb-16"><div class="card-header"><span>Preview & Approval</span></div><div class="card-body">';
+    if (!preview) {
+        html += '<div class="empty-state"><p>Preview the draft to inspect the config block, any env-var writes, and readiness blockers before approval.</p></div>';
+    } else {
+        const warnings = Array.isArray(preview.warnings) ? preview.warnings : [];
+        html += '<div class="capability-preview-summary">';
+        html += '<div class="capability-preview-item"><div class="runtime-readiness-label">Target</div><div class="runtime-readiness-value">' + escH((preview.summary || {}).kind || '') + '</div><div class="runtime-readiness-detail">' + escH((currentOption.label || (preview.summary || {}).kind || '').toString()) + '</div></div>';
+        html += '<div class="capability-preview-item"><div class="runtime-readiness-label">Env Vars</div><div class="runtime-readiness-value">' + escH(String((preview.summary || {}).env_var_count || 0)) + '</div><div class="runtime-readiness-detail">' + escH(String((preview.summary || {}).env_write_count || 0)) + ' will be written now</div></div>';
+        html += '<div class="capability-preview-item"><div class="runtime-readiness-label">Approval</div><div class="runtime-readiness-value">' + escH(preview.can_apply ? 'Ready' : 'Blocked') + '</div><div class="runtime-readiness-detail">' + escH(preview.can_apply ? 'Approve to write config and env changes.' : 'Resolve the existing configured integration first.') + '</div></div>';
+        html += '</div>';
+        if (warnings.length) {
+            html += '<div class="card mt-16"><div class="card-header"><span>Warnings</span></div><div class="card-body"><ul class="plain-list">' + warnings.map(warning => '<li>' + escH(warning) + '</li>').join('') + '</ul></div></div>';
+        }
+        html += '<div id="capability-preview-actions" class="capability-builder-actions mt-16"><button id="capability-approve-button" class="btn btn-primary" ' + (preview.can_apply ? '' : 'disabled ') + 'onclick="applyCapabilityDraft()">Approve & Create Integration</button><button class="btn" onclick="previewCapabilityDraft()">Refresh Preview</button></div>';
+        html += '<div class="card mt-16"><div class="card-header"><span>Will Write</span></div><div class="card-body"><div class="capability-layout-list">' +
+            writes.map(item =>
+                '<div class="capability-layout-item"><div class="capability-layout-kind">' + escH((item.kind || 'item').toUpperCase()) + '</div><div class="font-mono text-sm">' + escH(item.path || '') + '</div><div class="capability-layout-detail">' + escH(item.label || item.action || '') + (item.key ? ' · ' + escH(item.key) : '') + '</div></div>'
+            ).join('') +
+            '</div></div></div>';
+        html += '<div class="card mt-16"><div class="card-header"><span>Readiness After Create</span></div><div class="card-body">';
+        if (!blockers.length) {
+            html += '<p class="text-sm text-secondary">This integration draft will be ready immediately after the write.</p>';
+        } else {
+            html += '<div class="skill-setup-blocker-list">' + blockers.map(blocker =>
+                '<div class="skill-setup-blocker"><div class="skill-setup-blocker-title">' + escH(blocker.message || 'Setup needed') + '</div>' +
+                (blocker.kind === 'env_var'
+                    ? '<div class="skill-setup-blocker-detail">Group: ' + escH(blocker.group || 'System') + '</div>'
+                    : '<div class="skill-setup-blocker-detail">Add at least one meaningful config value or save the missing env vars.</div>') +
+                '</div>'
+            ).join('') + '</div>';
+        }
+        html += '</div></div>';
+        if (configWrite) {
+            html += '<div class="card mt-16"><div class="card-header"><span>Generated Integration Config</span></div><div class="card-body"><pre class="font-mono text-xs capability-code-preview">' + escH(configWrite.content || '') + '</pre></div></div>';
+        }
+    }
+    html += '</div></div>';
+    html += renderCapabilityBulletCard('Proposed Data Model', typeMeta.data_model || []);
+    html += renderCapabilityBulletCard('UI Flow', typeMeta.ui_flow || []);
+    html += renderCapabilityLayoutCard(typeMeta.layout || []);
+    html += renderCapabilityBulletCard('MVP Scope', typeMeta.mvp_scope || []);
+    html += '</div></div>';
+    return html;
+}
+
+function renderAgentPresetCapabilityBuilder(typeMeta) {
+    const draft = capabilityDraft('agent_preset');
+    const preview = capabilityPreview('agent_preset');
+    const profiles = capabilityProfileList();
+    const skills = capabilitySkillList();
+    const integrations = capabilityIntegrationOptions();
+    const writes = Array.isArray((preview || {}).writes) ? preview.writes : [];
+    const yamlWrite = writes.find(item => item && item.content);
+    const manifest = (preview || {}).manifest || {};
+    const selectedSkills = Array.isArray(manifest.skills) ? manifest.skills : [];
+    const selectedIntegrations = Array.isArray(manifest.integrations) ? manifest.integrations : [];
+
+    let html = '<div class="card mb-16"><div class="card-header"><span>' + escH(typeMeta.label || 'Create Agent Preset') + '</span><span class="badge badge-success">' + escH(typeMeta.phase || 'Phase 3') + '</span></div><div class="card-body">';
+    html += '<p class="text-sm text-secondary mb-16">Agent presets store a reusable personality overlay plus the model roles, skills, integrations, and agent defaults that preset expects around it.</p>';
+    html += '</div></div>';
+    html += '<div class="capability-builder-grid">';
+    html += '<div class="capability-builder-column">';
+    html += '<div class="card mb-16"><div class="card-header"><span>Preset Draft</span></div><div class="card-body">';
+    html += '<div class="capability-form-grid">';
+    html += '<div class="form-group"><label class="form-label">Name</label>' + inputH('capability-preset-name', draft.name || '', 'text', 'code-reviewer', 'oninput="updateCapabilityDraftField(\'name\', this.value)"') + '</div>';
+    html += '<div class="form-group"><label class="form-label">Reasoning Effort</label>' + selectH('capability-preset-reasoning', ['', 'none', 'low', 'medium', 'high', 'xhigh', 'minimal'], draft.reasoning_effort || '', 'capability-preset-reasoning').replace('<select', '<select onchange="updateCapabilityDraftField(\'reasoning_effort\', this.value)"') + '</div>';
+    html += '<div class="form-group"><label class="form-label">Max Turns</label>' + inputH('capability-preset-max-turns', draft.max_turns || '', 'number', '90', 'oninput="updateCapabilityDraftField(\'max_turns\', this.value)" min="1"') + '</div>';
+    html += '<div class="form-group capability-list-wide"><label class="form-label">Description</label>' + textareaH('capability-preset-description', draft.description || '', 3, false).replace('<textarea', '<textarea oninput="updateCapabilityDraftField(\'description\', this.value)"') + '</div>';
+    html += '<div class="form-group capability-list-wide"><label class="form-label">System Prompt</label>' + textareaH('capability-preset-system-prompt', draft.system_prompt || '', 8, false).replace('<textarea', '<textarea oninput="updateCapabilityDraftField(\'system_prompt\', this.value)"') + '<div class="capability-field-note">This becomes the preset personality overlay stored in Hermes config.</div></div>';
+    html += '</div>';
+    html += '<div class="capability-builder-actions"><button class="btn btn-primary" onclick="previewCapabilityDraft()">Preview Draft</button><button class="btn" onclick="resetCapabilityDraft(\'agent_preset\')">Reset</button></div>';
+    html += '</div></div>';
+    ['primary', 'fallback', 'vision'].forEach(role => {
+        html += renderAgentRoleCard(role, (((draft.roles || {})[role]) || {}), profiles);
+    });
+    html += renderCapabilitySelectionCard(
+        'Skills',
+        'skills',
+        skills.map(item => ({
+            path: item.path,
+            name: item.name || item.path,
+            description: item.description || '',
+            enabled: item.enabled,
+            ready: item.ready,
+        })),
+        draft.skills || [],
+        'Install or create skills first, then reference the ones this preset expects.'
+    );
+    html += renderCapabilitySelectionCard(
+        'Integrations',
+        'integrations',
+        integrations.map(item => ({
+            name: item.name,
+            label: item.label || item.name,
+            description: item.exists ? 'Available in current config' : 'Known Hermes integration',
+            configured: item.configured,
+        })),
+        draft.integrations || [],
+        'No integrations were discovered in capability context.'
+    );
+    html += '</div>';
+
+    html += '<div class="capability-builder-column">';
+    html += renderCapabilityCreatedCard('agent_preset');
+    html += '<div id="capability-preview-anchor"></div><div class="card mb-16"><div class="card-header"><span>Preview & Approval</span></div><div class="card-body">';
+    if (!preview) {
+        html += '<div class="empty-state"><p>Preview the preset to inspect the stored personality payload, referenced skills, integrations, and model-role bindings before approval.</p></div>';
+    } else {
+        const warnings = Array.isArray(preview.warnings) ? preview.warnings : [];
+        html += '<div class="capability-preview-summary">';
+        html += '<div class="capability-preview-item"><div class="runtime-readiness-label">Preset</div><div class="runtime-readiness-value">' + escH((preview.summary || {}).name || '') + '</div><div class="runtime-readiness-detail">' + escH((manifest.storage_path || 'agent.personalities')) + '</div></div>';
+        html += '<div class="capability-preview-item"><div class="runtime-readiness-label">Composition</div><div class="runtime-readiness-value">' + escH(String((preview.summary || {}).enabled_role_count || 0)) + ' roles</div><div class="runtime-readiness-detail">' + escH(String((preview.summary || {}).skill_count || 0)) + ' skills, ' + escH(String((preview.summary || {}).integration_count || 0)) + ' integrations</div></div>';
+        html += '<div class="capability-preview-item"><div class="runtime-readiness-label">Approval</div><div class="runtime-readiness-value">' + escH(preview.can_apply ? 'Ready' : 'Blocked') + '</div><div class="runtime-readiness-detail">' + escH(preview.can_apply ? 'Approve to save the preset.' : 'Resolve the existing preset name conflict first.') + '</div></div>';
+        html += '</div>';
+        if (warnings.length) {
+            html += '<div class="card mt-16"><div class="card-header"><span>Warnings</span></div><div class="card-body"><ul class="plain-list">' + warnings.map(warning => '<li>' + escH(warning) + '</li>').join('') + '</ul></div></div>';
+        }
+        html += '<div id="capability-preview-actions" class="capability-builder-actions mt-16"><button id="capability-approve-button" class="btn btn-primary" ' + (preview.can_apply ? '' : 'disabled ') + 'onclick="applyCapabilityDraft()">Approve & Create Agent Preset</button><button class="btn" onclick="previewCapabilityDraft()">Refresh Preview</button></div>';
+        html += '<div class="card mt-16"><div class="card-header"><span>Will Write</span></div><div class="card-body"><div class="capability-layout-list">' +
+            writes.map(item =>
+                '<div class="capability-layout-item"><div class="capability-layout-kind">' + escH((item.kind || 'item').toUpperCase()) + '</div><div class="font-mono text-sm">' + escH(item.path || '') + '</div><div class="capability-layout-detail">' + escH(item.label || item.action || '') + '</div></div>'
+            ).join('') +
+            '</div></div></div>';
+        html += '<div class="card mt-16"><div class="card-header"><span>Referenced Skills</span></div><div class="card-body">';
+        if (!selectedSkills.length) html += '<p class="text-sm text-secondary">No skills were selected for this preset.</p>';
+        else html += '<ul class="plain-list">' + selectedSkills.map(item => '<li><span class="font-mono">' + escH(item.path || '') + '</span>' + (item.ready === false ? ' · needs setup' : item.enabled === false ? ' · disabled' : '') + '</li>').join('') + '</ul>';
+        html += '</div></div>';
+        html += '<div class="card mt-16"><div class="card-header"><span>Referenced Integrations</span></div><div class="card-body">';
+        if (!selectedIntegrations.length) html += '<p class="text-sm text-secondary">No integrations were selected for this preset.</p>';
+        else html += '<ul class="plain-list">' + selectedIntegrations.map(item => '<li><span class="font-mono">' + escH(item.name || '') + '</span>' + (item.configured ? '' : ' · not configured yet') + '</li>').join('') + '</ul>';
+        html += '</div></div>';
+        if (yamlWrite) {
+            html += '<div class="card mt-16"><div class="card-header"><span>Generated Preset Fragment</span></div><div class="card-body"><pre class="font-mono text-xs capability-code-preview">' + escH(yamlWrite.content || '') + '</pre></div></div>';
+        }
+    }
+    html += '</div></div>';
+    html += renderCapabilityBulletCard('Proposed Data Model', typeMeta.data_model || []);
+    html += renderCapabilityBulletCard('UI Flow', typeMeta.ui_flow || []);
+    html += renderCapabilityLayoutCard(typeMeta.layout || []);
+    html += renderCapabilityBulletCard('MVP Scope', typeMeta.mvp_scope || []);
+    html += '</div></div>';
+    return html;
+}
+
+function renderCapabilityBuilder() {
+    if (!screenIsActive('capabilities')) return;
+    const editorState = (capabilityBuilderState.focusBuilderOnRender || capabilityBuilderState.focusPreviewOnRender) ? null : captureCapabilityEditorState();
+    const content = document.getElementById('content');
+    if (!content) return;
+    const catalog = capabilityBuilderState.catalog || { types: [] };
+    const typeMeta = capabilityCatalogType(capabilityBuilderState.selectedType);
+    let html = '<div class="section-header skill-page-header"><span>Create Capability</span><div class="skill-page-actions">';
+    html += '<button class="' + capabilitySelectButtonClass('skill') + '" onclick="selectCapabilityType(\'skill\')">Create Skill</button>';
+    html += '<button class="' + capabilitySelectButtonClass('integration') + '" onclick="selectCapabilityType(\'integration\')">Create Integration</button>';
+    html += '<button class="' + capabilitySelectButtonClass('agent_preset') + '" onclick="selectCapabilityType(\'agent_preset\')">Create Agent Preset</button>';
+    html += '</div></div>';
+    html += '<div class="card mb-16"><div class="card-body"><p class="text-sm text-secondary">The capability system is phased on purpose: skills are the primary extension mechanism, integrations capture connection state, and agent presets compose models plus capabilities. Every type uses the same draft preview and approval pattern before writing files or config.</p></div></div>';
+    html += renderCapabilityOverview(catalog);
+    html += '<div class="card mb-16"><div class="card-header"><span>Capability Types</span></div><div class="card-body">' + renderCapabilityTypeCards() + '</div></div>';
+    html += '<div id="capability-builder-anchor"></div>';
+    if (capabilityBuilderState.selectedType === 'skill') html += renderSkillCapabilityBuilder(typeMeta);
+    else if (capabilityBuilderState.selectedType === 'integration') html += renderIntegrationCapabilityBuilder(typeMeta);
+    else if (capabilityBuilderState.selectedType === 'agent_preset') html += renderAgentPresetCapabilityBuilder(typeMeta);
+    content.innerHTML = html;
+    if (capabilityBuilderState.focusBuilderOnRender) {
+        capabilityBuilderState.focusBuilderOnRender = false;
+        requestAnimationFrame(() => focusCapabilityBuilder());
+    } else if (capabilityBuilderState.focusPreviewOnRender) {
+        capabilityBuilderState.focusPreviewOnRender = false;
+        requestAnimationFrame(() => focusCapabilityPreview());
+    } else {
+        restoreCapabilityEditorState(editorState);
+    }
+}
+
+Screens.capabilities = async function () {
+    const content = document.getElementById('content');
+    try {
+        capabilityBuilderState.catalog = await api('GET', '/api/capabilities');
+        if (!screenIsActive('capabilities')) return;
+        renderCapabilityBuilder();
+    } catch (e) {
+        if (!screenIsActive('capabilities')) return;
+        content.innerHTML = '<div class="empty-state"><div class="empty-icon">\u26a0\ufe0f</div><h3>Error</h3><p>' + escH(e.message) + '</p></div>';
+    }
+};
+
+window.openCreateCapability = function (type = 'skill') {
+    capabilityBuilderState.selectedType = type || 'skill';
+    capabilityBuilderState.focusBuilderOnRender = true;
+    capabilityBuilderState.focusPreviewOnRender = false;
+    navigate('capabilities');
+};
+
+window.selectCapabilityType = function (type) {
+    capabilityBuilderState.selectedType = type || 'skill';
+    capabilityBuilderState.focusBuilderOnRender = true;
+    capabilityBuilderState.focusPreviewOnRender = false;
+    renderCapabilityBuilder();
+};
+
+window.updateCapabilityDraftField = function (field, value) {
+    const type = capabilityBuilderState.selectedType || 'skill';
+    const draft = capabilityDraft(type);
+    if (type === 'skill') {
+        if (field === 'name') {
+            const previousAuto = capabilitySlugify(draft.name || '');
+            draft.name = value;
+            if (!draft.slug || draft.slug === previousAuto) {
+                draft.slug = capabilitySlugify(value);
+            }
+        } else {
+            draft[field] = value;
+        }
+    } else if (type === 'integration') {
+        if (field === 'kind') {
+            capabilityBuilderState.drafts.integration = defaultIntegrationCapabilityDraft(value);
+        } else {
+            draft[field] = value;
+        }
+    } else {
+        draft[field] = value;
+    }
+    clearCapabilityPreview(type);
+    if (currentScreenId() === 'capabilities') renderCapabilityBuilder();
+};
+
+window.addCapabilityListItem = function (key) {
+    const type = capabilityBuilderState.selectedType || 'skill';
+    const draft = capabilityDraft(type);
+    if (!Array.isArray(draft[key])) draft[key] = [];
+    if (key === 'env_vars' && type === 'skill') draft[key].push({ key: '', label: '', group: 'Provider', description: '' });
+    if (key === 'env_vars' && type === 'integration') draft[key].push({ key: '', label: '', group: 'Channel', description: '', value: '' });
+    if (key === 'credential_files') draft[key].push({ path: '', label: '', description: '' });
+    if (key === 'required_commands') draft[key].push({ name: '', description: '' });
+    clearCapabilityPreview(type);
+    renderCapabilityBuilder();
+};
+
+window.updateCapabilityListItem = function (key, index, field, value) {
+    const type = capabilityBuilderState.selectedType || 'skill';
+    const draft = capabilityDraft(type);
+    if (!Array.isArray(draft[key]) || !draft[key][index]) return;
+    draft[key][index][field] = value;
+    clearCapabilityPreview(type);
+    renderCapabilityBuilder();
+};
+
+window.removeCapabilityListItem = function (key, index) {
+    const type = capabilityBuilderState.selectedType || 'skill';
+    const draft = capabilityDraft(type);
+    if (!Array.isArray(draft[key])) return;
+    draft[key].splice(index, 1);
+    clearCapabilityPreview(type);
+    renderCapabilityBuilder();
+};
+
+window.resetCapabilitySkillDraft = function () {
+    resetCapabilityDraftState('skill');
+    renderCapabilityBuilder();
+};
+
+window.resetCapabilityDraft = function (type) {
+    resetCapabilityDraftState(type || capabilityBuilderState.selectedType || 'skill');
+    renderCapabilityBuilder();
+};
+
+window.clearCreatedCapabilityNotice = function () {
+    capabilityBuilderState.lastCreated = null;
+    renderCapabilityBuilder();
+};
+
+window.updateCapabilityRoleField = function (role, field, value) {
+    const draft = capabilityDraft('agent_preset');
+    if (!draft.roles) draft.roles = {};
+    if (!draft.roles[role]) draft.roles[role] = { enabled: role === 'primary', profile: '', model: '', routing_provider: '' };
+    draft.roles[role][field] = value;
+    if (field === 'profile' && value && !draft.roles[role].model) {
+        const profile = capabilityProfileList().find(item => item.name === value);
+        if (profile && profile.model) draft.roles[role].model = profile.model;
+    }
+    clearCapabilityPreview('agent_preset');
+    renderCapabilityBuilder();
+};
+
+window.toggleCapabilitySelection = function (key, value, checked) {
+    const draft = capabilityDraft('agent_preset');
+    if (!Array.isArray(draft[key])) draft[key] = [];
+    const list = draft[key].slice();
+    const next = checked
+        ? Array.from(new Set(list.concat([value])))
+        : list.filter(item => item !== value);
+    draft[key] = next;
+    clearCapabilityPreview('agent_preset');
+    renderCapabilityBuilder();
+};
+
+window.previewCapabilityDraft = async function () {
+    const type = capabilityBuilderState.selectedType || 'skill';
+    toast('Building draft preview...', 'info', 1500);
+    try {
+        const resp = await api('POST', '/api/capabilities/preview', {
+            type,
+            draft: capabilityDraft(type),
+        });
+        capabilityBuilderState.previews[type] = resp;
+        capabilityBuilderState.lastCreated = null;
+        capabilityBuilderState.focusPreviewOnRender = true;
+        renderCapabilityBuilder();
+        toast('Draft preview ready', 'success');
+    } catch (e) {
+        toast('Preview failed: ' + e.message, 'error');
+    }
+};
+
+window.applyCapabilityDraft = async function () {
+    const type = capabilityBuilderState.selectedType || 'skill';
+    const preview = capabilityPreview(type);
+    if (!preview || !preview.preview_token) {
+        toast('Preview the draft before approval', 'warning');
+        return;
+    }
+    if (preview.can_apply === false) {
+        toast('Resolve the draft warnings before approval', 'error');
+        return;
+    }
+    toast('Writing capability...', 'info', 1500);
+    try {
+        const resp = await api('POST', '/api/capabilities/apply', {
+            type,
+            draft: capabilityDraft(type),
+            preview_token: preview.preview_token,
+        });
+        capabilityBuilderState.lastCreated = {
+            type,
+            ...(resp.created || {}),
+        };
+        if (type === 'skill' && resp.created && (resp.created.slug || resp.created.path)) {
+            const skillPath = resp.created.slug || resp.created.path;
+            skillCatalogState.recentPaths[skillPath] = true;
+            skillCatalogState.focusPathOnRender = skillPath;
+        }
+        if (type === 'integration' && resp.created && (resp.created.kind || resp.created.name)) {
+            const integrationName = resp.created.kind || resp.created.name;
+            integrationCatalogState.recentNames[integrationName] = true;
+            integrationCatalogState.focusNameOnRender = integrationName;
+        }
+        if (type === 'agent_preset' && resp.created && resp.created.name) {
+            const presetName = resp.created.name;
+            agentCatalogState.recentNames[presetName] = true;
+            agentCatalogState.focusNameOnRender = presetName;
+        }
+        if (type === 'skill') capabilityBuilderState.drafts.skill = defaultSkillCapabilityDraft();
+        else if (type === 'integration') capabilityBuilderState.drafts.integration = defaultIntegrationCapabilityDraft();
+        else if (type === 'agent_preset') capabilityBuilderState.drafts.agent_preset = defaultAgentPresetDraft();
+        capabilityBuilderState.previews[type] = null;
+        renderCapabilityBuilder();
+        toast((resp.created || {}).name ? ((resp.created || {}).name + ' created') : 'Capability created', 'success');
+    } catch (e) {
+        toast('Create failed: ' + e.message, 'error');
+    }
+};
+
 const starterPackState = {
     items: {},
 };
@@ -1612,11 +2549,25 @@ const skillCatalogState = {
     searchQuery: '',
     statusFilter: 'all',
     sourceFilter: 'all',
+    categoryFilter: 'all',
     collapsedSources: {},
     selectedPaths: {},
     selectedSourceKey: '',
     recentPaths: {},
+    focusPathOnRender: '',
 };
+
+const integrationCatalogState = {
+    recentNames: {},
+    focusNameOnRender: '',
+};
+
+const agentCatalogState = {
+    recentNames: {},
+    focusNameOnRender: '',
+};
+
+const UNCATEGORIZED_SKILL_FILTER = '__uncategorized__';
 
 function rememberSkills(skills) {
     const nextList = Array.isArray(skills) ? skills : [];
@@ -1646,6 +2597,10 @@ function rememberSkills(skills) {
     if (skillCatalogState.sourceFilter !== 'all' && !validSourceKeys.has(skillCatalogState.sourceFilter)) {
         skillCatalogState.sourceFilter = 'all';
     }
+    const validCategoryKeys = new Set(nextList.map(skill => skillCategoryKey(skill)));
+    if (skillCatalogState.categoryFilter !== 'all' && !validCategoryKeys.has(skillCatalogState.categoryFilter)) {
+        skillCatalogState.categoryFilter = 'all';
+    }
 }
 
 function skillSourceLabel(skill) {
@@ -1663,6 +2618,9 @@ function skillSourceMeta(skill) {
     if (!source.identifier && !source.source_repo && !source.catalog_source) {
         return 'Manual or older skills without recorded repo metadata.';
     }
+    if (source.install_mode === 'webui_create') {
+        return 'Created in Hermes Web UI.';
+    }
     if (source.install_mode === 'github_repo' && source.source_repo) {
         return 'Imported from GitHub repo.';
     }
@@ -1673,6 +2631,21 @@ function skillSourceMeta(skill) {
         return 'Installed through the Hermes CLI.';
     }
     return 'Recorded source metadata is available for this skill.';
+}
+
+function skillCategoryKey(skill) {
+    const category = String((skill && skill.category) || '').trim();
+    return category || UNCATEGORIZED_SKILL_FILTER;
+}
+
+function skillCategoryLabel(valueOrSkill) {
+    const key = typeof valueOrSkill === 'string'
+        ? String(valueOrSkill || '').trim()
+        : skillCategoryKey(valueOrSkill || {});
+    if (!key || key === UNCATEGORIZED_SKILL_FILTER) {
+        return 'Uncategorized';
+    }
+    return key;
 }
 
 function skillSetupStatus(skill) {
@@ -1707,6 +2680,104 @@ function sortSkillsStable(skills) {
     });
 }
 
+function skillElementId(path) {
+    return 'skill-card-' + String(path || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
+}
+
+function integrationElementId(name) {
+    return 'integration-card-' + String(name || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
+}
+
+function agentElementId(name) {
+    return 'agent-card-' + String(name || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
+}
+
+function focusInventoryCardById(elementId) {
+    const target = elementId ? document.getElementById(elementId) : null;
+    if (!target) return;
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    const focusTarget = target.querySelector('button, input, [tabindex]');
+    if (focusTarget && typeof focusTarget.focus === 'function') {
+        try { focusTarget.focus({ preventScroll: true }); }
+        catch (e) { focusTarget.focus(); }
+    }
+}
+
+function captureSkillsInventoryState() {
+    const content = document.getElementById('content');
+    const active = document.activeElement;
+    if (!active || !active.id) {
+        return {
+            scrollX: window.scrollX || 0,
+            scrollY: window.scrollY || 0,
+            contentScrollTop: content ? content.scrollTop : 0,
+            contentScrollLeft: content ? content.scrollLeft : 0,
+        };
+    }
+    const canRestoreSelection = typeof active.selectionStart === 'number' && typeof active.selectionEnd === 'number';
+    return {
+        id: active.id,
+        selectionStart: canRestoreSelection ? active.selectionStart : null,
+        selectionEnd: canRestoreSelection ? active.selectionEnd : null,
+        scrollX: window.scrollX || 0,
+        scrollY: window.scrollY || 0,
+        contentScrollTop: content ? content.scrollTop : 0,
+        contentScrollLeft: content ? content.scrollLeft : 0,
+    };
+}
+
+function restoreSkillsInventoryState(state) {
+    if (!state) return;
+    const scrollX = Number.isFinite(state.scrollX) ? state.scrollX : 0;
+    const scrollY = Number.isFinite(state.scrollY) ? state.scrollY : 0;
+    const contentScrollTop = Number.isFinite(state.contentScrollTop) ? state.contentScrollTop : 0;
+    const contentScrollLeft = Number.isFinite(state.contentScrollLeft) ? state.contentScrollLeft : 0;
+    const restore = () => {
+        const content = document.getElementById('content');
+        if (content) {
+            content.scrollTop = contentScrollTop;
+            content.scrollLeft = contentScrollLeft;
+        }
+        const el = state.id ? document.getElementById(state.id) : null;
+        if (el && typeof el.focus === 'function') {
+            try { el.focus({ preventScroll: true }); }
+            catch (e) { el.focus(); }
+            if (typeof state.selectionStart === 'number' && typeof state.selectionEnd === 'number' && typeof el.setSelectionRange === 'function') {
+                try { el.setSelectionRange(state.selectionStart, state.selectionEnd); } catch (e) { /* ignore */ }
+            }
+        }
+        if (content) {
+            content.scrollTop = contentScrollTop;
+            content.scrollLeft = contentScrollLeft;
+        }
+        window.scrollTo(scrollX, scrollY);
+    };
+    requestAnimationFrame(restore);
+}
+
+function focusSkillInventoryPath(path) {
+    const target = path ? document.getElementById(skillElementId(path)) : null;
+    if (!target) return;
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    const focusTarget = target.querySelector('button, input, [tabindex]');
+    if (focusTarget && typeof focusTarget.focus === 'function') {
+        try { focusTarget.focus({ preventScroll: true }); }
+        catch (e) { focusTarget.focus(); }
+    }
+}
+
+function finishSkillsInventoryRender(content, html, viewState) {
+    if (!content) return;
+    content.innerHTML = html;
+    if (skillCatalogState.focusPathOnRender) {
+        const focusPath = skillCatalogState.focusPathOnRender;
+        skillCatalogState.focusPathOnRender = '';
+        requestAnimationFrame(() => focusSkillInventoryPath(focusPath));
+        return;
+    }
+    restoreSkillsInventoryState(viewState);
+}
+
 function skillSearchText(skill) {
     const source = skill.source || {};
     const setup = skillSetupStatus(skill);
@@ -1726,6 +2797,14 @@ function availableSkillSourceKeys() {
     return Array.from(new Set(skillCatalogState.list.map(skill => skillSourceKey(skill)))).sort((a, b) => {
         if (a === 'Local / Unknown') return -1;
         if (b === 'Local / Unknown') return 1;
+        return String(a).localeCompare(String(b));
+    });
+}
+
+function availableSkillCategoryKeys() {
+    return Array.from(new Set(skillCatalogState.list.map(skill => skillCategoryKey(skill)))).sort((a, b) => {
+        if (a === UNCATEGORIZED_SKILL_FILTER) return 1;
+        if (b === UNCATEGORIZED_SKILL_FILTER) return -1;
         return String(a).localeCompare(String(b));
     });
 }
@@ -1766,10 +2845,14 @@ function skillMatchesFilters(skill) {
     const searchNeedle = String(skillCatalogState.searchQuery || '').trim().toLowerCase();
     const statusFilter = skillCatalogState.statusFilter || 'all';
     const sourceFilter = skillCatalogState.sourceFilter || 'all';
+    const categoryFilter = skillCatalogState.categoryFilter || 'all';
     const setup = skillSetupStatus(skill);
     const enabled = skill.enabled !== false;
 
     if (sourceFilter !== 'all' && skillSourceKey(skill) !== sourceFilter) {
+        return false;
+    }
+    if (categoryFilter !== 'all' && skillCategoryKey(skill) !== categoryFilter) {
         return false;
     }
     if (statusFilter === 'enabled' && !enabled) {
@@ -1801,6 +2884,13 @@ function visibleSkillsForSource(sourceKey, section = 'all') {
         if (section === 'disabled') return skill.enabled === false;
         return true;
     });
+}
+
+function skillsInventoryIsDefaultView() {
+    return !String(skillCatalogState.searchQuery || '').trim()
+        && (skillCatalogState.statusFilter || 'all') === 'all'
+        && (skillCatalogState.sourceFilter || 'all') === 'all'
+        && (skillCatalogState.categoryFilter || 'all') === 'all';
 }
 
 function summarizeSkillGroup(skills) {
@@ -1844,9 +2934,14 @@ function skillSourceBlocks(skills) {
 
 function renderSkillFilterBar(totalSkills) {
     const sourceOptions = availableSkillSourceKeys();
+    const categoryOptions = availableSkillCategoryKeys();
     const sourceSelect = '<select class="form-select skill-filter-select" id="skill-source-filter" onchange="setSkillSourceFilter(this.value)">' +
         '<option value="all"' + (skillCatalogState.sourceFilter === 'all' ? ' selected' : '') + '>All sources</option>' +
         sourceOptions.map(key => '<option value="' + escA(key) + '"' + (skillCatalogState.sourceFilter === key ? ' selected' : '') + '>' + escH(key) + '</option>').join('') +
+        '</select>';
+    const categorySelect = '<select class="form-select skill-filter-select" id="skill-category-filter" onchange="setSkillCategoryFilter(this.value)">' +
+        '<option value="all"' + (skillCatalogState.categoryFilter === 'all' ? ' selected' : '') + '>All categories</option>' +
+        categoryOptions.map(key => '<option value="' + escA(key) + '"' + (skillCatalogState.categoryFilter === key ? ' selected' : '') + '>' + escH(skillCategoryLabel(key)) + '</option>').join('') +
         '</select>';
     const filters = [
         ['all', 'All'],
@@ -1856,7 +2951,8 @@ function renderSkillFilterBar(totalSkills) {
         ['ready', 'Ready'],
     ];
     let html = '<div class="section-header skill-page-header"><span>' + totalSkills + ' Skills</span><div class="skill-page-actions">';
-    html += '<button class="btn btn-primary" onclick="openSkillInstallModal()">Install Skill</button>';
+    html += '<button class="btn btn-primary" onclick="openCreateCapability(\'skill\')">Create Skill</button>';
+    html += '<button class="btn" onclick="openSkillInstallModal()">Install Skill</button>';
     html += '<button class="btn" onclick="navigate(\'channels\')">Open Apps & Integrations</button>';
     html += '<button class="btn" onclick="navigate(\'env-vars\')">Open Env Vars</button>';
     html += '</div></div>';
@@ -1866,9 +2962,10 @@ function renderSkillFilterBar(totalSkills) {
         '<button class="btn btn-sm ' + (skillCatalogState.statusFilter === value ? 'btn-primary' : '') + '" onclick="setSkillStatusFilter(\'' + escA(value) + '\')">' + escH(label) + '</button>'
     ).join('') + '</div>';
     html += '<div class="skill-filter-controls">';
-    html += '<label class="skill-filter-label">Source</label>' + sourceSelect;
+    html += '<label class="skill-filter-label">Source / Origin</label>' + sourceSelect;
+    html += '<label class="skill-filter-label">Category</label>' + categorySelect;
     html += '<div class="search-box skill-search-box"><span class="search-icon">' + UI_ICONS.search + '</span><input type="text" class="form-input" id="skill-search" placeholder="Search skills..." value="' + escA(skillCatalogState.searchQuery) + '" oninput="setSkillSearch(this.value)"></div>';
-    if (skillCatalogState.searchQuery || skillCatalogState.statusFilter !== 'all' || skillCatalogState.sourceFilter !== 'all') {
+    if (skillCatalogState.searchQuery || skillCatalogState.statusFilter !== 'all' || skillCatalogState.sourceFilter !== 'all' || skillCatalogState.categoryFilter !== 'all') {
         html += '<button class="btn btn-sm" onclick="clearSkillFilters()">Clear Filters</button>';
     }
     html += '</div></div></div></div>';
@@ -1946,7 +3043,7 @@ function renderSkillSourceBlock(group) {
     const disabledSkills = visibleGroupSkills.filter(skill => skill.enabled === false);
 
     let html = '<div class="card mb-16 skill-source-block"><div class="card-header skill-source-block-header">';
-    html += '<div><div class="skill-source-block-title">' + escH(group.title) + '</div><div class="skill-source-block-meta">' + escH(group.meta) + '</div></div>';
+    html += '<div><div class="skill-source-block-title">Source: ' + escH(group.title) + '</div><div class="skill-source-block-meta">' + escH(group.meta) + '</div></div>';
     html += '<div class="skill-source-block-summary">';
     html += '<span class="badge badge-info">' + summary.total + ' total</span>';
     html += '<span class="badge badge-success">' + summary.enabled + ' enabled</span>';
@@ -1991,14 +3088,10 @@ function renderSkillTile(skill) {
     const setup = skillSetupStatus(skill);
     const recent = skillCatalogState.recentPaths[skill.path];
     const checked = isSkillSelected(skill.path);
-    let html = '<div class="starter-pack-item skill-item-card" data-skill-name="' + escA(skill.name) + '" data-skill-path="' + escA(skill.path) + '" data-skill-search="' + escA(skillSearchText(skill)) + '">';
+    let html = '<div class="starter-pack-item skill-item-card" id="' + escA(skillElementId(skill.path)) + '" data-skill-name="' + escA(skill.name) + '" data-skill-path="' + escA(skill.path) + '" data-skill-search="' + escA(skillSearchText(skill)) + '">';
     html += '<div class="starter-pack-item-top"><div><div class="skill-name-line"><span class="starter-pack-item-title">' + escH(skill.name) + '</span>' +
         (recent ? '<span class="badge badge-info">New</span>' : '') + '</div>';
-    if (skill.category) {
-        html += '<div class="starter-pack-item-kind">' + escH(skill.category) + '</div>';
-    } else {
-        html += '<div class="starter-pack-item-kind">Skill</div>';
-    }
+    html += '<div class="starter-pack-item-kind">Category: ' + escH(skillCategoryLabel(skill)) + '</div>';
     html += '</div><div class="skill-card-badges">';
     html += '<span class="badge ' + (skill.enabled !== false ? 'badge-success' : 'badge-danger') + '">' + (skill.enabled !== false ? 'Enabled' : 'Disabled') + '</span>';
     if (setup.ready) {
@@ -2020,36 +3113,46 @@ function renderSkillTile(skill) {
 }
 
 function renderSkillsInventory() {
+    if (!screenIsActive('skills')) return;
     const content = document.getElementById('content');
     if (!content) return;
+    const viewState = skillCatalogState.focusPathOnRender ? null : captureSkillsInventoryState();
 
     const skills = skillCatalogState.list || [];
     const runtime = skillCatalogState.runtime || {};
     const policy = skillCatalogState.policy || {};
     const visible = visibleSkills();
+    const focusedSkill = skillCatalogState.focusPathOnRender ? skillCatalogState.items[skillCatalogState.focusPathOnRender] : null;
+    if (focusedSkill) {
+        skillCatalogState.collapsedSources[skillSourceKey(focusedSkill)] = false;
+    }
     const blocks = skillSourceBlocks(visible);
     const starterPackItems = (runtime.starter_pack || {}).items || [];
+    const showStarterPack = skillsInventoryIsDefaultView();
 
     let html = renderSkillFilterBar(skills.length);
-    html += '<div class="card mb-16"><div class="card-body"><p class="text-sm text-secondary">Skills are grouped by where they came from so repo imports stay manageable. <span class="font-mono">Enabled</span> means Hermes can consider a skill on CLI turns. <span class="font-mono">Needs Setup</span> opens exact blockers plus shortcuts to the right setup flow.</p></div></div>';
-    html += '<div class="skills-source-grid">' + renderStarterPackBlock(starterPackItems);
+    html += '<div class="card mb-16"><div class="card-body"><p class="text-sm text-secondary">Skills are grouped into source blocks by where they came from, like <span class="font-mono">Hermes Web UI</span> or a repo import. The category you type, like <span class="font-mono">test</span>, appears on each skill card and in the category filter. <span class="font-mono">Enabled</span> means Hermes can consider a skill on CLI turns. <span class="font-mono">Needs Setup</span> opens exact blockers plus shortcuts to the right setup flow.</p></div></div>';
+    html += '<div class="skills-source-grid">';
+    if (showStarterPack) {
+        html += renderStarterPackBlock(starterPackItems);
+    }
 
     if (!skills.length) {
         html += '<div class="empty-state"><div class="empty-icon">' + UI_ICONS.books + '</div><h3>No Skills Found</h3><p>Skills directory is empty or no <span class="font-mono">SKILL.md</span> files were discovered.</p></div>';
         html += '</div>';
-        content.innerHTML = html;
+        finishSkillsInventoryRender(content, html, viewState);
         return;
     }
 
     if (!visible.length) {
         html += '<div class="empty-state"><div class="empty-icon">' + UI_ICONS.books + '</div><h3>No Matching Skills</h3><p>Try clearing filters or searching for a different skill name.</p></div>';
         html += '</div>';
-        content.innerHTML = html;
+        finishSkillsInventoryRender(content, html, viewState);
         return;
     }
 
     html += blocks.map(renderSkillSourceBlock).join('') + '</div>';
-    content.innerHTML = html;
+    finishSkillsInventoryRender(content, html, viewState);
 }
 
 window.setSkillSearch = function (value) {
@@ -2070,10 +3173,17 @@ window.setSkillSourceFilter = function (value) {
     renderSkillsInventory();
 };
 
+window.setSkillCategoryFilter = function (value) {
+    skillCatalogState.categoryFilter = value || 'all';
+    clearSelectedSkillsState();
+    renderSkillsInventory();
+};
+
 window.clearSkillFilters = function () {
     skillCatalogState.searchQuery = '';
     skillCatalogState.statusFilter = 'all';
     skillCatalogState.sourceFilter = 'all';
+    skillCatalogState.categoryFilter = 'all';
     clearSelectedSkillsState();
     renderSkillsInventory();
 };
@@ -2081,6 +3191,42 @@ window.clearSkillFilters = function () {
 window.clearSelectedSkills = function () {
     clearSelectedSkillsState();
     renderSkillsInventory();
+};
+
+window.openCreatedSkillInventory = function (path) {
+    const skillPath = String(path || '').trim();
+    if (skillPath) {
+        skillCatalogState.recentPaths[skillPath] = true;
+        skillCatalogState.focusPathOnRender = skillPath;
+        const existing = skillCatalogState.items[skillPath];
+        if (existing) {
+            skillCatalogState.collapsedSources[skillSourceKey(existing)] = false;
+        }
+    }
+    skillCatalogState.searchQuery = '';
+    skillCatalogState.statusFilter = 'all';
+    skillCatalogState.sourceFilter = 'all';
+    skillCatalogState.categoryFilter = 'all';
+    clearSelectedSkillsState();
+    navigate('skills');
+};
+
+window.openCreatedIntegrationInventory = function (name) {
+    const integrationName = String(name || '').trim();
+    if (integrationName) {
+        integrationCatalogState.recentNames[integrationName] = true;
+        integrationCatalogState.focusNameOnRender = integrationName;
+    }
+    navigate('channels');
+};
+
+window.openCreatedAgentInventory = function (name) {
+    const presetName = String(name || '').trim();
+    if (presetName) {
+        agentCatalogState.recentNames[presetName] = true;
+        agentCatalogState.focusNameOnRender = presetName;
+    }
+    navigate('agents');
 };
 
 window.toggleSkillSelection = function (path, checked) {
@@ -2146,6 +3292,7 @@ window.showSkillSourceDetails = function (path) {
     const source = skill.source || {};
     let html = '<div class="card mb-16"><div class="card-header"><span>Installed From</span></div><div class="card-body">';
     html += '<div class="form-group"><label class="form-label">Display</label><div class="font-mono text-sm">' + escH(skillSourceLabel(skill)) + '</div></div>';
+    html += '<div class="form-group"><label class="form-label">Category</label><div class="text-sm">' + escH(skillCategoryLabel(skill)) + '</div></div>';
     if (source.identifier) {
         html += '<div class="form-group"><label class="form-label">Identifier</label><div class="font-mono text-sm">' + escH(source.identifier) + '</div></div>';
     }
@@ -2664,8 +3811,10 @@ Screens.skills = async function () {
         rememberSkills(data.skills || []);
         skillCatalogState.runtime = status.runtime || {};
         skillCatalogState.policy = status.transport_policy || {};
+        if (!screenIsActive('skills')) return;
         renderSkillsInventory();
     } catch (e) {
+        if (!screenIsActive('skills')) return;
         content.innerHTML = '<div class="empty-state"><div class="empty-icon">\u26a0\ufe0f</div><h3>Error</h3><p>' + escH(e.message) + '</p></div>';
     }
 };
@@ -2726,14 +3875,26 @@ Screens.channels = async function () {
             api('GET', '/api/channels'),
             api('GET', '/api/chat/status').catch(() => ({})),
         ]);
+        if (!screenIsActive('channels')) return;
         const channels = data.integrations || data.channels || [];
+        const focusIntegrationName = integrationCatalogState.focusNameOnRender || '';
+        const orderedChannels = channels.slice().sort((a, b) => {
+            if (focusIntegrationName && a.name === focusIntegrationName && b.name !== focusIntegrationName) return -1;
+            if (focusIntegrationName && b.name === focusIntegrationName && a.name !== focusIntegrationName) return 1;
+            return 0;
+        });
+        const configuredNames = orderedChannels.filter(item => item && item.configured).map(item => item.label || item.name).filter(Boolean);
         const runtime = status.runtime || {};
         const policy = status.transport_policy || {};
         let html = renderRuntimeReadinessCard(runtime, policy);
         html += '<div class="card mb-16"><div class="card-body">';
-        html += '<p class="text-sm text-secondary mb-16">This screen edits Hermes app and integration config directly. Top-level sections like <span class="font-mono">discord</span> and <span class="font-mono">whatsapp</span> appear here, while Hooks remains a separate editor for the raw <span class="font-mono">hooks</span> block.</p>';
+        html += '<p class="text-sm text-secondary mb-16">This screen edits Hermes app and integration config directly. Top-level sections like <span class="font-mono">discord</span>, <span class="font-mono">whatsapp</span>, and <span class="font-mono">webhook</span> appear here. The separate <span class="font-mono">Raw Hooks</span> screen only edits the low-level <span class="font-mono">hooks</span> block.</p>';
+        if (configuredNames.length) {
+            html += '<div class="text-sm text-secondary mb-16">Configured now: ' + configuredNames.map(name => '<span class="badge badge-success">' + escH(name) + '</span>').join(' ') + '</div>';
+        }
         html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
-        html += '<button class="btn" onclick="navigate(\'hooks\')">Open Hooks</button>';
+        html += '<button class="btn btn-primary" onclick="openCreateCapability(\'integration\')">Create Integration</button>';
+        html += '<button class="btn" onclick="navigate(\'hooks\')">Open Raw Hooks</button>';
         html += '<button class="btn" onclick="navigate(\'skills\')">Open Skills</button>';
         html += '<button class="btn" onclick="navigate(\'env-vars\')">Open Env Vars</button>';
         html += '</div></div></div>';
@@ -2742,10 +3903,11 @@ Screens.channels = async function () {
             content.innerHTML = html;
             return;
         }
-        channels.forEach(ch => {
+        orderedChannels.forEach(ch => {
             const configured = !!ch.configured;
             const kindLabel = ch.kind === 'legacy_channel' ? 'Legacy Channel' : 'Integration';
-            html += '<div class="card mb-16"><div class="card-header"><span>' + escH(ch.label || ch.name) + '</span><div style="display:flex;gap:8px;flex-wrap:wrap"><span class="badge ' + (configured ? 'badge-success' : 'badge-secondary') + '">' + (configured ? 'Configured' : 'Empty') + '</span><span class="badge badge-info">' + escH(kindLabel) + '</span></div></div>';
+            const recent = !!integrationCatalogState.recentNames[ch.name || ''];
+            html += '<div class="card mb-16" id="' + escA(integrationElementId(ch.name || '')) + '"><div class="card-header"><span>' + escH(ch.label || ch.name) + '</span><div style="display:flex;gap:8px;flex-wrap:wrap"><span class="badge ' + (configured ? 'badge-success' : 'badge-secondary') + '">' + (configured ? 'Configured' : 'Empty') + '</span><span class="badge badge-info">' + escH(kindLabel) + '</span>' + (recent ? '<span class="badge badge-success">New</span>' : '') + '</div></div>';
             html += '<div class="card-body">';
             html += '<p class="text-sm text-secondary mb-12">' + escH(
                 ch.kind === 'legacy_channel'
@@ -2757,7 +3919,12 @@ Screens.channels = async function () {
             html += '</div></div>';
         });
         content.innerHTML = html;
+        if (focusIntegrationName) {
+            integrationCatalogState.focusNameOnRender = '';
+            requestAnimationFrame(() => focusInventoryCardById(integrationElementId(focusIntegrationName)));
+        }
     } catch (e) {
+        if (!screenIsActive('channels')) return;
         content.innerHTML = '<div class="empty-state"><div class="empty-icon">\u26a0\ufe0f</div><h3>Error</h3><p>' + escH(e.message) + '</p></div>';
     }
 };
@@ -2802,7 +3969,7 @@ Screens.hooks = async function () {
         const cfg = data.config || data;
         const runtime = status.runtime || {};
         let fields = '';
-        let intro = '<p class="text-sm text-secondary mb-16">This screen edits the raw <span class="font-mono">hooks</span> block in Hermes config. The web UI does not execute hooks by itself; whether they run depends on your Hermes runtime.</p>';
+        let intro = '<p class="text-sm text-secondary mb-16">This screen edits the raw <span class="font-mono">hooks</span> block in Hermes config. It is separate from the <span class="font-mono">Webhook</span> integration card on <span class="font-mono">Apps & Integrations</span>. The web UI does not execute hooks by itself; whether they run depends on your Hermes runtime.</p>';
         let recommended = '<div class="card mb-16"><div class="card-header"><span>Recommended Default</span></div><div class="card-body"><p class="text-sm text-secondary mb-12">Safe route: leave hooks empty unless you want a very specific approval, retry, or logging workflow. Memory, skills, and integrations do not need extra hooks to work.</p>';
         if (runtime.hooks && runtime.hooks.configured) {
             recommended += '<p class="text-sm text-secondary">Currently configured hooks: ' + escH((runtime.hooks.keys || []).join(', ')) + '</p>';
@@ -2815,7 +3982,7 @@ Screens.hooks = async function () {
             else fields += '<div class="form-group"><label class="form-label">' + escH(key) + '</label>' + inputH('hook-' + key, val) + '</div>';
         }
         if (!fields) fields = '<div class="empty-state"><p>No hooks configured yet.</p></div>';
-        content.innerHTML = recommended + '<div class="card"><div class="card-header"><span>Webhooks / Hooks</span></div><div class="card-body">' + intro + fields + '<button class="btn btn-primary mt-16" onclick="saveHooks()">Save Hooks</button></div></div>';
+        content.innerHTML = recommended + '<div class="card"><div class="card-header"><span>Raw Hooks</span></div><div class="card-body">' + intro + fields + '<button class="btn btn-primary mt-16" onclick="saveHooks()">Save Hooks</button></div></div>';
     } catch (e) {
         content.innerHTML = '<div class="empty-state"><div class="empty-icon">\u26a0\ufe0f</div><h3>Error</h3><p>' + escH(e.message) + '</p></div>';
     }
@@ -3664,7 +4831,7 @@ Screens.folders = async function () {
             <div class="card-header">
                 <span>Folders</span>
                 <div class="flex gap-8">
-                    <button class="btn btn-sm" onclick="chatCreateFolderPrompt()">New Folder</button>
+                    <button class="btn btn-sm" id="folders-screen-create" onclick="chatCreateFolderPrompt()">New Folder</button>
                 </div>
             </div>
             <div class="card-body">
@@ -3930,11 +5097,11 @@ async function chatLoadHistory() {
             api('GET', '/api/chat/folders'),
             api('GET', '/api/chat/sessions'),
         ]);
-        const list = document.getElementById('chat-history-list');
-        if (!list) return;
         const folders = folderData.folders || [];
         const sessions = sessionData.sessions || [];
         chatState.folders = folders.slice();
+        const list = document.getElementById('chat-history-list');
+        if (!list) return;
         const ungrouped = sessions.filter(s => !(s.session && s.session.folder_id));
         if (folders.length === 0 && ungrouped.length === 0) {
             list.innerHTML = '<div class="chat-history-empty">No chats yet.<br>Click + to start one.</div>';

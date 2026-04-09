@@ -10,6 +10,7 @@ import os
 import re
 import copy
 import json
+import hashlib
 import shutil
 import mimetypes
 import subprocess
@@ -126,8 +127,9 @@ def _find_hermes_bin():
         HERMES_HOME / "hermes-agent" / "venv" / "bin" / "hermes",  # legacy
     ]
     for path in candidates:
-        if path and path.exists():
-            return path
+        candidate = Path(path).expanduser() if path else None
+        if candidate and candidate.exists():
+            return candidate
     return candidates[0]
 
 HERMES_BIN = _find_hermes_bin()
@@ -277,6 +279,67 @@ INTEGRATION_SECTION_LABELS = {
     "webhook": "Webhook",
 }
 INTEGRATION_SECTION_ORDER = tuple(INTEGRATION_SECTION_LABELS.keys())
+INTEGRATION_CONFIG_TEMPLATES = {
+    "discord": {
+        "require_mention": True,
+        "free_response_channels": "",
+        "auto_thread": True,
+    },
+    "whatsapp": {},
+    "telegram": {},
+    "slack": {},
+    "matrix": {},
+    "webhook": {
+        "url": "",
+    },
+}
+INTEGRATION_ENV_TEMPLATES = {
+    "discord": (
+        {
+            "key": "DISCORD_TOKEN",
+            "group": "Channel",
+            "label": "Discord Token",
+            "description": "Bot token Hermes uses to connect to Discord.",
+            "secret": True,
+        },
+    ),
+    "telegram": (
+        {
+            "key": "TELEGRAM_BOT_TOKEN",
+            "group": "Channel",
+            "label": "Telegram Bot Token",
+            "description": "Bot token Hermes uses to connect to Telegram.",
+            "secret": True,
+        },
+    ),
+    "slack": (
+        {
+            "key": "SLACK_BOT_TOKEN",
+            "group": "Channel",
+            "label": "Slack Bot Token",
+            "description": "Bot token Hermes uses to connect to Slack.",
+            "secret": True,
+        },
+    ),
+    "matrix": (
+        {
+            "key": "MATRIX_ACCESS_TOKEN",
+            "group": "Channel",
+            "label": "Matrix Access Token",
+            "description": "Access token Hermes uses to connect to Matrix.",
+            "secret": True,
+        },
+    ),
+}
+AGENT_REASONING_EFFORT_OPTIONS = (
+    "",
+    "none",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "minimal",
+)
 ENV_GROUP_HELP = {
     "Provider": "Provider variables are API keys and optional endpoint overrides used by model providers and memory search. For standard OpenAI use, you usually only need OPENAI_API_KEY.",
     "Channel": "Channel variables are only needed when an integration or skill specifically asks for them. If you are not setting up Discord, WhatsApp, Slack, or another messaging bridge, you can usually leave this group alone.",
@@ -414,6 +477,113 @@ STARTER_PACK_SKILL_GROUPS = (
         ),
     },
 )
+CAPABILITY_RECOMMENDED_ORDER = (
+    "skill",
+    "integration",
+    "agent_preset",
+)
+CAPABILITY_ARCHITECTURE_RULES = [
+    "Skills are the primary Hermes extension mechanism.",
+    "Integrations store reusable connection and config for external systems.",
+    "Agent Presets compose model roles, skills, and integrations into a reusable working mode.",
+    "Every capability type must support a draft preview before any files or config are written.",
+]
+CAPABILITY_MVP_SCOPE = [
+    "Phase 1 ships Create Skill end-to-end first.",
+    "Phase 2 adds Create Integration on top of the same preview-and-approve flow.",
+    "Phase 3 adds Create Agent Preset that composes existing models, skills, and integrations.",
+]
+CAPABILITY_IMPLEMENTATION_ORDER = [
+    "Create Skill",
+    "Create Integration",
+    "Create Agent Preset",
+]
+CAPABILITY_TYPE_DEFINITIONS = {
+    "skill": {
+        "id": "skill",
+        "label": "Skill",
+        "phase": "Phase 1",
+        "status": "active",
+        "summary": "Primary Hermes extension mechanism stored as a skill folder with SKILL.md and optional helper assets.",
+        "data_model": [
+            "identity: name, slug, category, description",
+            "instructions: markdown body for when and how the skill should be used",
+            "setup: env vars, credential files, and required commands",
+            "assets: optional scripts/ and references/ folders",
+        ],
+        "ui_flow": [
+            "Choose Skill",
+            "Fill draft fields",
+            "Preview generated files and readiness blockers",
+            "Approve and write the skill folder",
+        ],
+        "layout": [
+            {"kind": "folder", "path": "~/.hermes/skills/<slug>/", "purpose": "Skill root directory"},
+            {"kind": "file", "path": "~/.hermes/skills/<slug>/SKILL.md", "purpose": "Skill instructions and metadata"},
+            {"kind": "folder", "path": "~/.hermes/skills/<slug>/scripts/", "purpose": "Optional helper scripts"},
+            {"kind": "folder", "path": "~/.hermes/skills/<slug>/references/", "purpose": "Optional reference material"},
+        ],
+        "mvp_scope": [
+            "Create a new skill from the UI",
+            "Preview generated SKILL.md before write",
+            "Feed setup metadata into the existing readiness and env-var flows",
+        ],
+    },
+    "integration": {
+        "id": "integration",
+        "label": "Integration",
+        "phase": "Phase 2",
+        "status": "active",
+        "summary": "Reusable connection and config blocks for Discord, Slack, webhooks, and other external systems.",
+        "data_model": [
+            "identity: name, slug, provider, label",
+            "config: structured JSON config block",
+            "secrets: env vars and credential references stored outside the visible config",
+            "readiness: configuration completeness and transport/runtime notes",
+        ],
+        "ui_flow": [
+            "Choose integration kind",
+            "Fill config and secret references",
+            "Preview config diff and readiness",
+            "Approve and write Hermes config",
+        ],
+        "layout": [
+            {"kind": "file", "path": "~/.hermes/config.yaml", "purpose": "Top-level integration sections and legacy channels config"},
+            {"kind": "file", "path": "~/.hermes/.env", "purpose": "Secrets and token storage when env vars are used"},
+        ],
+        "mvp_scope": [
+            "Create top-level integration blocks that match the current Apps & Integrations UI",
+            "Reuse existing env-var editing for secret setup",
+            "Preview config changes before save",
+        ],
+    },
+    "agent_preset": {
+        "id": "agent_preset",
+        "label": "Agent Preset",
+        "phase": "Phase 3",
+        "status": "active",
+        "summary": "Reusable agent working modes that compose model roles, enabled skills, and connected integrations.",
+        "data_model": [
+            "identity: name, slug, description",
+            "model composition: primary, fallback, and vision role bindings",
+            "capability composition: selected skills and integrations",
+            "agent settings: personality and execution defaults",
+        ],
+        "ui_flow": [
+            "Pick model-role targets",
+            "Select skills and integrations",
+            "Preview the composed preset",
+            "Approve and write the preset config",
+        ],
+        "layout": [
+            {"kind": "file", "path": "~/.hermes/config.yaml", "purpose": "Future agent preset storage alongside Hermes agent config"},
+        ],
+        "mvp_scope": [
+            "Compose existing model roles, skills, and integrations into reusable presets",
+            "Preview final role and capability bindings before save",
+        ],
+    },
+}
 VISION_REFERENCE_HINT_RE = re.compile(
     r"\b("
     r"screenshot|screen|image|photo|picture|diagram|ui"
@@ -1550,8 +1720,42 @@ class ConfigManager:
     """Manages reading, writing, and merging the Hermes YAML config."""
 
     def __init__(self):
-        self._config: dict = {}
+        object.__setattr__(self, "_config", {})
+        object.__setattr__(self, "_config_mtime_ns", None)
+        object.__setattr__(self, "_manual_override", False)
+        object.__setattr__(self, "_setting_from_disk", False)
         self.load()
+
+    def __setattr__(self, name, value):
+        object.__setattr__(self, name, value)
+        if name == "_config" and not getattr(self, "_setting_from_disk", False):
+            object.__setattr__(self, "_manual_override", True)
+            object.__setattr__(self, "_config_mtime_ns", self._config_file_mtime_ns())
+
+    def _config_file_mtime_ns(self):
+        try:
+            return CONFIG_PATH.stat().st_mtime_ns
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+
+    def _replace_config_from_disk(self, data):
+        object.__setattr__(self, "_setting_from_disk", True)
+        try:
+            object.__setattr__(self, "_config", data)
+        finally:
+            object.__setattr__(self, "_setting_from_disk", False)
+        object.__setattr__(self, "_manual_override", False)
+        object.__setattr__(self, "_config_mtime_ns", self._config_file_mtime_ns())
+
+    def load_if_changed(self):
+        """Reload config.yaml only when the on-disk file changed."""
+        if self._manual_override:
+            return
+        current_mtime_ns = self._config_file_mtime_ns()
+        if current_mtime_ns != self._config_mtime_ns:
+            self.load()
 
     # -- loading ----------------------------------------------------------
     def load(self):
@@ -1559,12 +1763,12 @@ class ConfigManager:
         if CONFIG_PATH.exists():
             try:
                 with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
-                    self._config = yaml.safe_load(fh) or {}
+                    self._replace_config_from_disk(yaml.safe_load(fh) or {})
             except Exception as exc:
-                self._config = {}
+                self._replace_config_from_disk({})
                 print(f"[ConfigManager] Failed to load config: {exc}")
         else:
-            self._config = {}
+            self._replace_config_from_disk({})
 
     # -- saving -----------------------------------------------------------
     def save(self):
@@ -1583,10 +1787,13 @@ class ConfigManager:
                 sort_keys=False,
                 allow_unicode=True,
             )
+        object.__setattr__(self, "_manual_override", False)
+        object.__setattr__(self, "_config_mtime_ns", self._config_file_mtime_ns())
 
     # -- getters ----------------------------------------------------------
     def get(self, section=None):
         """Return full config or a single section (masked)."""
+        self.load_if_changed()
         if section is None:
             return self.mask_secrets(copy.deepcopy(self._config))
         data = copy.deepcopy(self._config.get(section, {}))
@@ -1596,6 +1803,7 @@ class ConfigManager:
 
     def get_raw(self, section=None):
         """Return config or section WITHOUT masking (internal use)."""
+        self.load_if_changed()
         if section is None:
             return copy.deepcopy(self._config)
         return copy.deepcopy(self._config.get(section, {}))
@@ -2132,6 +2340,1154 @@ def _env_presets_by_group() -> dict[str, list[dict]]:
         meta = _env_var_metadata(key)
         grouped.setdefault(meta["group"], []).append(meta)
     return grouped
+
+
+def _slugify_capability(value: str) -> str:
+    text = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower())
+    return text.strip("-")
+
+
+def _capability_preview_token(capability_type: str, payload: dict) -> str:
+    def _canonicalize(value):
+        if isinstance(value, dict):
+            return {
+                str(key): _canonicalize(item)
+                for key, item in value.items()
+                if str(key) not in {"recorded_at"}
+            }
+        if isinstance(value, list):
+            return [_canonicalize(item) for item in value]
+        return value
+
+    encoded = json.dumps({
+        "type": str(capability_type or "").strip(),
+        "payload": _canonicalize(payload),
+    }, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _capability_status_badge(status: str) -> str:
+    if status == "active":
+        return "Active"
+    if status == "planned":
+        return "Planned Next"
+    return "Preview"
+
+
+def _capability_integration_options(raw: dict | None = None) -> list[dict]:
+    raw = raw if raw is not None else cfg.get_raw()
+    existing = {entry.get("name"): entry for entry in _integration_entries(raw)}
+    options = []
+    for key in INTEGRATION_SECTION_ORDER:
+        entry = existing.get(key) or {}
+        config_value = raw.get(key)
+        if not isinstance(config_value, dict):
+            config_value = copy.deepcopy(INTEGRATION_CONFIG_TEMPLATES.get(key) or {})
+        options.append({
+            "name": key,
+            "label": INTEGRATION_SECTION_LABELS.get(key, key.title()),
+            "kind": "integration",
+            "configured": bool(entry.get("configured")),
+            "exists": isinstance(raw.get(key), dict),
+            "config": cfg.mask_secrets(copy.deepcopy(config_value)),
+            "config_template": copy.deepcopy(INTEGRATION_CONFIG_TEMPLATES.get(key) or {}),
+            "suggested_env_vars": [
+                _normalize_capability_env_var(item)
+                for item in (INTEGRATION_ENV_TEMPLATES.get(key) or ())
+                if _normalize_capability_env_var(item)
+            ],
+        })
+    return options
+
+
+def _agent_defaults(raw: dict | None = None) -> dict:
+    raw = raw if raw is not None else cfg.get_raw()
+    agent_cfg = raw.get("agent", {})
+    return copy.deepcopy(agent_cfg) if isinstance(agent_cfg, dict) else {}
+
+
+def _agent_personality_sections(raw: dict | None = None) -> tuple[dict, dict]:
+    raw = raw if raw is not None else cfg.get_raw()
+    agent_cfg = raw.get("agent", {})
+    nested = agent_cfg.get("personalities", {}) if isinstance(agent_cfg, dict) else {}
+    legacy = raw.get("personalities", {})
+    nested = copy.deepcopy(nested) if isinstance(nested, dict) else {}
+    legacy = copy.deepcopy(legacy) if isinstance(legacy, dict) else {}
+    return nested, legacy
+
+
+def _agent_personality_entries(raw: dict | None = None) -> tuple[dict[str, object], dict[str, str]]:
+    nested, legacy = _agent_personality_sections(raw)
+    merged = {}
+    storage = {}
+    for name, value in legacy.items():
+        merged[str(name)] = copy.deepcopy(value)
+        storage[str(name)] = "legacy"
+    for name, value in nested.items():
+        merged[str(name)] = copy.deepcopy(value)
+        storage[str(name)] = "agent"
+    return merged, storage
+
+
+def _normalize_personality_value(value) -> object:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, dict):
+        return str(value or "")
+    system_prompt = str(value.get("system_prompt") or value.get("prompt") or "").strip()
+    description = str(value.get("description") or "").strip()
+    tone = str(value.get("tone") or "").strip()
+    style = str(value.get("style") or "").strip()
+    metadata = copy.deepcopy(value.get("metadata")) if isinstance(value.get("metadata"), dict) else None
+    extra = {
+        key: copy.deepcopy(item)
+        for key, item in value.items()
+        if key not in {"prompt", "system_prompt", "description", "tone", "style", "metadata"}
+    }
+    if not any((description, tone, style, metadata, extra)):
+        return system_prompt
+    normalized = {}
+    if description:
+        normalized["description"] = description
+    if system_prompt:
+        normalized["system_prompt"] = system_prompt
+    if tone:
+        normalized["tone"] = tone
+    if style:
+        normalized["style"] = style
+    if metadata:
+        normalized["metadata"] = metadata
+    normalized.update(extra)
+    return normalized
+
+
+def _personality_system_prompt(value) -> str:
+    if isinstance(value, dict):
+        parts = [str(value.get("system_prompt") or value.get("prompt") or "").strip()]
+        if value.get("tone"):
+            parts.append(f"Tone: {value['tone']}")
+        if value.get("style"):
+            parts.append(f"Style: {value['style']}")
+        return "\n".join(part for part in parts if part)
+    return str(value or "")
+
+
+def _personality_entry_for_api(name: str, value) -> dict:
+    normalized = _normalize_personality_value(value)
+    metadata = normalized.get("metadata") if isinstance(normalized, dict) and isinstance(normalized.get("metadata"), dict) else {}
+    hermes_meta = metadata.get("hermes_web_ui") if isinstance(metadata, dict) else {}
+    return {
+        "name": name,
+        "kind": str((hermes_meta or {}).get("capability_type") or "personality"),
+        "description": str((normalized.get("description") if isinstance(normalized, dict) else "") or "").strip(),
+        "system_prompt": _personality_system_prompt(normalized),
+        "value": cfg.mask_secrets(copy.deepcopy(normalized)),
+        "metadata": cfg.mask_secrets(copy.deepcopy(metadata)) if metadata else {},
+    }
+
+
+def _capability_catalog() -> dict:
+    raw = cfg.get_raw()
+    integrations = _integration_entries(raw)
+    skills = _discover_skill_entries()
+    configured_integrations = [entry for entry in integrations if entry.get("configured")]
+    model_roles = {
+        role: _model_role_info(role)
+        for role in MODEL_ROLE_LABELS
+    }
+    profiles = []
+    usage_map = _provider_usage_map(raw=raw)
+    for profile in _available_provider_profiles(raw):
+        safe = cfg.mask_secrets(profile)
+        safe["used_by"] = usage_map.get(profile.get("name", ""), [])
+        safe["has_api_key"] = bool(profile.get("api_key") or _provider_env_api_key(profile.get("provider")))
+        safe["provider_label"] = _provider_display_name(profile.get("provider", ""))
+        profiles.append(safe)
+    personalities, storage = _agent_personality_entries(raw)
+    return {
+        "recommended_order": list(CAPABILITY_IMPLEMENTATION_ORDER),
+        "architecture_rules": list(CAPABILITY_ARCHITECTURE_RULES),
+        "mvp_scope": list(CAPABILITY_MVP_SCOPE),
+        "types": [
+            {
+                **definition,
+                "status_label": _capability_status_badge(definition.get("status", "")),
+            }
+            for definition in (CAPABILITY_TYPE_DEFINITIONS[key] for key in CAPABILITY_RECOMMENDED_ORDER)
+        ],
+        "context": {
+            "skills_dir": str(SKILLS_DIR),
+            "integrations_total": len(integrations),
+            "integrations_configured": len(configured_integrations),
+            "integration_names": [entry.get("name") for entry in integrations if entry.get("name")],
+            "integration_options": _capability_integration_options(raw),
+            "model_roles": model_roles,
+            "provider_profiles": profiles,
+            "skills": [
+                {
+                    "path": skill.get("path"),
+                    "name": skill.get("name"),
+                    "description": skill.get("description"),
+                    "enabled": bool(skill.get("enabled")),
+                    "ready": bool(((skill.get("setup") or {}).get("ready"))),
+                }
+                for skill in skills
+            ],
+            "agent_defaults": {
+                key: value
+                for key, value in _agent_defaults(raw).items()
+                if key != "personalities"
+            },
+            "personality_names": sorted(personalities.keys(), key=str.casefold),
+            "personality_storage": storage,
+        },
+    }
+
+
+def _normalize_capability_env_var(entry) -> dict:
+    if isinstance(entry, str):
+        entry = {"key": entry}
+    if not isinstance(entry, dict):
+        return {}
+    raw_key = str(entry.get("key") or "").strip().upper()
+    key = re.sub(r"[^A-Z0-9_]", "_", raw_key).strip("_")
+    if not key:
+        return {}
+    base = _env_var_metadata(key)
+    group = str(entry.get("group") or base.get("group") or _classify_env_key(key)).strip()
+    if group not in ENV_GROUP_HELP:
+        group = _classify_env_key(key)
+    label = str(entry.get("label") or base.get("label") or key).strip() or key
+    description = str(entry.get("description") or base.get("description") or "").strip()
+    default_value = str(entry.get("default_value") or base.get("default_value") or "").strip()
+    secret = bool(entry.get("secret")) if "secret" in entry else bool(base.get("secret"))
+    recommended = bool(entry.get("recommended")) if "recommended" in entry else bool(base.get("recommended"))
+    return {
+        "key": key,
+        "group": group,
+        "label": label,
+        "description": description,
+        "default_value": default_value,
+        "secret": secret,
+        "recommended": recommended,
+    }
+
+
+def _normalize_capability_credential_file(entry) -> dict:
+    if isinstance(entry, str):
+        entry = {"path": entry}
+    if not isinstance(entry, dict):
+        return {}
+    rel_path = _safe_skill_rel_path(entry.get("path") or "")
+    if not rel_path:
+        return {}
+    label = str(entry.get("label") or Path(rel_path).name).strip() or Path(rel_path).name
+    description = str(entry.get("description") or "").strip()
+    return {
+        "path": rel_path,
+        "label": label,
+        "description": description,
+    }
+
+
+def _normalize_capability_required_command(entry) -> dict:
+    if isinstance(entry, str):
+        entry = {"name": entry}
+    if not isinstance(entry, dict):
+        return {}
+    name = str(entry.get("name") or "").strip()
+    if not name:
+        return {}
+    description = str(entry.get("description") or "").strip()
+    return {
+        "name": name,
+        "description": description,
+    }
+
+
+def _normalize_capability_env_assignment(entry) -> dict:
+    if isinstance(entry, str):
+        entry = {"key": entry}
+    if not isinstance(entry, dict):
+        return {}
+    normalized = _normalize_capability_env_var(entry)
+    if not normalized:
+        return {}
+    value = entry.get("value")
+    normalized["value"] = str(value) if value is not None else ""
+    return normalized
+
+
+def _restore_text_file(path: Path, previous_text: str | None) -> None:
+    if previous_text is None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(previous_text, encoding="utf-8")
+
+
+def _normalize_integration_capability_draft(data: dict | None) -> tuple[dict, list[str]]:
+    payload = data if isinstance(data, dict) else {}
+    kind = str(payload.get("kind") or payload.get("name") or "").strip().lower()
+    config = payload.get("config")
+    if isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except Exception:
+            config = {"__invalid_json__": True}
+    if config is None:
+        config = copy.deepcopy(INTEGRATION_CONFIG_TEMPLATES.get(kind) or {})
+    env_vars = []
+    seen_env_keys = set()
+    for entry in payload.get("env_vars") if isinstance(payload.get("env_vars"), list) else []:
+        normalized = _normalize_capability_env_assignment(entry)
+        key = normalized.get("key")
+        if not key or key in seen_env_keys:
+            continue
+        seen_env_keys.add(key)
+        env_vars.append(normalized)
+
+    normalized = {
+        "kind": kind,
+        "label": INTEGRATION_SECTION_LABELS.get(kind, kind.title()),
+        "config": copy.deepcopy(config) if isinstance(config, dict) else config,
+        "env_vars": env_vars,
+    }
+    errors = []
+    if kind not in INTEGRATION_SECTION_LABELS:
+        errors.append("Integration kind is required")
+    if not isinstance(config, dict) or config.get("__invalid_json__"):
+        errors.append("Integration config must be a JSON object")
+    return normalized, errors
+
+
+def _integration_capability_conflicts(kind: str, raw: dict | None = None) -> list[str]:
+    raw = raw if raw is not None else cfg.get_raw()
+    current = raw.get(kind)
+    if isinstance(current, dict) and _integration_config_is_configured(current):
+        return [str(CONFIG_PATH)]
+    return []
+
+
+def _integration_capability_readiness(draft: dict, env_values: dict[str, str] | None = None) -> dict:
+    env_values = env_values or {}
+    blockers = []
+    issues = []
+    for entry in draft.get("env_vars") or []:
+        key = entry.get("key") or ""
+        value = str(entry.get("value") or env_values.get(key) or "").strip()
+        if value:
+            continue
+        blockers.append({
+            "kind": "env_var",
+            "key": key,
+            "group": entry.get("group") or _classify_env_key(key),
+            "message": f"missing env var {key}",
+        })
+        issues.append(f"missing env var {key}")
+    if not _integration_config_is_configured(draft.get("config") or {}):
+        blockers.append({
+            "kind": "config",
+            "message": "integration config is still empty",
+        })
+        issues.append("integration config is still empty")
+    return {
+        "ready": not blockers,
+        "issues": issues,
+        "blockers": blockers,
+    }
+
+
+def _preview_integration_capability(data: dict | None) -> tuple[dict, int]:
+    draft, errors = _normalize_integration_capability_draft(data)
+    if errors:
+        return {"ok": False, "error": "; ".join(errors)}, 400
+
+    raw = cfg.get_raw()
+    env_values = dotenv_values(str(ENV_PATH)) if ENV_PATH.exists() else {}
+    current = raw.get(draft["kind"])
+    exists = isinstance(current, dict)
+    conflicts = _integration_capability_conflicts(draft["kind"], raw=raw)
+    readiness = _integration_capability_readiness(draft, env_values=env_values)
+
+    next_raw = copy.deepcopy(raw)
+    next_raw[draft["kind"]] = copy.deepcopy(draft["config"])
+    integration_entry = next(
+        (entry for entry in _integration_entries(next_raw) if entry.get("name") == draft["kind"]),
+        {
+            "name": draft["kind"],
+            "label": draft["label"],
+            "kind": "integration",
+            "configured": _integration_config_is_configured(draft["config"]),
+            "config": cfg.mask_secrets(copy.deepcopy(draft["config"])),
+            "source": "top_level",
+        },
+    )
+    integration_entry["readiness"] = readiness
+
+    writes = [{
+        "kind": "file",
+        "path": str(CONFIG_PATH),
+        "action": "update" if exists else "create",
+        "label": f"Set {draft['label']} integration block",
+        "content": json.dumps(draft.get("config") or {}, indent=2, sort_keys=True),
+    }]
+    env_overrides = []
+    for entry in draft.get("env_vars") or []:
+        key = entry.get("key") or ""
+        value = str(entry.get("value") or "")
+        current_value = str(env_values.get(key) or "")
+        if value:
+            if current_value and current_value != value:
+                env_overrides.append(key)
+            writes.append({
+                "kind": "file",
+                "path": str(ENV_PATH),
+                "action": "update" if ENV_PATH.exists() else "create",
+                "label": f"Set env var {key}",
+                "key": key,
+                "content": _mask_value(key, value),
+            })
+
+    warnings = []
+    if conflicts:
+        warnings.append("This integration is already configured. Edit it from Apps & Integrations instead of creating it again.")
+    if not _integration_config_is_configured(draft.get("config") or {}):
+        warnings.append("The config block is still empty, so Apps & Integrations may continue to show it as Empty.")
+    for key in env_overrides:
+        warnings.append(f"{key} already exists in ~/.hermes/.env and will be overwritten.")
+    if exists and not conflicts:
+        warnings.append("This will fill an existing empty integration section in config.yaml.")
+
+    preview_payload = {
+        "draft": draft,
+        "integration": {
+            **integration_entry,
+            "config_raw": copy.deepcopy(draft["config"]),
+            "env_vars": [
+                {
+                    key: value
+                    for key, value in entry.items()
+                    if key != "value"
+                }
+                for entry in (draft.get("env_vars") or [])
+            ],
+            "readiness": readiness,
+        },
+        "writes": writes,
+        "conflicts": conflicts,
+    }
+    preview_token = _capability_preview_token("integration", preview_payload)
+    return {
+        "ok": True,
+        "type": "integration",
+        "phase": "Phase 2",
+        "preview_token": preview_token,
+        "can_apply": not conflicts,
+        "draft": draft,
+        "summary": {
+            "name": draft.get("label") or draft.get("kind") or "Integration",
+            "kind": draft.get("kind") or "",
+            "target_dir": str(CONFIG_PATH),
+            "env_var_count": len(draft.get("env_vars") or []),
+            "env_write_count": len([entry for entry in (draft.get("env_vars") or []) if str(entry.get("value") or "").strip()]),
+            "configured": bool(integration_entry.get("configured")),
+            "conflict_count": len(conflicts),
+        },
+        "warnings": warnings,
+        "conflicts": conflicts,
+        "writes": writes,
+        "manifest": {
+            "integration": {
+                key: value
+                for key, value in preview_payload["integration"].items()
+                if key != "config_raw"
+            },
+            "integration_config": copy.deepcopy(draft["config"]),
+        },
+    }, 200
+
+
+def _apply_integration_capability(data: dict | None, preview_token: str) -> tuple[dict, int]:
+    preview, status = _preview_integration_capability(data)
+    if status != 200:
+        return preview, status
+    if not preview_token or preview_token != preview.get("preview_token"):
+        return {"ok": False, "error": "Preview has changed. Refresh the draft preview before approval."}, 409
+    if not preview.get("can_apply"):
+        return {"ok": False, "error": "This integration is already configured. Edit it from Apps & Integrations instead."}, 409
+
+    draft = preview.get("draft") or {}
+    config_before = CONFIG_PATH.read_text(encoding="utf-8") if CONFIG_PATH.exists() else None
+    env_before = ENV_PATH.read_text(encoding="utf-8") if ENV_PATH.exists() else None
+    try:
+        for entry in draft.get("env_vars") or []:
+            value = str(entry.get("value") or "")
+            if not value:
+                continue
+            ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
+            set_key(str(ENV_PATH), entry.get("key") or "", value)
+        cfg.set(str(draft.get("kind") or ""), copy.deepcopy(draft.get("config") or {}))
+    except Exception:
+        _restore_text_file(ENV_PATH, env_before)
+        _restore_text_file(CONFIG_PATH, config_before)
+        cfg.load()
+        raise
+
+    cfg.load()
+    created = next(
+        (entry for entry in _integration_entries() if entry.get("name") == draft.get("kind")),
+        None,
+    )
+    return {
+        "ok": True,
+        "type": "integration",
+        "created": {
+            "name": draft.get("label") or draft.get("kind") or "Integration",
+            "kind": draft.get("kind") or "",
+            "target_dir": str(CONFIG_PATH),
+            "files": [str(CONFIG_PATH)] + ([str(ENV_PATH)] if any(str(item.get("value") or "").strip() for item in (draft.get("env_vars") or [])) else []),
+            "integration": created,
+        },
+    }, 200
+
+
+def _normalize_agent_preset_role(role: str, payload, profile_names: set[str]) -> tuple[dict, list[str]]:
+    data = payload if isinstance(payload, dict) else {}
+    profile = str(data.get("profile") or "").strip()
+    model = str(data.get("model") or "").strip()
+    routing_provider = str(data.get("routing_provider") or "").strip()
+    enabled = role == "primary" or bool(data.get("enabled")) or bool(profile or model or routing_provider)
+    normalized = {
+        "enabled": enabled,
+        "profile": profile,
+        "model": model,
+        "routing_provider": routing_provider,
+    }
+    errors = []
+    if enabled and not profile:
+        errors.append(f"{MODEL_ROLE_LABELS.get(role, role.title())} requires a provider profile")
+    if enabled and not model:
+        errors.append(f"{MODEL_ROLE_LABELS.get(role, role.title())} requires a model")
+    if profile and profile not in profile_names:
+        errors.append(f"{MODEL_ROLE_LABELS.get(role, role.title())} profile '{profile}' was not found")
+    return normalized, errors
+
+
+def _render_agent_preset_fragment(name: str, personality: dict) -> str:
+    fragment = {
+        "agent": {
+            "personalities": {
+                name: personality,
+            }
+        }
+    }
+    return yaml.safe_dump(
+        fragment,
+        default_flow_style=False,
+        sort_keys=False,
+        allow_unicode=True,
+    ).strip() + "\n"
+
+
+def _normalize_agent_preset_draft(data: dict | None) -> tuple[dict, list[str]]:
+    payload = data if isinstance(data, dict) else {}
+    raw = cfg.get_raw()
+    profile_names = {
+        str(profile.get("name") or "").strip()
+        for profile in _available_provider_profiles(raw)
+        if str(profile.get("name") or "").strip()
+    }
+    skill_map = {
+        str(skill.get("path") or "").strip(): skill
+        for skill in _discover_skill_entries()
+        if str(skill.get("path") or "").strip()
+    }
+    integration_names = {
+        str(item.get("name") or "").strip()
+        for item in _capability_integration_options(raw)
+        if str(item.get("name") or "").strip()
+    }
+
+    name = str(payload.get("name") or "").strip()
+    description = str(payload.get("description") or "").strip()
+    system_prompt = str(payload.get("system_prompt") or payload.get("prompt") or "").strip()
+    reasoning_effort = str(payload.get("reasoning_effort") or "").strip().lower()
+    max_turns_raw = payload.get("max_turns")
+    max_turns = None
+    if max_turns_raw not in (None, "", False):
+        try:
+            max_turns = int(max_turns_raw)
+        except (TypeError, ValueError):
+            max_turns = "invalid"
+
+    roles = {}
+    errors = []
+    role_payload = payload.get("roles") if isinstance(payload.get("roles"), dict) else {}
+    for role in MODEL_ROLE_LABELS:
+        normalized_role, role_errors = _normalize_agent_preset_role(role, role_payload.get(role), profile_names)
+        roles[role] = normalized_role
+        errors.extend(role_errors)
+
+    skills = []
+    seen_skills = set()
+    for value in payload.get("skills") if isinstance(payload.get("skills"), list) else []:
+        path = str(value or "").strip()
+        if not path or path in seen_skills:
+            continue
+        seen_skills.add(path)
+        if path not in skill_map:
+            errors.append(f"Selected skill '{path}' was not found")
+            continue
+        skills.append(path)
+
+    integrations = []
+    seen_integrations = set()
+    for value in payload.get("integrations") if isinstance(payload.get("integrations"), list) else []:
+        name_value = str(value or "").strip()
+        if not name_value or name_value in seen_integrations:
+            continue
+        seen_integrations.add(name_value)
+        if name_value not in integration_names:
+            errors.append(f"Selected integration '{name_value}' was not found")
+            continue
+        integrations.append(name_value)
+
+    normalized = {
+        "name": name[:120].rstrip(),
+        "description": description[:400].rstrip(),
+        "system_prompt": system_prompt[:12000].rstrip(),
+        "roles": roles,
+        "skills": skills,
+        "integrations": integrations,
+        "reasoning_effort": reasoning_effort,
+        "max_turns": max_turns,
+    }
+    if not normalized["name"]:
+        errors.append("Preset name is required")
+    if normalized["max_turns"] == "invalid" or (isinstance(normalized["max_turns"], int) and normalized["max_turns"] <= 0):
+        errors.append("Max turns must be a positive integer")
+    if normalized["reasoning_effort"] and normalized["reasoning_effort"] not in AGENT_REASONING_EFFORT_OPTIONS:
+        errors.append("Reasoning effort must be one of none, low, medium, high, xhigh, or minimal")
+    return normalized, errors
+
+
+def _agent_preset_conflicts(name: str, raw: dict | None = None) -> list[str]:
+    personalities, _ = _agent_personality_entries(raw)
+    if str(name or "").strip() in personalities:
+        return [str(CONFIG_PATH)]
+    return []
+
+
+def _agent_preset_personality_manifest(draft: dict) -> dict:
+    metadata = {
+        "hermes_web_ui": {
+            "capability_type": "agent_preset",
+            "schema_version": 1,
+            "created_via": "hermes-web-ui",
+            "model_roles": copy.deepcopy(draft.get("roles") or {}),
+            "skills": list(draft.get("skills") or []),
+            "integrations": list(draft.get("integrations") or []),
+            "agent_defaults": {},
+        }
+    }
+    if draft.get("reasoning_effort"):
+        metadata["hermes_web_ui"]["agent_defaults"]["reasoning_effort"] = draft["reasoning_effort"]
+    if isinstance(draft.get("max_turns"), int):
+        metadata["hermes_web_ui"]["agent_defaults"]["max_turns"] = draft["max_turns"]
+    if not metadata["hermes_web_ui"]["agent_defaults"]:
+        metadata["hermes_web_ui"].pop("agent_defaults", None)
+    personality = {
+        "description": draft.get("description") or f"{draft.get('name') or 'Preset'} created in Hermes Web UI.",
+        "system_prompt": draft.get("system_prompt") or draft.get("description") or f"You are the {draft.get('name') or 'agent preset'} preset.",
+        "metadata": metadata,
+    }
+    return personality
+
+
+def _preview_agent_preset_capability(data: dict | None) -> tuple[dict, int]:
+    draft, errors = _normalize_agent_preset_draft(data)
+    if errors:
+        return {"ok": False, "error": "; ".join(errors)}, 400
+
+    raw = cfg.get_raw()
+    personalities, storage = _agent_personality_entries(raw)
+    skill_map = {
+        str(skill.get("path") or "").strip(): skill
+        for skill in _discover_skill_entries()
+        if str(skill.get("path") or "").strip()
+    }
+    integration_map = {
+        str(item.get("name") or "").strip(): item
+        for item in _capability_integration_options(raw)
+        if str(item.get("name") or "").strip()
+    }
+
+    conflicts = _agent_preset_conflicts(draft["name"], raw=raw)
+    warnings = []
+    if conflicts:
+        existing_source = storage.get(draft["name"], "agent")
+        warnings.append(f"A preset or personality already exists with this name in {existing_source}.")
+
+    skill_details = []
+    for path in draft.get("skills") or []:
+        skill = skill_map.get(path) or {}
+        if not skill.get("enabled"):
+            warnings.append(f"Skill '{path}' is currently disabled.")
+        elif not ((skill.get("setup") or {}).get("ready", True)):
+            warnings.append(f"Skill '{path}' still needs setup.")
+        skill_details.append({
+            "path": path,
+            "name": skill.get("name") or path,
+            "enabled": bool(skill.get("enabled")),
+            "ready": bool((skill.get("setup") or {}).get("ready", True)),
+        })
+
+    integration_details = []
+    for name in draft.get("integrations") or []:
+        item = integration_map.get(name) or {}
+        if not item.get("configured"):
+            warnings.append(f"Integration '{name}' is not configured yet.")
+        integration_details.append({
+            "name": name,
+            "label": item.get("label") or name,
+            "configured": bool(item.get("configured")),
+        })
+
+    personality = _agent_preset_personality_manifest(draft)
+    writes = [{
+        "kind": "file",
+        "path": str(CONFIG_PATH),
+        "action": "update",
+        "label": f"Save preset {draft['name']} under agent.personalities",
+        "content": _render_agent_preset_fragment(draft["name"], personality),
+    }]
+    preview_payload = {
+        "draft": draft,
+        "personality": personality,
+        "writes": writes,
+        "conflicts": conflicts,
+    }
+    preview_token = _capability_preview_token("agent_preset", preview_payload)
+    return {
+        "ok": True,
+        "type": "agent_preset",
+        "phase": "Phase 3",
+        "preview_token": preview_token,
+        "can_apply": not conflicts,
+        "draft": draft,
+        "summary": {
+            "name": draft.get("name") or "Agent Preset",
+            "target_dir": str(CONFIG_PATH),
+            "skill_count": len(draft.get("skills") or []),
+            "integration_count": len(draft.get("integrations") or []),
+            "enabled_role_count": len([role for role, entry in (draft.get("roles") or {}).items() if entry.get("enabled")]),
+            "conflict_count": len(conflicts),
+        },
+        "warnings": warnings,
+        "conflicts": conflicts,
+        "writes": writes,
+        "manifest": {
+            "personality": personality,
+            "skills": skill_details,
+            "integrations": integration_details,
+            "storage_path": f"agent.personalities.{draft['name']}",
+            "existing_personality": copy.deepcopy(personalities.get(draft["name"])) if draft["name"] in personalities else None,
+        },
+    }, 200
+
+
+def _apply_agent_preset_capability(data: dict | None, preview_token: str) -> tuple[dict, int]:
+    preview, status = _preview_agent_preset_capability(data)
+    if status != 200:
+        return preview, status
+    if not preview_token or preview_token != preview.get("preview_token"):
+        return {"ok": False, "error": "Preview has changed. Refresh the draft preview before approval."}, 409
+    if not preview.get("can_apply"):
+        return {"ok": False, "error": "A preset or personality already exists with this name."}, 409
+
+    draft = preview.get("draft") or {}
+    personality = copy.deepcopy(((preview.get("manifest") or {}).get("personality")) or {})
+    config_before = CONFIG_PATH.read_text(encoding="utf-8") if CONFIG_PATH.exists() else None
+    try:
+        raw = cfg.get_raw()
+        agent_cfg = raw.get("agent", {})
+        if not isinstance(agent_cfg, dict):
+            agent_cfg = {}
+        personalities = agent_cfg.get("personalities", {})
+        if not isinstance(personalities, dict):
+            personalities = {}
+        personalities[str(draft.get("name") or "")] = personality
+        agent_cfg["personalities"] = personalities
+        cfg.set("agent", agent_cfg)
+    except Exception:
+        _restore_text_file(CONFIG_PATH, config_before)
+        cfg.load()
+        raise
+
+    cfg.load()
+    merged, _ = _agent_personality_entries()
+    return {
+        "ok": True,
+        "type": "agent_preset",
+        "created": {
+            "name": draft.get("name") or "Agent Preset",
+            "target_dir": str(CONFIG_PATH),
+            "files": [str(CONFIG_PATH)],
+            "personality": copy.deepcopy(merged.get(str(draft.get("name") or ""))),
+        },
+    }, 200
+
+
+def _normalize_skill_capability_draft(data: dict | None) -> tuple[dict, list[str]]:
+    payload = data if isinstance(data, dict) else {}
+    name = str(payload.get("name") or "").strip()
+    slug = _slugify_capability(str(payload.get("slug") or "").strip() or name)
+    category = str(payload.get("category") or "").strip()
+    description = str(payload.get("description") or "").strip()
+    instructions = str(payload.get("instructions") or "").strip()
+    include_scripts = bool(payload.get("include_scripts"))
+    include_references = bool(payload.get("include_references"))
+
+    env_vars = []
+    seen_env_keys = set()
+    for entry in payload.get("env_vars") if isinstance(payload.get("env_vars"), list) else []:
+        normalized = _normalize_capability_env_var(entry)
+        key = normalized.get("key")
+        if not key or key in seen_env_keys:
+            continue
+        seen_env_keys.add(key)
+        env_vars.append(normalized)
+
+    credential_files = []
+    seen_paths = set()
+    for entry in payload.get("credential_files") if isinstance(payload.get("credential_files"), list) else []:
+        normalized = _normalize_capability_credential_file(entry)
+        rel_path = normalized.get("path")
+        if not rel_path or rel_path in seen_paths:
+            continue
+        seen_paths.add(rel_path)
+        credential_files.append(normalized)
+
+    required_commands = []
+    seen_commands = set()
+    for entry in payload.get("required_commands") if isinstance(payload.get("required_commands"), list) else []:
+        normalized = _normalize_capability_required_command(entry)
+        command_name = normalized.get("name")
+        if not command_name or command_name in seen_commands:
+            continue
+        seen_commands.add(command_name)
+        required_commands.append(normalized)
+
+    normalized = {
+        "name": name[:120].rstrip(),
+        "slug": slug,
+        "category": category[:120].rstrip(),
+        "description": description[:400].rstrip(),
+        "instructions": instructions[:12000].rstrip(),
+        "env_vars": env_vars,
+        "credential_files": credential_files,
+        "required_commands": required_commands,
+        "include_scripts": include_scripts,
+        "include_references": include_references,
+    }
+    errors = []
+    if not normalized["name"]:
+        errors.append("Skill name is required")
+    if not normalized["slug"]:
+        errors.append("Skill slug is required")
+    return normalized, errors
+
+
+def _render_skill_capability_frontmatter(draft: dict) -> dict:
+    frontmatter = {
+        "name": draft.get("name") or "",
+        "description": draft.get("description") or f"{draft.get('name') or 'Skill'} created in Hermes Web UI.",
+    }
+    if draft.get("category"):
+        frontmatter["category"] = draft["category"]
+    if draft.get("env_vars"):
+        frontmatter["prerequisites"] = {
+            "env_vars": [entry.get("key") for entry in draft["env_vars"] if entry.get("key")],
+        }
+    if draft.get("credential_files"):
+        frontmatter["required_credential_files"] = [
+            {
+                key: value
+                for key, value in entry.items()
+                if value not in (None, "", [])
+            }
+            for entry in draft["credential_files"]
+        ]
+
+    metadata = {
+        "hermes_web_ui": {
+            "capability_type": "skill",
+            "schema_version": 1,
+            "created_via": "hermes-web-ui",
+            "setup": {},
+        }
+    }
+    if draft.get("required_commands"):
+        metadata["openclaw"] = {
+            "requires": {
+                "bins": [entry.get("name") for entry in draft["required_commands"] if entry.get("name")],
+            }
+        }
+    setup = metadata["hermes_web_ui"]["setup"]
+    if draft.get("env_vars"):
+        setup["env_vars"] = draft["env_vars"]
+    if draft.get("credential_files"):
+        setup["credential_files"] = draft["credential_files"]
+    if draft.get("required_commands"):
+        setup["required_commands"] = draft["required_commands"]
+    if draft.get("include_scripts") or draft.get("include_references"):
+        setup["folders"] = {
+            "scripts": bool(draft.get("include_scripts")),
+            "references": bool(draft.get("include_references")),
+        }
+    if setup:
+        frontmatter["metadata"] = metadata
+    return frontmatter
+
+
+def _render_skill_capability_markdown(draft: dict, frontmatter: dict) -> str:
+    frontmatter_yaml = yaml.safe_dump(
+        frontmatter,
+        default_flow_style=False,
+        sort_keys=False,
+        allow_unicode=True,
+    ).strip()
+    instructions = draft.get("instructions") or (
+        f"Describe when to use the {draft.get('name') or 'skill'} capability, what steps it should follow, "
+        "and any constraints or output expectations."
+    )
+    lines = [
+        "---",
+        frontmatter_yaml,
+        "---",
+        "",
+        f"# {draft.get('name') or 'New Skill'}",
+        "",
+        draft.get("description") or "Reusable Hermes skill created in Hermes Web UI.",
+        "",
+        "## Instructions",
+        instructions,
+    ]
+
+    env_vars = draft.get("env_vars") or []
+    credential_files = draft.get("credential_files") or []
+    required_commands = draft.get("required_commands") or []
+    if env_vars or credential_files or required_commands:
+        lines.extend(["", "## Setup Requirements"])
+        if env_vars:
+            lines.append("")
+            lines.append("### Environment Variables")
+            for entry in env_vars:
+                detail = str(entry.get("description") or "").strip()
+                label = str(entry.get("label") or entry.get("key") or "").strip()
+                line = f"- `{entry.get('key')}`"
+                if label and label != entry.get("key"):
+                    line += f" - {label}"
+                if detail:
+                    line += f": {detail}"
+                lines.append(line)
+        if credential_files:
+            lines.append("")
+            lines.append("### Credential Files")
+            for entry in credential_files:
+                detail = str(entry.get("description") or "").strip()
+                line = f"- `{entry.get('path')}`"
+                if detail:
+                    line += f": {detail}"
+                lines.append(line)
+        if required_commands:
+            lines.append("")
+            lines.append("### Required Commands")
+            for entry in required_commands:
+                detail = str(entry.get("description") or "").strip()
+                line = f"- `{entry.get('name')}`"
+                if detail:
+                    line += f": {detail}"
+                lines.append(line)
+
+    included_folders = []
+    if draft.get("include_scripts"):
+        included_folders.append("`scripts/` for helper automation")
+    if draft.get("include_references"):
+        included_folders.append("`references/` for docs and examples")
+    if included_folders:
+        lines.extend(["", "## Included Folders"])
+        lines.extend([f"- {item}" for item in included_folders])
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _capability_skill_source_metadata() -> dict:
+    return _build_skill_source_record(
+        "hermes-web-ui/create-skill",
+        install_mode="webui_create",
+        display="Hermes Web UI",
+        catalog_source="create-capability",
+    )
+
+
+def _capability_skill_conflicts(slug: str) -> list[str]:
+    info = _skill_request_paths(slug)
+    if not info:
+        return []
+    return [
+        str(path)
+        for path in info.get("variants") or []
+        if isinstance(path, Path) and path.exists()
+    ]
+
+
+def _preview_skill_capability(data: dict | None) -> tuple[dict, int]:
+    draft, errors = _normalize_skill_capability_draft(data)
+    if errors:
+        return {"ok": False, "error": "; ".join(errors)}, 400
+
+    frontmatter = _render_skill_capability_frontmatter(draft)
+    skill_md = _render_skill_capability_markdown(draft, frontmatter)
+    source = _capability_skill_source_metadata()
+    skill = {
+        "name": frontmatter.get("name") or draft.get("name") or draft.get("slug") or "Skill",
+        "category": frontmatter.get("category") or "",
+        "description": frontmatter.get("description") or "",
+        "path": draft.get("slug") or "",
+        "enabled": True,
+        "frontmatter": frontmatter,
+        "source": source,
+    }
+    skill["setup"] = _skill_setup_readiness(skill)
+
+    target_dir = SKILLS_DIR / draft["slug"]
+    writes = [{
+        "kind": "directory",
+        "path": str(target_dir),
+        "action": "create",
+        "label": "Skill folder",
+    }, {
+        "kind": "file",
+        "path": str(target_dir / "SKILL.md"),
+        "action": "create",
+        "label": "Skill instructions",
+        "content": skill_md,
+    }]
+    if draft.get("include_scripts"):
+        writes.append({
+            "kind": "directory",
+            "path": str(target_dir / "scripts"),
+            "action": "create",
+            "label": "Optional scripts folder",
+        })
+    if draft.get("include_references"):
+        writes.append({
+            "kind": "directory",
+            "path": str(target_dir / "references"),
+            "action": "create",
+            "label": "Optional references folder",
+        })
+
+    conflicts = _capability_skill_conflicts(draft["slug"])
+    warnings = []
+    if conflicts:
+        warnings.append("A skill already exists for this slug. Change the slug before approval.")
+
+    preview_payload = {
+        "draft": draft,
+        "skill": {
+            **skill,
+            "setup": skill.get("setup") or {},
+        },
+        "writes": writes,
+        "conflicts": conflicts,
+    }
+    preview_token = _capability_preview_token("skill", preview_payload)
+    return {
+        "ok": True,
+        "type": "skill",
+        "phase": "Phase 1",
+        "preview_token": preview_token,
+        "can_apply": not conflicts,
+        "draft": draft,
+        "summary": {
+            "name": draft.get("name") or draft.get("slug") or "Skill",
+            "slug": draft.get("slug") or "",
+            "target_dir": str(target_dir),
+            "description": frontmatter.get("description") or "",
+            "conflict_count": len(conflicts),
+            "env_var_count": len(draft.get("env_vars") or []),
+            "credential_file_count": len(draft.get("credential_files") or []),
+            "required_command_count": len(draft.get("required_commands") or []),
+        },
+        "warnings": warnings,
+        "conflicts": conflicts,
+        "writes": writes,
+        "manifest": {
+            "skill": skill,
+        },
+    }, 200
+
+
+def _apply_skill_capability(data: dict | None, preview_token: str) -> tuple[dict, int]:
+    preview, status = _preview_skill_capability(data)
+    if status != 200:
+        return preview, status
+    if not preview_token or preview_token != preview.get("preview_token"):
+        return {"ok": False, "error": "Preview has changed. Refresh the draft preview before approval."}, 409
+    if not preview.get("can_apply"):
+        return {"ok": False, "error": "This skill slug is already taken. Change the slug and preview again."}, 409
+
+    draft = preview.get("draft") or {}
+    target_dir = SKILLS_DIR / str(draft.get("slug") or "")
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    if target_dir.exists():
+        return {"ok": False, "error": "This skill already exists on disk."}, 409
+    tmp_dir = target_dir.parent / f".{target_dir.name}.tmp-{uuid.uuid4().hex[:8]}"
+    skill_md_content = next(
+        (entry.get("content") for entry in (preview.get("writes") or []) if entry.get("path") == str(target_dir / "SKILL.md")),
+        "",
+    )
+    try:
+        tmp_dir.mkdir(parents=False, exist_ok=False)
+        (tmp_dir / "SKILL.md").write_text(
+            skill_md_content,
+            encoding="utf-8",
+        )
+        if draft.get("include_scripts"):
+            (tmp_dir / "scripts").mkdir(exist_ok=True)
+        if draft.get("include_references"):
+            (tmp_dir / "references").mkdir(exist_ok=True)
+        _write_skill_source_metadata(tmp_dir, _capability_skill_source_metadata())
+        tmp_dir.rename(target_dir)
+    except Exception:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+    try:
+        created_skill = next(
+            (entry for entry in _discover_skill_entries() if entry.get("path") == draft.get("slug")),
+            None,
+        )
+    except Exception:
+        created_skill = copy.deepcopy(((preview.get("manifest") or {}).get("skill") if isinstance(preview.get("manifest"), dict) else {}) or None)
+    return {
+        "ok": True,
+        "type": "skill",
+        "created": {
+            "name": draft.get("name") or draft.get("slug") or "Skill",
+            "slug": draft.get("slug") or "",
+            "target_dir": str(target_dir),
+            "files": [entry.get("path") for entry in (preview.get("writes") or []) if entry.get("path")],
+            "skill": created_skill,
+        },
+    }, 200
 
 
 def _run_hermes(*args, timeout: int = 30) -> subprocess.CompletedProcess:
@@ -2677,19 +4033,33 @@ def api_env_get():
     try:
         raw = dotenv_values(str(ENV_PATH)) if ENV_PATH.exists() else {}
         masked = {k: _mask_value(k, v) for k, v in raw.items() if v is not None}
+        skills = _discover_skill_entries()
+        dynamic_presets = _skill_env_var_presets(skills)
 
         groups: dict[str, list[str]] = {}
         for k in masked:
             g = _classify_env_key(k)
             groups.setdefault(g, []).append(k)
 
-        metadata = {k: _env_var_metadata(k) for k in masked}
+        metadata = {
+            k: dynamic_presets.get(k) or _env_var_metadata(k)
+            for k in masked
+        }
+        presets = _env_presets_by_group()
+        for key, meta in dynamic_presets.items():
+            group = meta.get("group") or _classify_env_key(key)
+            bucket = presets.setdefault(group, [])
+            if any(str(item.get("key") or "").strip() == key for item in bucket if isinstance(item, dict)):
+                continue
+            bucket.append(meta)
+        for values in presets.values():
+            values.sort(key=lambda item: str(item.get("label") or item.get("key") or "").casefold())
         return jsonify({
             "vars": masked,
             "groups": groups,
             "metadata": metadata,
             "group_help": ENV_GROUP_HELP,
-            "presets": _env_presets_by_group(),
+            "presets": presets,
         })
     except Exception as exc:
         return _http_error(str(exc))
@@ -3163,12 +4533,17 @@ def api_provider_discovery_endpoints(name):
 def api_agents_get():
     try:
         raw = cfg.get_raw()
-        agent_cfg = raw.get("agent", {})
-        personalities = agent_cfg.get("personalities", {})
+        agent_cfg = _agent_defaults(raw)
+        personalities, _ = _agent_personality_entries(raw)
+        entries = [
+            _personality_entry_for_api(name, value)
+            for name, value in sorted(personalities.items(), key=lambda item: str(item[0]).casefold())
+        ]
         # Return agent defaults plus personalities (masked)
         result = {
             "defaults": cfg.mask_secrets({k: v for k, v in agent_cfg.items() if k != "personalities"}),
             "personalities": cfg.mask_secrets(personalities),
+            "entries": entries,
         }
         return jsonify(result)
     except Exception as exc:
@@ -3185,13 +4560,18 @@ def api_agents_add():
             return jsonify({"ok": False, "error": "name is required"}), 400
 
         raw = cfg.get_raw()
-        agent_cfg = raw.get("agent", {})
-        personalities = agent_cfg.get("personalities", {})
+        personalities, _ = _agent_personality_entries(raw)
         if name in personalities:
             return jsonify({"ok": False, "error": f"Agent '{name}' already exists"}), 409
 
-        personalities[name] = {k: v for k, v in data.items() if k != "name"}
-        agent_cfg["personalities"] = personalities
+        agent_cfg = raw.get("agent", {})
+        if not isinstance(agent_cfg, dict):
+            agent_cfg = {}
+        nested = agent_cfg.get("personalities", {})
+        if not isinstance(nested, dict):
+            nested = {}
+        nested[name] = _normalize_personality_value({k: v for k, v in data.items() if k != "name"})
+        agent_cfg["personalities"] = nested
         cfg.set("agent", agent_cfg)
         return jsonify({"ok": True})
     except Exception as exc:
@@ -3204,14 +4584,30 @@ def api_agents_update(name):
     try:
         data = request.get_json(force=True)
         raw = cfg.get_raw()
-        agent_cfg = raw.get("agent", {})
-        personalities = agent_cfg.get("personalities", {})
+        personalities, storage = _agent_personality_entries(raw)
         if name not in personalities:
             return jsonify({"ok": False, "error": f"Agent '{name}' not found"}), 404
 
-        personalities[name] = ConfigManager.deep_merge(personalities[name], data)
-        agent_cfg["personalities"] = personalities
-        cfg.set("agent", agent_cfg)
+        if storage.get(name) == "legacy":
+            legacy = raw.get("personalities", {})
+            if not isinstance(legacy, dict):
+                legacy = {}
+            current = legacy.get(name, "")
+            merged = ConfigManager.deep_merge(current, data) if isinstance(current, dict) else {**data, "system_prompt": str(data.get("system_prompt") or data.get("prompt") or current or "")}
+            legacy[name] = _normalize_personality_value(merged)
+            cfg.set("personalities", legacy)
+        else:
+            agent_cfg = raw.get("agent", {})
+            if not isinstance(agent_cfg, dict):
+                agent_cfg = {}
+            nested = agent_cfg.get("personalities", {})
+            if not isinstance(nested, dict):
+                nested = {}
+            current = nested.get(name, "")
+            merged = ConfigManager.deep_merge(current, data) if isinstance(current, dict) else {**data, "system_prompt": str(data.get("system_prompt") or data.get("prompt") or current or "")}
+            nested[name] = _normalize_personality_value(merged)
+            agent_cfg["personalities"] = nested
+            cfg.set("agent", agent_cfg)
         return jsonify({"ok": True})
     except Exception as exc:
         return _http_error(str(exc))
@@ -3222,14 +4618,26 @@ def api_agents_update(name):
 def api_agents_delete(name):
     try:
         raw = cfg.get_raw()
-        agent_cfg = raw.get("agent", {})
-        personalities = agent_cfg.get("personalities", {})
+        personalities, storage = _agent_personality_entries(raw)
         if name not in personalities:
             return jsonify({"ok": False, "error": f"Agent '{name}' not found"}), 404
 
-        del personalities[name]
-        agent_cfg["personalities"] = personalities
-        cfg.set("agent", agent_cfg)
+        if storage.get(name) == "legacy":
+            legacy = raw.get("personalities", {})
+            if not isinstance(legacy, dict):
+                legacy = {}
+            legacy.pop(name, None)
+            cfg.set("personalities", legacy)
+        else:
+            agent_cfg = raw.get("agent", {})
+            if not isinstance(agent_cfg, dict):
+                agent_cfg = {}
+            nested = agent_cfg.get("personalities", {})
+            if not isinstance(nested, dict):
+                nested = {}
+            nested.pop(name, None)
+            agent_cfg["personalities"] = nested
+            cfg.set("agent", agent_cfg)
         return jsonify({"ok": True})
     except Exception as exc:
         return _http_error(str(exc))
@@ -3245,21 +4653,91 @@ def api_agents_duplicate(name):
             return jsonify({"ok": False, "error": "new_name is required"}), 400
 
         raw = cfg.get_raw()
-        agent_cfg = raw.get("agent", {})
-        personalities = agent_cfg.get("personalities", {})
+        personalities, storage = _agent_personality_entries(raw)
         if name not in personalities:
             return jsonify({"ok": False, "error": f"Agent '{name}' not found"}), 404
+        if new_name in personalities:
+            return jsonify({"ok": False, "error": f"Agent '{new_name}' already exists"}), 409
 
-        personalities[new_name] = copy.deepcopy(personalities[name])
-        agent_cfg["personalities"] = personalities
-        cfg.set("agent", agent_cfg)
+        if storage.get(name) == "legacy":
+            legacy = raw.get("personalities", {})
+            if not isinstance(legacy, dict):
+                legacy = {}
+            legacy[new_name] = copy.deepcopy(legacy.get(name))
+            cfg.set("personalities", legacy)
+        else:
+            agent_cfg = raw.get("agent", {})
+            if not isinstance(agent_cfg, dict):
+                agent_cfg = {}
+            nested = agent_cfg.get("personalities", {})
+            if not isinstance(nested, dict):
+                nested = {}
+            nested[new_name] = copy.deepcopy(nested.get(name))
+            agent_cfg["personalities"] = nested
+            cfg.set("agent", agent_cfg)
         return jsonify({"ok": True})
     except Exception as exc:
         return _http_error(str(exc))
 
 
 # ===================================================================
-# 21–22. Skills
+# 21–23. Capability Builder
+# ===================================================================
+
+@app.route("/api/capabilities", methods=["GET"])
+@require_token
+def api_capabilities_get():
+    try:
+        return jsonify(_capability_catalog())
+    except Exception as exc:
+        return _http_error(str(exc))
+
+
+@app.route("/api/capabilities/preview", methods=["POST"])
+@require_token
+def api_capabilities_preview():
+    try:
+        data = request.get_json(force=True) or {}
+        capability_type = str(data.get("type") or "").strip().lower()
+        draft = data.get("draft") if isinstance(data.get("draft"), dict) else {}
+        if capability_type == "skill":
+            payload, status = _preview_skill_capability(draft)
+            return jsonify(payload), status
+        if capability_type == "integration":
+            payload, status = _preview_integration_capability(draft)
+            return jsonify(payload), status
+        if capability_type == "agent_preset":
+            payload, status = _preview_agent_preset_capability(draft)
+            return jsonify(payload), status
+        return jsonify({"ok": False, "error": "Capability type is required"}), 400
+    except Exception as exc:
+        return _http_error(str(exc))
+
+
+@app.route("/api/capabilities/apply", methods=["POST"])
+@require_token
+def api_capabilities_apply():
+    try:
+        data = request.get_json(force=True) or {}
+        capability_type = str(data.get("type") or "").strip().lower()
+        draft = data.get("draft") if isinstance(data.get("draft"), dict) else {}
+        preview_token = str(data.get("preview_token") or "").strip()
+        if capability_type == "skill":
+            payload, status = _apply_skill_capability(draft, preview_token)
+            return jsonify(payload), status
+        if capability_type == "integration":
+            payload, status = _apply_integration_capability(draft, preview_token)
+            return jsonify(payload), status
+        if capability_type == "agent_preset":
+            payload, status = _apply_agent_preset_capability(draft, preview_token)
+            return jsonify(payload), status
+        return jsonify({"ok": False, "error": "Capability type is required"}), 400
+    except Exception as exc:
+        return _http_error(str(exc))
+
+
+# ===================================================================
+# 24–25. Skills
 # ===================================================================
 
 @app.route("/api/skills", methods=["GET"])
@@ -3584,9 +5062,7 @@ def api_sessions_config_put():
 def api_hooks_get():
     try:
         hooks = cfg.get("hooks")
-        if not hooks:
-            return jsonify({"hooks": {}, "webhook": {}})
-        return jsonify(hooks)
+        return jsonify({"config": hooks if isinstance(hooks, dict) else {}})
     except Exception as exc:
         return _http_error(str(exc))
 
@@ -4459,66 +5935,133 @@ def _skill_wants_integration_setup(skill: dict, env_blockers: list[dict]) -> boo
     return any(hint in haystack for hint in ("discord", "whatsapp", "slack", "telegram", "matrix", "webhook"))
 
 
-def _skill_setup_readiness(skill: dict) -> dict:
+def _skill_setup_details(skill: dict) -> dict:
     frontmatter = skill.get("frontmatter") if isinstance(skill.get("frontmatter"), dict) else {}
+    metadata = frontmatter.get("metadata") if isinstance(frontmatter.get("metadata"), dict) else {}
+    ui_setup = {}
+    if isinstance(metadata.get("hermes_web_ui"), dict):
+        ui_setup = metadata["hermes_web_ui"].get("setup") if isinstance(metadata["hermes_web_ui"].get("setup"), dict) else {}
+
+    env_vars = []
+    seen_env = set()
+    for entry in ui_setup.get("env_vars") if isinstance(ui_setup.get("env_vars"), list) else []:
+        normalized = _normalize_capability_env_var(entry)
+        key = normalized.get("key")
+        if not key or key in seen_env:
+            continue
+        seen_env.add(key)
+        env_vars.append(normalized)
+    prerequisites = frontmatter.get("prerequisites")
+    legacy_env_vars = _clean_string_list(prerequisites.get("env_vars")) if isinstance(prerequisites, dict) else []
+    for env_key in legacy_env_vars:
+        normalized = _normalize_capability_env_var(env_key)
+        key = normalized.get("key")
+        if not key or key in seen_env:
+            continue
+        seen_env.add(key)
+        env_vars.append(normalized)
+
+    credential_files = []
+    seen_paths = set()
+    for entry in ui_setup.get("credential_files") if isinstance(ui_setup.get("credential_files"), list) else []:
+        normalized = _normalize_capability_credential_file(entry)
+        rel_path = normalized.get("path")
+        if not rel_path or rel_path in seen_paths:
+            continue
+        seen_paths.add(rel_path)
+        credential_files.append(normalized)
+    required_files = frontmatter.get("required_credential_files")
+    if isinstance(required_files, list):
+        for entry in required_files:
+            normalized = _normalize_capability_credential_file(entry)
+            rel_path = normalized.get("path")
+            if not rel_path or rel_path in seen_paths:
+                continue
+            seen_paths.add(rel_path)
+            credential_files.append(normalized)
+
+    required_commands = []
+    seen_commands = set()
+    for entry in ui_setup.get("required_commands") if isinstance(ui_setup.get("required_commands"), list) else []:
+        normalized = _normalize_capability_required_command(entry)
+        name = normalized.get("name")
+        if not name or name in seen_commands:
+            continue
+        seen_commands.add(name)
+        required_commands.append(normalized)
+    openclaw_meta = metadata.get("openclaw") if isinstance(metadata.get("openclaw"), dict) else {}
+    legacy_bins = _clean_string_list(((openclaw_meta.get("requires") or {}).get("bins"))) if isinstance(openclaw_meta, dict) else []
+    for binary in legacy_bins:
+        normalized = _normalize_capability_required_command(binary)
+        name = normalized.get("name")
+        if not name or name in seen_commands:
+            continue
+        seen_commands.add(name)
+        required_commands.append(normalized)
+
+    return {
+        "env_vars": env_vars,
+        "credential_files": credential_files,
+        "required_commands": required_commands,
+    }
+
+
+def _skill_setup_readiness(skill: dict) -> dict:
     skill_dir = _skill_absolute_path(skill)
     issues = []
     blockers = []
     actions = []
+    details = _skill_setup_details(skill)
 
-    required_files = frontmatter.get("required_credential_files")
-    if isinstance(required_files, list):
-        for entry in required_files:
-            if not isinstance(entry, dict):
-                continue
-            rel_path = str(entry.get("path") or "").strip()
-            if not rel_path or not skill_dir:
-                continue
-            target = (skill_dir / rel_path).resolve()
-            if not target.exists():
-                message = f"missing credential file {rel_path}"
-                issues.append(message)
-                blockers.append({
-                    "kind": "credential_file",
-                    "path": rel_path,
-                    "absolute_path": str(target),
-                    "message": message,
-                })
+    for entry in details.get("credential_files") or []:
+        rel_path = str(entry.get("path") or "").strip()
+        if not rel_path or not skill_dir:
+            continue
+        target = (skill_dir / rel_path).resolve()
+        if not target.exists():
+            message = f"missing credential file {rel_path}"
+            issues.append(message)
+            blockers.append({
+                "kind": "credential_file",
+                "path": rel_path,
+                "label": str(entry.get("label") or Path(rel_path).name).strip(),
+                "description": str(entry.get("description") or "").strip(),
+                "absolute_path": str(target),
+                "message": message,
+            })
 
-    prerequisites = frontmatter.get("prerequisites")
-    env_vars = []
-    if isinstance(prerequisites, dict):
-        env_vars = _clean_string_list(prerequisites.get("env_vars"))
     env_blockers = []
-    for env_key in env_vars:
+    for env_entry in details.get("env_vars") or []:
+        env_key = str(env_entry.get("key") or "").strip()
+        if not env_key:
+            continue
         if not _runtime_env_value(env_key, ""):
-            env_meta = _env_var_metadata(env_key)
             message = f"missing env var {env_key}"
             issues.append(message)
             blocker = {
                 "kind": "env_var",
                 "key": env_key,
-                "group": env_meta.get("group") or _classify_env_key(env_key),
-                "label": env_meta.get("label") or env_key,
-                "description": env_meta.get("description") or "",
+                "group": env_entry.get("group") or _classify_env_key(env_key),
+                "label": env_entry.get("label") or env_key,
+                "description": env_entry.get("description") or "",
+                "default_value": str(env_entry.get("default_value") or "").strip(),
+                "secret": bool(env_entry.get("secret")),
                 "message": message,
             }
             blockers.append(blocker)
             env_blockers.append(blocker)
 
-    metadata = frontmatter.get("metadata")
-    required_bins = []
-    if isinstance(metadata, dict):
-        openclaw_meta = metadata.get("openclaw")
-        if isinstance(openclaw_meta, dict):
-            required_bins = _clean_string_list(((openclaw_meta.get("requires") or {}).get("bins")))
-    for binary in required_bins:
+    for command_entry in details.get("required_commands") or []:
+        binary = str(command_entry.get("name") or "").strip()
+        if not binary:
+            continue
         if shutil.which(binary) is None:
             message = f"missing command {binary}"
             issues.append(message)
             blockers.append({
                 "kind": "command",
                 "name": binary,
+                "description": str(command_entry.get("description") or "").strip(),
                 "message": message,
             })
 
@@ -4527,6 +6070,9 @@ def _skill_setup_readiness(skill: dict) -> dict:
             "type": "env_var",
             "key": blocker.get("key"),
             "group": blocker.get("group"),
+            "description": blocker.get("description"),
+            "default_value": blocker.get("default_value"),
+            "secret": blocker.get("secret"),
             "label": f"Set {blocker.get('label') or blocker.get('key')}",
         })
 
@@ -4551,7 +6097,27 @@ def _skill_setup_readiness(skill: dict) -> dict:
         "issues": issues,
         "blockers": blockers,
         "actions": unique_actions,
+        "requirements": details,
     }
+
+
+def _skill_env_var_presets(skills: list[dict] | None = None) -> dict[str, dict]:
+    catalog = {}
+    for skill in skills if skills is not None else _discover_skill_entries():
+        requirements = ((skill.get("setup") or {}).get("requirements") if isinstance(skill.get("setup"), dict) else {}) or {}
+        for entry in requirements.get("env_vars") if isinstance(requirements.get("env_vars"), list) else []:
+            normalized = _normalize_capability_env_var(entry)
+            key = normalized.get("key")
+            if not key:
+                continue
+            existing = catalog.get(key, {})
+            merged = {
+                **_env_var_metadata(key),
+                **existing,
+                **normalized,
+            }
+            catalog[key] = merged
+    return catalog
 
 
 def _starter_pack_skill_group(item_id: str) -> dict | None:

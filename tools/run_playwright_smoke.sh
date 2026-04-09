@@ -21,7 +21,24 @@ fi
 export TMPDIR=/tmp
 export TMP=/tmp
 export TEMP=/tmp
-export PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-browsers
+export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}"
+
+if ! "$HOME/.hermes/.venv/bin/python" - <<'PY' >/dev/null 2>&1
+import os
+from pathlib import Path
+
+browser_root = Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"])
+patterns = (
+    "chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell",
+    "chromium-*/chrome-linux/chrome",
+)
+found = any(any(browser_root.glob(pattern)) for pattern in patterns)
+raise SystemExit(0 if found else 1)
+PY
+then
+  echo "Installing Playwright Chromium into $PLAYWRIGHT_BROWSERS_PATH ..." >&2
+  "$HOME/.hermes/.venv/bin/python" -m playwright install chromium >&2
+fi
 
 exec "$HOME/.hermes/.venv/bin/python" \
   "$ROOT_DIR/tools/playwright_smoke.py" \

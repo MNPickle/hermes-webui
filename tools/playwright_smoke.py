@@ -91,6 +91,16 @@ def find_first_folder_with_chats(page):
     return None
 
 
+def open_new_folder_modal(page) -> None:
+    # Prefer the persistent sidebar action because the folders screen can still
+    # be finishing its async render when the first header button appears.
+    sidebar_create = page.locator("#folders-nav-create")
+    if sidebar_create.count():
+        sidebar_create.click()
+        return
+    page.locator("#folders-screen-create").click()
+
+
 def main() -> int:
     args = parse_args()
     shot_dir = Path(args.screenshot_dir) if args.screenshot_dir else Path(tempfile.mkdtemp(prefix="hermes-pw-smoke-"))
@@ -141,13 +151,103 @@ def main() -> int:
         wait(page, 150)
         assert_screen_has_no_broken_literals(page, "skills")
         assert_screen_has_no_broken_literals(page, "channels")
+        assert_screen_has_no_broken_literals(page, "capabilities")
+        page.wait_for_selector("text=Skill Draft", timeout=15000)
+        page.click('button[data-screen="skills"]')
+        page.wait_for_selector("#skill-search", timeout=10000)
+        expect(page.locator("#skill-category-filter").count() == 1, "Skills screen is missing the category filter")
+        source_options = page.locator("#skill-source-filter option").evaluate_all(
+            "options => options.map(option => ({ value: option.value, label: (option.textContent || '').trim() }))"
+        )
+        filtered_source = next((option["value"] for option in source_options if option["value"] != "all"), "")
+        expect(bool(filtered_source), "Skills source filter did not expose any source options")
+        page.select_option("#skill-source-filter", filtered_source)
+        wait(page, 300)
+        expect(
+            page.locator(".starter-pack-block").count() == 0,
+            "Starter Pack should be hidden once the Skills view is filtered by source",
+        )
+        page.select_option("#skill-source-filter", "all")
+        wait(page, 300)
+        expect(
+            page.locator(".starter-pack-block").count() == 1,
+            "Starter Pack should return in the default unfiltered Skills view",
+        )
+        page.locator("#skill-search").click()
+        for ch in "Git ":
+            page.keyboard.type(ch)
+            page.wait_for_timeout(50)
+        expect(
+            page.locator("#skill-search").input_value() == "Git ",
+            "Skills search input lost typed text while filtering the inventory",
+        )
+        page.locator("#skill-search").fill("")
+        page.click('button[data-screen="capabilities"]')
+        page.wait_for_selector("text=Skill Draft", timeout=10000)
+
+        page.locator(".skill-page-actions button", has_text="Create Integration").click()
+        page.wait_for_selector("text=Integration Draft", timeout=5000)
+        expect(
+            page.locator(".skill-page-actions .btn.btn-primary", has_text="Create Integration").count() == 1,
+            "Capability switcher did not highlight Create Integration",
+        )
+
+        page.locator(".skill-page-actions button", has_text="Create Agent Preset").click()
+        page.wait_for_selector("text=Preset Draft", timeout=5000)
+        expect(
+            page.locator(".skill-page-actions .btn.btn-primary", has_text="Create Agent Preset").count() == 1,
+            "Capability switcher did not highlight Create Agent Preset",
+        )
+
+        page.locator(".skill-page-actions button", has_text="Create Skill").click()
+        page.wait_for_selector("text=Skill Draft", timeout=5000)
+        expect(
+            page.locator(".skill-page-actions .btn.btn-primary", has_text="Create Skill").count() == 1,
+            "Capability switcher did not highlight Create Skill",
+        )
+        page.locator("#capability-skill-name").click()
+        page.keyboard.type("UI Test Skill")
+        page.locator("#capability-skill-category").click()
+        for ch in "testing":
+            page.keyboard.type(ch)
+            page.wait_for_timeout(50)
+        expect(
+            page.locator("#capability-skill-category").input_value() == "testing",
+            "Capability builder lost typed text while editing the category field",
+        )
+        page.set_viewport_size({"width": 900, "height": 650})
+        wait(page, 300)
+        page.locator("#capability-skill-description").fill("Simple UI test skill")
+        page.locator("#capability-skill-instructions").fill("This is a test skill created from the Hermes Web UI.")
+        page.locator(".capability-builder-actions .btn.btn-primary", has_text="Preview Draft").click()
+        expect(wait_for_toast(page, "draft preview ready"), "Capability preview ready toast did not appear")
+        page.wait_for_selector("#capability-approve-button", timeout=5000)
+        page.wait_for_timeout(800)
+        approval_rect = page.locator("#capability-approve-button").evaluate(
+            """
+            el => {
+                const rect = el.getBoundingClientRect();
+                return {
+                    top: rect.top,
+                    bottom: rect.bottom,
+                    innerHeight: window.innerHeight,
+                };
+            }
+            """
+        )
+        expect(
+            approval_rect["top"] < approval_rect["innerHeight"] and approval_rect["bottom"] > 0,
+            "Capability preview did not bring the approval button into view",
+        )
+        page.set_viewport_size({"width": 1440, "height": 1200})
+        wait(page, 300)
 
         page.click('button[data-screen="folders"]')
         page.wait_for_selector(".folder-admin-card", timeout=10000)
         page.screenshot(path=str(shot_dir / "folders.png"), full_page=True)
 
         first_folder_title = page.locator(".folder-admin-title").first.inner_text(timeout=3000).strip()
-        page.click("text=New Folder")
+        open_new_folder_modal(page)
         page.wait_for_selector("#chat-folder-title", timeout=5000)
         page.fill("#chat-folder-title", first_folder_title)
         page.press("#chat-folder-title", "Enter")
@@ -156,7 +256,7 @@ def main() -> int:
         page.click('#modal-footer .btn:not(.btn-primary)')
         wait(page, 300)
 
-        page.click("text=New Folder")
+        open_new_folder_modal(page)
         page.wait_for_selector("#chat-folder-title", timeout=5000)
         page.fill("#chat-folder-title", temp_folder_name)
         page.click("#modal-footer .btn.btn-primary")

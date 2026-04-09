@@ -4,6 +4,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -272,6 +273,19 @@ class HermesWebUISmokeTests(unittest.TestCase):
                 mod._call_api_server({}, [{"role": "user", "content": "describe"}], "sid-1", prefer_vision=True)
 
         self.assertIn("image too small", str(ctx.exception))
+
+    def test_find_hermes_bin_accepts_string_path_from_shutil_which(self):
+        tmp_home = Path(self.tmpdir.name) / "home"
+        hermes_path = tmp_home / "bin" / "hermes"
+        hermes_path.parent.mkdir(parents=True)
+        hermes_path.write_text("#!/bin/sh\n", encoding="utf-8")
+
+        with patch.object(mod, "HERMES_HOME", tmp_home / ".hermes"), \
+             patch.object(mod.Path, "home", return_value=tmp_home), \
+             patch("shutil.which", return_value=str(hermes_path)):
+            found = mod._find_hermes_bin()
+
+        self.assertEqual(found, hermes_path)
 
     def test_chat_status_exposes_readiness_details(self):
         with patch.object(mod, "_check_api_server", return_value=False), \
@@ -1625,6 +1639,618 @@ Sidecar output:
         self.assertEqual(resp.status_code, 400, resp.data)
         self.assertEqual(resp.get_json()["error"], "identifier is required")
 
+    def test_capabilities_catalog_exposes_phased_rollout(self):
+        resp = self.client.get("/api/capabilities", headers=self.headers)
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        body = resp.get_json()
+        self.assertEqual(body["recommended_order"], ["Create Skill", "Create Integration", "Create Agent Preset"])
+        types = {entry["id"]: entry for entry in body["types"]}
+        self.assertEqual(types["skill"]["status"], "active")
+        self.assertEqual(types["integration"]["phase"], "Phase 2")
+        self.assertEqual(types["agent_preset"]["phase"], "Phase 3")
+
+    def test_capabilities_preview_builds_skill_manifest_before_write(self):
+        skill_root = Path(self.tmpdir.name) / "skills"
+
+        with patch.object(mod, "SKILLS_DIR", skill_root), \
+             patch.object(mod.shutil, "which", return_value=None):
+            resp = self.client.post(
+                "/api/capabilities/preview",
+                json={
+                    "type": "skill",
+                    "draft": {
+                        "name": "Google Workspace Helper",
+                        "category": "productivity",
+                        "description": "Handles Gmail and Calendar workflows.",
+                        "instructions": "Use this skill when the task touches Google Workspace.",
+                        "env_vars": [{
+                            "key": "GOOGLE_CLIENT_ID",
+                            "label": "Google Client ID",
+                            "group": "Provider",
+                            "description": "Used for OAuth setup.",
+                        }],
+                        "credential_files": [{
+                            "path": "credentials/oauth-client.json",
+                            "label": "OAuth Client",
+                            "description": "Downloaded client secret file.",
+                        }],
+                        "required_commands": [{
+                            "name": "uv",
+                            "description": "Runs the helper script.",
+                        }],
+                        "include_scripts": True,
+                        "include_references": True,
+                    },
+                },
+                headers=self.headers,
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        body = resp.get_json()
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["can_apply"])
+        self.assertEqual(body["summary"]["slug"], "google-workspace-helper")
+        skill = body["manifest"]["skill"]
+        self.assertEqual(skill["path"], "google-workspace-helper")
+        self.assertFalse(skill["setup"]["ready"])
+        self.assertIn("missing env var GOOGLE_CLIENT_ID", skill["setup"]["issues"])
+        self.assertIn("missing credential file credentials/oauth-client.json", skill["setup"]["issues"])
+        self.assertIn("missing command uv", skill["setup"]["issues"])
+        write_paths = [entry["path"] for entry in body["writes"]]
+        self.assertIn(str(skill_root / "google-workspace-helper" / "SKILL.md"), write_paths)
+        self.assertIn(str(skill_root / "google-workspace-helper" / "scripts"), write_paths)
+        self.assertIn(str(skill_root / "google-workspace-helper" / "references"), write_paths)
+
+    def test_capabilities_apply_writes_skill_and_source_metadata(self):
+        skill_root = Path(self.tmpdir.name) / "skills"
+
+        with patch.object(mod, "SKILLS_DIR", skill_root):
+            preview = self.client.post(
+                "/api/capabilities/preview",
+                json={
+                    "type": "skill",
+                    "draft": {
+                        "name": "Weather Helper",
+                        "description": "Checks weather conditions.",
+                        "instructions": "Use this skill for weather questions.",
+                        "include_references": True,
+                    },
+                },
+                headers=self.headers,
+            )
+            preview_body = preview.get_json()
+            resp = self.client.post(
+                "/api/capabilities/apply",
+                json={
+                    "type": "skill",
+                    "draft": {
+                        "name": "Weather Helper",
+                        "description": "Checks weather conditions.",
+                        "instructions": "Use this skill for weather questions.",
+                        "include_references": True,
+                    },
+                    "preview_token": preview_body["preview_token"],
+                },
+                headers=self.headers,
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        created_dir = skill_root / "weather-helper"
+        self.assertTrue((created_dir / "SKILL.md").exists())
+        self.assertTrue((created_dir / "references").exists())
+        source_meta = json.loads((created_dir / mod.SKILL_SOURCE_METADATA_FILENAME).read_text(encoding="utf-8"))
+        self.assertEqual(source_meta["install_mode"], "webui_create")
+        self.assertEqual(source_meta["display"], "Hermes Web UI")
+        with patch.object(mod, "SKILLS_DIR", skill_root):
+            skills = mod._discover_skill_entries()
+        created = next(skill for skill in skills if skill["path"] == "weather-helper")
+        self.assertEqual(created["source"]["install_mode"], "webui_create")
+
+    def test_capabilities_apply_skill_preview_token_survives_second_rollover(self):
+        skill_root = Path(self.tmpdir.name) / "skills"
+
+        with patch.object(mod, "SKILLS_DIR", skill_root):
+            preview = self.client.post(
+                "/api/capabilities/preview",
+                json={
+                    "type": "skill",
+                    "draft": {
+                        "name": "Second Boundary Skill",
+                        "description": "Verifies preview token stability.",
+                        "instructions": "Waits past a timestamp boundary before approval.",
+                    },
+                },
+                headers=self.headers,
+            )
+            self.assertEqual(preview.status_code, 200, preview.data)
+            preview_body = preview.get_json()
+            time.sleep(max(0.0, 1.05 - (time.time() % 1)))
+            resp = self.client.post(
+                "/api/capabilities/apply",
+                json={
+                    "type": "skill",
+                    "draft": {
+                        "name": "Second Boundary Skill",
+                        "description": "Verifies preview token stability.",
+                        "instructions": "Waits past a timestamp boundary before approval.",
+                    },
+                    "preview_token": preview_body["preview_token"],
+                },
+                headers=self.headers,
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertTrue((skill_root / "second-boundary-skill" / "SKILL.md").exists())
+
+    def test_capabilities_apply_cleans_up_partial_skill_on_write_failure(self):
+        skill_root = Path(self.tmpdir.name) / "skills"
+
+        with patch.object(mod, "SKILLS_DIR", skill_root):
+            preview = self.client.post(
+                "/api/capabilities/preview",
+                json={
+                    "type": "skill",
+                    "draft": {
+                        "name": "Cleanup Skill",
+                        "description": "Should not leave partial files behind.",
+                        "instructions": "Use this to verify cleanup behavior.",
+                    },
+                },
+                headers=self.headers,
+            )
+            preview_body = preview.get_json()
+            with patch.object(mod, "_write_skill_source_metadata", side_effect=RuntimeError("metadata write failed")):
+                resp = self.client.post(
+                    "/api/capabilities/apply",
+                    json={
+                        "type": "skill",
+                        "draft": {
+                            "name": "Cleanup Skill",
+                            "description": "Should not leave partial files behind.",
+                            "instructions": "Use this to verify cleanup behavior.",
+                        },
+                        "preview_token": preview_body["preview_token"],
+                    },
+                    headers=self.headers,
+                )
+
+        self.assertEqual(resp.status_code, 500, resp.data)
+        self.assertFalse((skill_root / "cleanup-skill").exists())
+        temp_dirs = list(skill_root.glob(".cleanup-skill.tmp-*"))
+        self.assertEqual(temp_dirs, [])
+
+    def test_env_api_includes_skill_declared_env_var_presets(self):
+        skill_root = Path(self.tmpdir.name) / "skills"
+        skill_dir = skill_root / "custom-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            """---
+name: custom-skill
+description: Uses a custom API key.
+metadata:
+  hermes_web_ui:
+    setup:
+      env_vars:
+        - key: CUSTOM_API_KEY
+          label: Custom API Key
+          group: Provider
+          description: Used by the custom integration.
+---
+# Custom Skill
+""",
+            encoding="utf-8",
+        )
+
+        with patch.object(mod, "SKILLS_DIR", skill_root):
+            resp = self.client.get("/api/env", headers=self.headers)
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        provider_presets = resp.get_json()["presets"]["Provider"]
+        preset = next(item for item in provider_presets if item["key"] == "CUSTOM_API_KEY")
+        self.assertEqual(preset["label"], "Custom API Key")
+        self.assertEqual(preset["description"], "Used by the custom integration.")
+
+    def test_capabilities_preview_builds_integration_manifest_before_write(self):
+        mod.cfg._config = {
+            "whatsapp": {},
+        }
+
+        resp = self.client.post(
+            "/api/capabilities/preview",
+            json={
+                "type": "integration",
+                "draft": {
+                    "kind": "discord",
+                    "config": {
+                        "require_mention": True,
+                        "auto_thread": True,
+                    },
+                    "env_vars": [{
+                        "key": "DISCORD_TOKEN",
+                        "label": "Discord Token",
+                        "group": "Channel",
+                        "description": "Bot token",
+                        "value": "discord-secret",
+                    }],
+                },
+            },
+            headers=self.headers,
+        )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        body = resp.get_json()
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["can_apply"])
+        self.assertEqual(body["summary"]["kind"], "discord")
+        manifest = body["manifest"]["integration"]
+        self.assertTrue(manifest["configured"])
+        self.assertTrue(manifest["readiness"]["ready"])
+        write_paths = [entry["path"] for entry in body["writes"]]
+        self.assertIn(str(mod.CONFIG_PATH), write_paths)
+        self.assertIn(str(mod.ENV_PATH), write_paths)
+
+    def test_capabilities_preview_blocks_when_integration_already_configured(self):
+        mod.cfg._config = {
+            "discord": {
+                "require_mention": True,
+            }
+        }
+
+        resp = self.client.post(
+            "/api/capabilities/preview",
+            json={
+                "type": "integration",
+                "draft": {
+                    "kind": "discord",
+                    "config": {
+                        "require_mention": True,
+                        "auto_thread": True,
+                    },
+                },
+            },
+            headers=self.headers,
+        )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        body = resp.get_json()
+        self.assertFalse(body["can_apply"])
+        self.assertIn("already configured", " ".join(body["warnings"]))
+
+    def test_capabilities_apply_writes_integration_config_and_env(self):
+        tmp = Path(self.tmpdir.name)
+        config_path = tmp / "config.yaml"
+        env_path = tmp / ".env"
+        backup_dir = tmp / "backups"
+        mod.cfg._config = {
+            "whatsapp": {},
+        }
+
+        with patch.object(mod, "CONFIG_PATH", config_path), \
+             patch.object(mod, "ENV_PATH", env_path), \
+             patch.object(mod, "BACKUP_DIR", backup_dir):
+            preview = self.client.post(
+                "/api/capabilities/preview",
+                json={
+                    "type": "integration",
+                    "draft": {
+                        "kind": "discord",
+                        "config": {
+                            "require_mention": True,
+                            "auto_thread": True,
+                        },
+                        "env_vars": [{
+                            "key": "DISCORD_TOKEN",
+                            "group": "Channel",
+                            "value": "discord-secret",
+                        }],
+                    },
+                },
+                headers=self.headers,
+            )
+            preview_body = preview.get_json()
+            resp = self.client.post(
+                "/api/capabilities/apply",
+                json={
+                    "type": "integration",
+                    "draft": {
+                        "kind": "discord",
+                        "config": {
+                            "require_mention": True,
+                            "auto_thread": True,
+                        },
+                        "env_vars": [{
+                            "key": "DISCORD_TOKEN",
+                            "group": "Channel",
+                            "value": "discord-secret",
+                        }],
+                    },
+                    "preview_token": preview_body["preview_token"],
+                },
+                headers=self.headers,
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        saved = mod.yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["discord"]["require_mention"], True)
+        self.assertIn("DISCORD_TOKEN", env_path.read_text(encoding="utf-8"))
+
+    def test_capabilities_apply_restores_env_when_integration_config_write_fails(self):
+        tmp = Path(self.tmpdir.name)
+        config_path = tmp / "config.yaml"
+        env_path = tmp / ".env"
+        backup_dir = tmp / "backups"
+        env_path.write_text("DISCORD_TOKEN=old-secret\n", encoding="utf-8")
+        mod.cfg._config = {}
+
+        with patch.object(mod, "CONFIG_PATH", config_path), \
+             patch.object(mod, "ENV_PATH", env_path), \
+             patch.object(mod, "BACKUP_DIR", backup_dir):
+            preview = self.client.post(
+                "/api/capabilities/preview",
+                json={
+                    "type": "integration",
+                    "draft": {
+                        "kind": "discord",
+                        "config": {
+                            "require_mention": True,
+                        },
+                        "env_vars": [{
+                            "key": "DISCORD_TOKEN",
+                            "group": "Channel",
+                            "value": "new-secret",
+                        }],
+                    },
+                },
+                headers=self.headers,
+            )
+            preview_body = preview.get_json()
+            with patch.object(mod.cfg, "set", side_effect=RuntimeError("config write failed")):
+                resp = self.client.post(
+                    "/api/capabilities/apply",
+                    json={
+                        "type": "integration",
+                        "draft": {
+                            "kind": "discord",
+                            "config": {
+                                "require_mention": True,
+                            },
+                            "env_vars": [{
+                                "key": "DISCORD_TOKEN",
+                                "group": "Channel",
+                                "value": "new-secret",
+                            }],
+                        },
+                        "preview_token": preview_body["preview_token"],
+                    },
+                    headers=self.headers,
+                )
+
+        self.assertEqual(resp.status_code, 500, resp.data)
+        self.assertEqual(env_path.read_text(encoding="utf-8"), "DISCORD_TOKEN=old-secret\n")
+
+    def test_capabilities_preview_builds_agent_preset_manifest_before_write(self):
+        skill_root = Path(self.tmpdir.name) / "skills"
+        skill_dir = skill_root / "review-helper"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            """---
+name: review-helper
+description: Reviews code carefully.
+---
+# Review Helper
+""",
+            encoding="utf-8",
+        )
+        mod.cfg._config = {
+            "agent": {
+                "max_turns": 90,
+                "reasoning_effort": "medium",
+            },
+            "custom_providers": [
+                {
+                    "name": "router-prod",
+                    "provider": "openrouter",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": "openai/gpt-5.4-mini",
+                    "api_key": "",
+                }
+            ],
+            "model": {
+                "default_profile": "router-prod",
+                "default_provider": "openrouter",
+                "default_model": "openai/gpt-5.4-mini",
+            },
+            "discord": {
+                "require_mention": True,
+            },
+        }
+
+        with patch.object(mod, "SKILLS_DIR", skill_root):
+            resp = self.client.post(
+                "/api/capabilities/preview",
+                json={
+                    "type": "agent_preset",
+                    "draft": {
+                        "name": "review-preset",
+                        "description": "Code review preset",
+                        "system_prompt": "Review code changes carefully.",
+                        "roles": {
+                            "primary": {
+                                "profile": "router-prod",
+                                "model": "openai/gpt-5.4-mini",
+                            },
+                            "fallback": {
+                                "enabled": False,
+                                "profile": "",
+                                "model": "",
+                            },
+                            "vision": {
+                                "enabled": False,
+                                "profile": "",
+                                "model": "",
+                            },
+                        },
+                        "skills": ["review-helper"],
+                        "integrations": ["discord"],
+                        "reasoning_effort": "high",
+                        "max_turns": 40,
+                    },
+                },
+                headers=self.headers,
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        body = resp.get_json()
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["can_apply"])
+        personality = body["manifest"]["personality"]
+        self.assertEqual(personality["metadata"]["hermes_web_ui"]["capability_type"], "agent_preset")
+        self.assertEqual(personality["metadata"]["hermes_web_ui"]["agent_defaults"]["reasoning_effort"], "high")
+        self.assertEqual(body["summary"]["skill_count"], 1)
+
+    def test_capabilities_apply_writes_agent_preset_to_agent_personalities(self):
+        tmp = Path(self.tmpdir.name)
+        config_path = tmp / "config.yaml"
+        backup_dir = tmp / "backups"
+        mod.cfg._config = {
+            "agent": {
+                "max_turns": 90,
+                "reasoning_effort": "medium",
+            },
+            "custom_providers": [
+                {
+                    "name": "router-prod",
+                    "provider": "openrouter",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": "openai/gpt-5.4-mini",
+                    "api_key": "",
+                }
+            ],
+            "model": {
+                "default_profile": "router-prod",
+                "default_provider": "openrouter",
+                "default_model": "openai/gpt-5.4-mini",
+            },
+        }
+
+        with patch.object(mod, "CONFIG_PATH", config_path), \
+             patch.object(mod, "BACKUP_DIR", backup_dir):
+            preview = self.client.post(
+                "/api/capabilities/preview",
+                json={
+                    "type": "agent_preset",
+                    "draft": {
+                        "name": "review-preset",
+                        "description": "Code review preset",
+                        "system_prompt": "Review code changes carefully.",
+                        "roles": {
+                            "primary": {
+                                "profile": "router-prod",
+                                "model": "openai/gpt-5.4-mini",
+                            },
+                            "fallback": {
+                                "enabled": False,
+                                "profile": "",
+                                "model": "",
+                            },
+                            "vision": {
+                                "enabled": False,
+                                "profile": "",
+                                "model": "",
+                            },
+                        },
+                        "skills": [],
+                        "integrations": [],
+                    },
+                },
+                headers=self.headers,
+            )
+            preview_body = preview.get_json()
+            resp = self.client.post(
+                "/api/capabilities/apply",
+                json={
+                    "type": "agent_preset",
+                    "draft": {
+                        "name": "review-preset",
+                        "description": "Code review preset",
+                        "system_prompt": "Review code changes carefully.",
+                        "roles": {
+                            "primary": {
+                                "profile": "router-prod",
+                                "model": "openai/gpt-5.4-mini",
+                            },
+                            "fallback": {
+                                "enabled": False,
+                                "profile": "",
+                                "model": "",
+                            },
+                            "vision": {
+                                "enabled": False,
+                                "profile": "",
+                                "model": "",
+                            },
+                        },
+                        "skills": [],
+                        "integrations": [],
+                    },
+                    "preview_token": preview_body["preview_token"],
+                },
+                headers=self.headers,
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        saved = mod.yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        preset = saved["agent"]["personalities"]["review-preset"]
+        self.assertEqual(preset["system_prompt"], "Review code changes carefully.")
+        self.assertEqual(preset["metadata"]["hermes_web_ui"]["capability_type"], "agent_preset")
+
+    def test_agents_api_reads_legacy_top_level_personalities_and_returns_entries(self):
+        mod.cfg._config = {
+            "agent": {
+                "max_turns": 90,
+            },
+            "personalities": {
+                "legacy-reviewer": "Review code carefully.",
+            },
+        }
+
+        resp = self.client.get("/api/agents", headers=self.headers)
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        body = resp.get_json()
+        self.assertIn("legacy-reviewer", body["personalities"])
+        entry = next(item for item in body["entries"] if item["name"] == "legacy-reviewer")
+        self.assertEqual(entry["system_prompt"], "Review code carefully.")
+        self.assertEqual(entry["kind"], "personality")
+
+    def test_capability_builder_js_uses_live_handlers_without_overescaped_quotes(self):
+        source = (mod.APP_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "replace('<select', '<select onchange=\"updateCapabilityListItem(\\'env_vars\\', ' + index + ', \\'group\\', this.value)\"')",
+            source,
+        )
+        self.assertIn(
+            "replace('<textarea', '<textarea oninput=\"updateCapabilityDraftField(\\'description\\', this.value)\"')",
+            source,
+        )
+        self.assertIn(
+            "replace('<textarea', '<textarea oninput=\"updateCapabilityDraftField(\\'instructions\\', this.value)\"')",
+            source,
+        )
+
+    def test_skills_inventory_js_exposes_category_filter_and_default_view_starter_pack_logic(self):
+        source = (mod.APP_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("id=\"skill-category-filter\"", source)
+        self.assertIn("Source / Origin", source)
+        self.assertIn("function skillsInventoryIsDefaultView()", source)
+        self.assertIn("openCreatedIntegrationInventory", source)
+        self.assertIn("openCreatedAgentInventory", source)
+        self.assertIn("integration-card-", source)
+        self.assertIn("agent-card-", source)
+
     def test_channels_api_exposes_top_level_integrations(self):
         mod.cfg._config = {
             "discord": {
@@ -1682,6 +2308,40 @@ Sidecar output:
 
         self.assertEqual(resp.status_code, 200, resp.data)
         self.assertNotIn("channel", resp.get_json()["missing"])
+
+    def test_hooks_api_returns_empty_config_without_fake_webhook_block(self):
+        mod.cfg._config = {}
+
+        resp = self.client.get("/api/hooks", headers=self.headers)
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.get_json(), {"config": {}})
+
+    def test_config_manager_reloads_when_config_file_changes_on_disk(self):
+        config_path = Path(self.tmpdir.name) / "config.yaml"
+        config_path.write_text("agent:\n  personalities: {}\n", encoding="utf-8")
+
+        with patch.object(mod, "CONFIG_PATH", config_path):
+            manager = mod.ConfigManager()
+            config_path.write_text(
+                "agent:\n  personalities:\n    UI Test Preset:\n      system_prompt: Updated on disk\n",
+                encoding="utf-8",
+            )
+            data = manager.get_raw()
+
+        self.assertIn("agent", data)
+        self.assertIn("UI Test Preset", data["agent"]["personalities"])
+
+    def test_config_manager_manual_override_does_not_reload_from_disk(self):
+        config_path = Path(self.tmpdir.name) / "config.yaml"
+        config_path.write_text("agent:\n  personalities: {}\n", encoding="utf-8")
+
+        with patch.object(mod, "CONFIG_PATH", config_path):
+            manager = mod.ConfigManager()
+            manager._config = {"agent": {"personalities": {"Manual Preset": {"system_prompt": "manual"}}}}
+            data = manager.get_raw()
+
+        self.assertIn("Manual Preset", data["agent"]["personalities"])
 
     def test_compose_chat_turn_payload_includes_folder_and_source_doc_text(self):
         workspace_root = Path(self.tmpdir.name) / "repo"
