@@ -18,6 +18,18 @@ This repo is intended to sit alongside a normal Hermes install. The current pref
 - Surfaces logs, sessions, onboarding state, and deployment health from one UI.
 - Offers in-app Hermes update checks and, when safe, an update action with confirmation.
 
+## Screenshots
+
+These screenshots use sanitized demo data so the public repo does not expose local usernames, absolute machine-specific paths, or personal workspace details.
+
+### Dashboard Overview
+
+![Hermes Web UI dashboard overview](docs/images/dashboard-overview.png)
+
+### Service and Updates
+
+![Hermes Web UI service and updates view](docs/images/service-updates.png)
+
 ## Quick Start
 
 If you do not already have Hermes installed, install it first:
