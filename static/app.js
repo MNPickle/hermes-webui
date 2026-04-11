@@ -289,6 +289,34 @@ function refreshCurrentScreen() {
 }
 
 let _healthCache = null, _healthTs = 0;
+
+function activeProfileBadgeH(profile, compact = false) {
+    const value = String(profile || 'unknown').trim() || 'unknown';
+    const label = compact ? '' : '<span class="profile-indicator-label">Profile</span>';
+    return '' +
+        '<div class="profile-indicator">' +
+            label +
+            '<span class="badge badge-accent" title="Active Hermes profile">' + escH(value) + '</span>' +
+        '</div>';
+}
+
+function activeProfileSidebarH(profile) {
+    const value = String(profile || 'unknown').trim() || 'unknown';
+    return '' +
+        '<div class="profile-indicator profile-indicator--sidebar">' +
+            '<span class="profile-indicator-label">Profile</span>' +
+            '<span class="badge badge-accent" title="Active Hermes profile">' + escH(value) + '</span>' +
+        '</div>';
+}
+
+function updateActiveProfileIndicators(health) {
+    const profile = health?.profile || 'unknown';
+    const topbar = document.getElementById('topbar-active-profile');
+    const sidebar = document.getElementById('sidebar-active-profile');
+    if (topbar) topbar.innerHTML = activeProfileBadgeH(profile, true);
+    if (sidebar) sidebar.innerHTML = activeProfileSidebarH(profile);
+}
+
 async function checkHealth() {
     const now = Date.now();
     if (_healthCache && (now - _healthTs) < 5000) return;
@@ -299,6 +327,7 @@ async function checkHealth() {
         const running = d.gateway_running;
         dot.className = 'status-dot ' + (running ? 'online' : 'warning');
         txt.textContent = running ? 'Gateway Running' : 'Gateway Stopped';
+        updateActiveProfileIndicators(d);
         const ver = document.getElementById('sidebar-version');
         if (ver) {
             ver.textContent = `UI v${WEB_UI_VERSION}`;
@@ -312,6 +341,7 @@ async function checkHealth() {
     } catch (e) {
         document.querySelector('#connection-status .status-dot').className = 'status-dot error';
         document.querySelector('#connection-status .status-text').textContent = 'Error';
+        updateActiveProfileIndicators({ profile: 'unavailable' });
     }
     _healthCache = true; _healthTs = now;
 }
@@ -711,6 +741,7 @@ Screens.dashboard = async function () {
             <div class="card-header"><span>System Info</span></div>
             <div class="card-body">
                 <div class="form-row">
+                    <div class="form-group"><label class="form-label">Active Profile</label><div>${activeProfileBadgeH(health.profile)}</div></div>
                     <div class="form-group"><label class="form-label">OS</label><div class="text-sm">${escH(sys.os_info || '?')}</div></div>
                     <div class="form-group"><label class="form-label">Disk Free</label><div class="text-sm">${fmtBytes(sys.disk_free)}</div></div>
                     <div class="form-group"><label class="form-label">Hermes Home</label><div class="font-mono text-sm">${escH(health.hermes_home || '?')}</div></div>
@@ -1168,6 +1199,7 @@ Screens.service = async function () {
             <div class="card-header"><span>Gateway Service</span><span class="badge ${health.gateway_running ? 'badge-success' : 'badge-danger'}">${health.gateway_running ? 'Running' : 'Stopped'}</span></div>
             <div class="card-body">
                 <div class="form-row" style="margin-bottom:16px">
+                    <div class="form-group"><label class="form-label">Active Profile</label><div>${activeProfileBadgeH(health.profile)}</div></div>
                     <div class="form-group"><label class="form-label">PID</label><div>${health.gateway_pid || 'N/A'}</div></div>
                     <div class="form-group"><label class="form-label">Version</label><div>${escH(health.version || '?')}</div></div>
                     <div class="form-group"><label class="form-label">Uptime</label><div>${escH(sys.uptime || '?')}</div></div>
@@ -1184,6 +1216,7 @@ Screens.service = async function () {
             <div class="card-header"><span>System Information</span></div>
             <div class="card-body">
                 <div class="form-row">
+                    <div class="form-group"><label class="form-label">Active Profile</label><div>${activeProfileBadgeH(health.profile)}</div></div>
                     <div class="form-group"><label class="form-label">Python</label><div class="font-mono text-sm">${escH(sys.python_version || '?')}</div></div>
                     <div class="form-group"><label class="form-label">OS</label><div class="text-sm">${escH(sys.os_info || '?')}</div></div>
                     <div class="form-group"><label class="form-label">Disk Free</label><div class="text-sm">${fmtBytes(sys.disk_free)}</div></div>
@@ -6749,6 +6782,7 @@ document.addEventListener('DOMContentLoaded', () => {
         toast('Theme: ' + ThemeManager.getLabel(), 'info', 2000);
     });
 
+    updateActiveProfileIndicators({ profile: 'loading' });
     checkHealth();
     HermesUpdate.ensureLoaded().catch(() => {});
     // Support ?chat or #chat for direct navigation

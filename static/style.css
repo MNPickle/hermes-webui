@@ -743,6 +743,52 @@ pre code {
   text-overflow: ellipsis;
 }
 
+.sidebar-active-profile {
+  margin-top: 8px;
+  min-height: 22px;
+}
+
+.profile-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.profile-indicator-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.profile-indicator .badge {
+  max-width: 100%;
+}
+
+.profile-indicator--sidebar {
+  width: 100%;
+  justify-content: space-between;
+}
+
+.profile-indicator--sidebar .badge {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.topbar-profile-indicator {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+}
+
+.topbar-profile-indicator .badge {
+  font-size: 12px;
+  padding: 5px 10px;
+}
+
 /* Sidebar Toggle (mobile overlay) */
 .sidebar-overlay {
   display: none;
@@ -1690,6 +1736,12 @@ pre code {
   background: var(--accent-dim);
   color: var(--accent);
   border: 1px solid rgba(99, 102, 241, 0.2);
+}
+
+@media (max-width: 768px) {
+  .topbar-profile-indicator {
+    display: none;
+  }
 }
 
 /* ============================================================

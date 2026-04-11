@@ -30,10 +30,10 @@ Make the active Hermes profile visible in the important runtime areas of the por
 ## Backlog
 
 - [x] Review the current UI surfaces and decide the minimum set of screens that should show the active profile.
-- [ ] Add one reusable frontend helper for rendering active profile information consistently.
-- [ ] Add a persistent active profile indicator in a global UI location.
-- [ ] Show the active profile in Dashboard runtime information.
-- [ ] Show the active profile in the Service screen next to gateway controls and runtime state.
+- [x] Add one reusable frontend helper for rendering active profile information consistently.
+- [x] Add a persistent active profile indicator in a global UI location.
+- [x] Show the active profile in Dashboard runtime information.
+- [x] Show the active profile in the Service screen next to gateway controls and runtime state.
 - [ ] Show the active profile in Providers / Models where runtime target data is shown.
 - [ ] Show the active profile in Chat in a lightweight but visible way.
 - [ ] Validate profile switching visually for `default` and `leire`.
@@ -42,7 +42,7 @@ Make the active Hermes profile visible in the important runtime areas of the por
 
 ## In Progress
 
-- [ ] Implement the first visible profile surfaces with minimal UI changes.
+- [ ] Implement active profile visibility in Providers / Models and Chat.
 
 
 ## Done
@@ -50,6 +50,10 @@ Make the active Hermes profile visible in the important runtime areas of the por
 - [x] Create the `improve-profiles` branch.
 - [x] Create a branch-local task tracker in `profiles_use/tasks.md`.
 - [x] Document the high-level implementation plan in `profiles_use/plan.md`.
+- [x] Add a reusable profile rendering helper in the frontend.
+- [x] Add a persistent active profile indicator to the global UI.
+- [x] Show the active profile in Dashboard.
+- [x] Show the active profile in Service.
 
 
 ## Validation Checklist
