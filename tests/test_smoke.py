@@ -491,6 +491,129 @@ class HermesWebUISmokeTests(unittest.TestCase):
             self.assertEqual(messages.status_code, 200, messages.data)
             self.assertEqual(messages.get_json()["session"]["profile"], "leire")
 
+    def test_chat_session_profile_switch_creates_new_runtime_segment(self):
+        hermes_root = Path(self.tmpdir.name) / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        profiles_dir.mkdir(parents=True)
+        (profiles_dir / "leire").mkdir()
+        state_path = Path(self.tmpdir.name) / "webui_profile"
+
+        with patch.object(mod, "HERMES_HOME", hermes_root), \
+             patch.object(mod, "CONFIG_PATH", hermes_root / "config.yaml"), \
+             patch.object(mod, "ENV_PATH", hermes_root / ".env"), \
+             patch.object(mod, "SKILLS_DIR", hermes_root / "skills"), \
+             patch.object(mod, "SESSIONS_DIR", hermes_root / "sessions"), \
+             patch.object(mod, "BACKUP_DIR", hermes_root / "backups"), \
+             patch.object(mod, "HERMES_PROFILES_DIR", profiles_dir), \
+             patch.object(mod, "WEBUI_PROFILE_STATE_PATH", state_path):
+            created = self.client.post("/api/chat/sessions", json={}, headers=self.headers)
+            self.assertEqual(created.status_code, 200, created.data)
+            session_id = created.get_json()["session_id"]
+            created_session = created.get_json()["session"]
+            self.assertEqual(created_session["profile"], "default")
+            self.assertEqual(created_session["active_segment_index"], 1)
+            self.assertEqual(len(created_session["segments"]), 1)
+
+            switched = self.client.put(
+                f"/api/chat/sessions/{session_id}/profile",
+                json={"profile": "leire"},
+                headers=self.headers,
+            )
+            self.assertEqual(switched.status_code, 200, switched.data)
+            session = switched.get_json()["session"]
+            self.assertEqual(session["profile"], "leire")
+            self.assertEqual(session["active_segment_index"], 2)
+            self.assertEqual(len(session["segments"]), 2)
+            self.assertEqual(session["segments"][0]["profile"], "default")
+            self.assertEqual(session["segments"][1]["profile"], "leire")
+
+            persisted = mod._load_session(session_id)
+            self.assertEqual(persisted["profile"], "leire")
+            self.assertEqual(persisted["active_segment_id"], "segment-2")
+            self.assertEqual(len(persisted["segments"]), 2)
+
+    def test_chat_session_profile_switch_is_local_and_used_on_next_turn(self):
+        hermes_root = Path(self.tmpdir.name) / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        profiles_dir.mkdir(parents=True)
+        (profiles_dir / "leire").mkdir()
+        state_path = Path(self.tmpdir.name) / "webui_profile"
+        seen_profiles = []
+
+        def fake_call(session, message, files=None, request_id=None, file_display_names=None):
+            seen_profiles.append(mod._selected_hermes_profile_name())
+            return (f"ok:{mod._selected_hermes_profile_name()}", "hermes-session-1")
+
+        with patch.object(mod, "HERMES_HOME", hermes_root), \
+             patch.object(mod, "CONFIG_PATH", hermes_root / "config.yaml"), \
+             patch.object(mod, "ENV_PATH", hermes_root / ".env"), \
+             patch.object(mod, "SKILLS_DIR", hermes_root / "skills"), \
+             patch.object(mod, "SESSIONS_DIR", hermes_root / "sessions"), \
+             patch.object(mod, "BACKUP_DIR", hermes_root / "backups"), \
+             patch.object(mod, "HERMES_PROFILES_DIR", profiles_dir), \
+             patch.object(mod, "WEBUI_PROFILE_STATE_PATH", state_path), \
+             patch.object(mod, "_check_api_server", return_value=False), \
+             patch.object(mod, "_image_attachment_support_status", return_value=(False, "disabled")), \
+             patch.object(mod, "_call_hermes_direct", side_effect=fake_call):
+            created = self.client.post("/api/chat/sessions", json={}, headers=self.headers)
+            self.assertEqual(created.status_code, 200, created.data)
+            session_id = created.get_json()["session_id"]
+
+            first = self.client.post(
+                "/api/chat",
+                json={"message": "hello", "session_id": session_id},
+                headers=self.headers,
+            )
+            self.assertEqual(first.status_code, 200, first.data)
+            self.assertEqual(first.get_json()["assistant_message"]["profile"], "default")
+
+            switched = self.client.put(
+                f"/api/chat/sessions/{session_id}/profile",
+                json={"profile": "leire"},
+                headers=self.headers,
+            )
+            self.assertEqual(switched.status_code, 200, switched.data)
+            self.assertFalse(state_path.exists())
+
+            second = self.client.post(
+                "/api/chat",
+                json={"message": "follow up", "session_id": session_id},
+                headers=self.headers,
+            )
+            self.assertEqual(second.status_code, 200, second.data)
+            second_json = second.get_json()
+            self.assertEqual(second_json["session"]["profile"], "leire")
+            self.assertEqual(second_json["assistant_message"]["profile"], "leire")
+            self.assertEqual(second_json["assistant_message"]["content"], "ok:leire")
+            self.assertEqual(seen_profiles, ["default", "leire"])
+
+    def test_chat_session_create_accepts_local_profile_without_writing_global_state(self):
+        hermes_root = Path(self.tmpdir.name) / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        profiles_dir.mkdir(parents=True)
+        (profiles_dir / "leire").mkdir()
+        state_path = Path(self.tmpdir.name) / "webui_profile"
+
+        with patch.object(mod, "HERMES_HOME", hermes_root), \
+             patch.object(mod, "CONFIG_PATH", hermes_root / "config.yaml"), \
+             patch.object(mod, "ENV_PATH", hermes_root / ".env"), \
+             patch.object(mod, "SKILLS_DIR", hermes_root / "skills"), \
+             patch.object(mod, "SESSIONS_DIR", hermes_root / "sessions"), \
+             patch.object(mod, "BACKUP_DIR", hermes_root / "backups"), \
+             patch.object(mod, "HERMES_PROFILES_DIR", profiles_dir), \
+             patch.object(mod, "WEBUI_PROFILE_STATE_PATH", state_path):
+            created = self.client.post(
+                "/api/chat/sessions",
+                json={"profile": "leire"},
+                headers=self.headers,
+            )
+            self.assertEqual(created.status_code, 200, created.data)
+
+            session = created.get_json()["session"]
+            self.assertEqual(session["profile"], "leire")
+            self.assertEqual(session["segments"][0]["profile"], "leire")
+            self.assertFalse(state_path.exists())
+
     def test_skill_setup_readiness_detects_missing_requirements(self):
         skill_root = Path(self.tmpdir.name) / "skills"
         skill_dir = skill_root / "productivity" / "google-workspace"

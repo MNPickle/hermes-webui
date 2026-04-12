@@ -4521,6 +4521,12 @@ const chatState = {
     currentSessionId: null,
     activeProfile: '',
     currentSessionProfile: '',
+    draftProfile: '',
+    availableProfiles: [],
+    currentSegments: [],
+    currentActiveSegmentId: '',
+    currentActiveSegmentIndex: 1,
+    historyProfileFilter: 'all',
     currentRequestId: null,
     currentRequestCancelSupported: false,
     isThinking: false,
@@ -4695,7 +4701,18 @@ function chatResetComposerAfterRequest() {
 
 function chatApplySessionMetadata(meta = null) {
     const session = meta || {};
-    chatState.currentSessionProfile = session.profile || chatState.activeProfile || '';
+    if (session.profile) {
+        chatState.currentSessionProfile = session.profile;
+        chatState.draftProfile = '';
+    } else if (chatState.currentSessionId) {
+        chatState.currentSessionProfile = chatState.activeProfile || '';
+        chatState.draftProfile = '';
+    } else {
+        chatState.currentSessionProfile = '';
+    }
+    chatState.currentSegments = Array.isArray(session.segments) ? session.segments.slice() : [];
+    chatState.currentActiveSegmentId = session.active_segment_id || '';
+    chatState.currentActiveSegmentIndex = Number(session.active_segment_index || 1) || 1;
     chatState.transportPreference = session.transport_preference || chatState.transportPreference || 'auto';
     chatState.currentTransport = session.transport_mode || null;
     chatState.currentContinuity = session.continuity_mode || null;
@@ -4722,7 +4739,44 @@ function chatApplySessionMetadata(meta = null) {
 }
 
 function chatVisibleProfile() {
-    return chatState.currentSessionProfile || chatState.activeProfile || 'default';
+    return chatState.currentSessionProfile || chatState.draftProfile || chatState.activeProfile || 'default';
+}
+
+function chatCurrentSegment() {
+    return (chatState.currentSegments || []).find(segment => segment.id === chatState.currentActiveSegmentId)
+        || chatState.currentSegments[chatState.currentSegments.length - 1]
+        || null;
+}
+
+async function chatLoadAvailableProfiles() {
+    try {
+        const data = await loadRuntimeProfiles();
+        chatState.availableProfiles = Array.isArray(data?.profiles) ? data.profiles.slice() : [];
+    } catch (e) {
+        chatState.availableProfiles = [];
+    }
+    chatRenderTransportControls();
+}
+
+function chatTransportLabel(value) {
+    if (value === 'cli') return 'CLI';
+    if (value === 'api') return 'API';
+    return 'Auto';
+}
+
+function chatBuildSegmentNode(message, segment) {
+    const div = document.createElement('div');
+    div.className = 'chat-segment-marker';
+    const profile = message?.profile || segment?.profile || chatVisibleProfile();
+    const transport = message?.transport || segment?.transport || '';
+    const chips = [
+        '<span class="badge badge-info">Profile: ' + escH(profile || 'default') + '</span>',
+    ];
+    if (transport) {
+        chips.push('<span class="badge">Transport: ' + escH(chatTransportLabel(transport)) + '</span>');
+    }
+    div.innerHTML = '<div class="chat-segment-marker-line"></div><div class="chat-segment-marker-body"><div class="chat-segment-marker-title">Profile changed</div><div class="chat-segment-marker-badges">' + chips.join('') + '</div></div><div class="chat-segment-marker-line"></div>';
+    return div;
 }
 
 function updateChatHistoryActiveProfileBadge() {
@@ -4730,6 +4784,77 @@ function updateChatHistoryActiveProfileBadge() {
     if (!badge) return;
     badge.textContent = 'Portal: ' + (chatState.activeProfile || 'default');
 }
+
+function chatSessionProfile(session) {
+    return String((session?.session || {}).profile || session?.profile || '').trim();
+}
+
+function chatSessionProfiles(session) {
+    const names = [];
+    const addName = (value) => {
+        const name = String(value || '').trim();
+        if (name && !names.includes(name)) names.push(name);
+    };
+    const segments = Array.isArray((session?.session || {}).segments) ? (session.session.segments || []) : [];
+    segments.forEach(segment => addName(segment?.profile));
+    addName(chatSessionProfile(session));
+    return names;
+}
+
+function chatSessionProfilesLabel(session) {
+    const profiles = chatSessionProfiles(session);
+    if (!profiles.length) return '';
+    if (profiles.length === 1) return 'Profile: ' + profiles[0];
+    return 'Profiles: ' + profiles.join(', ');
+}
+
+function chatFilteredProfileOptions(sessions = []) {
+    const names = new Set();
+    (chatState.availableProfiles || []).forEach(profile => {
+        const name = String(profile?.name || '').trim();
+        if (name) names.add(name);
+    });
+    sessions.forEach(session => {
+        chatSessionProfiles(session).forEach(name => names.add(name));
+    });
+    if (chatState.activeProfile) names.add(chatState.activeProfile);
+    return ['all', ...Array.from(names).sort()];
+}
+
+function chatSessionMatchesProfileFilter(session) {
+    const filter = String(chatState.historyProfileFilter || 'all');
+    if (!filter || filter === 'all') return true;
+    return chatSessionProfiles(session).includes(filter);
+}
+
+function chatRenderHistoryProfileFilter(sessions = []) {
+    const mounts = [
+        document.getElementById('chat-history-filter-slot'),
+        document.getElementById('sidebar-history-profile-filter-slot'),
+    ].filter(Boolean);
+    if (!mounts.length) return;
+    const options = chatFilteredProfileOptions(sessions);
+    if (!options.length || options.length === 1) {
+        mounts.forEach(mount => { mount.innerHTML = ''; });
+        return;
+    }
+    if (!options.includes(chatState.historyProfileFilter)) {
+        chatState.historyProfileFilter = 'all';
+    }
+    const html =
+        '<label class="chat-history-filter-label" for="chat-history-profile-filter">Filter</label>' +
+        '<select id="chat-history-profile-filter" class="chat-history-filter-select" onchange="chatSetHistoryProfileFilter(this.value)">' +
+        options.map(value => '<option value="' + escA(value) + '"' + (value === chatState.historyProfileFilter ? ' selected' : '') + '>' + escH(value === 'all' ? 'All profiles' : value) + '</option>').join('') +
+        '</select>';
+    mounts.forEach((mount, index) => {
+        mount.innerHTML = html.replace(/chat-history-profile-filter/g, index === 0 ? 'chat-history-profile-filter' : 'sidebar-history-profile-filter');
+    });
+}
+
+window.chatSetHistoryProfileFilter = function (value) {
+    chatState.historyProfileFilter = value || 'all';
+    chatLoadHistory();
+};
 
 function chatGoHome() {
     chatState.currentSessionId = null;
@@ -4932,13 +5057,75 @@ function chatRenderTransportControls() {
     if (chatState.currentSessionId && chatState.currentTransport && current !== chatState.currentTransport) {
         note += ' Next turn preference: ' + chatTransportPreferenceLabel(current) + '.';
     }
+    const availableProfiles = Array.isArray(chatState.availableProfiles) ? chatState.availableProfiles : [];
+    const activeSegment = chatCurrentSegment();
+    const profileOptions = availableProfiles.map(profile => {
+        const name = profile?.name || 'default';
+        return '<option value="' + escA(name) + '"' + (name === chatVisibleProfile() ? ' selected' : '') + '>' + escH(name) + '</option>';
+    }).join('');
+    const switchSummary = chatState.currentSessionId
+        ? 'The next messages in this chat will use the selected profile after you apply it.'
+        : 'Choose the profile you want to use before the next new chat turn.';
     mount.innerHTML =
-        '<div class="chat-transport-wrap">' +
-            '<div class="chat-transport-label">Transport</div>' +
-            '<div class="chat-transport-buttons">' + buttons + '</div>' +
+        '<div class="chat-runtime-controls">' +
+            '<div class="chat-transport-wrap">' +
+                '<div class="chat-transport-label">Transport</div>' +
+                '<div class="chat-transport-buttons">' + buttons + '</div>' +
+            '</div>' +
+            '<div class="chat-profile-wrap">' +
+                '<div class="chat-transport-label">Profile</div>' +
+                '<div class="chat-profile-controls">' +
+                    '<select id="chat-profile-select" class="chat-profile-select" onchange="chatHandleProfileDraftChange()">' + profileOptions + '</select>' +
+                    '<button class="chat-runtime-apply-btn" type="button" onclick="chatApplyRuntimeProfile()"' + (profileOptions ? '' : ' disabled') + '>Use Profile</button>' +
+                '</div>' +
+            '</div>' +
         '</div>' +
-        '<div class="chat-transport-note">' + escH(note) + '</div>';
+        '<div class="chat-transport-note">' + escH(note) + '</div>' +
+        '<div class="chat-runtime-note">' +
+            (activeSegment ? '<span class="badge">Current profile: ' + escH(activeSegment.profile || chatVisibleProfile()) + '</span> ' : '') +
+            escH(switchSummary) +
+        '</div>';
+    chatHandleProfileDraftChange();
 }
+
+window.chatHandleProfileDraftChange = function () {
+    const select = document.getElementById('chat-profile-select');
+    const button = document.querySelector('.chat-runtime-apply-btn');
+    if (!select || !button) return;
+    button.disabled = !select.value || select.value === chatVisibleProfile();
+};
+
+window.chatApplyRuntimeProfile = async function () {
+    const select = document.getElementById('chat-profile-select');
+    if (!select || !select.value) return;
+    const nextProfile = select.value;
+    if (nextProfile === chatVisibleProfile()) {
+        toast('This chat is already using that profile', 'info', 1500);
+        chatHandleProfileDraftChange();
+        return;
+    }
+    const button = document.querySelector('.chat-runtime-apply-btn');
+    try {
+        if (button) button.disabled = true;
+        if (chatState.currentSessionId) {
+            const resp = await api('PUT', '/api/chat/sessions/' + chatState.currentSessionId + '/profile', { profile: nextProfile });
+            chatApplySessionMetadata(resp.session || null);
+            toast('Chat profile changed to ' + nextProfile, 'success', 1500);
+        } else {
+            chatState.draftProfile = nextProfile;
+            chatState.currentSessionProfile = '';
+            chatState.currentSegments = [{ id: 'segment-1', index: 1, profile: nextProfile, transport: '', start_message_index: 0 }];
+            chatState.currentActiveSegmentId = 'segment-1';
+            chatState.currentActiveSegmentIndex = 1;
+            chatRenderSessionBanner();
+            toast('Next chat will use profile ' + nextProfile, 'success', 1500);
+        }
+        chatRenderTransportControls();
+    } catch (e) {
+        toast('Profile change failed: ' + e.message, 'error');
+        chatRenderTransportControls();
+    }
+};
 
 function chatRenderSessionBanner() {
     const banner = document.getElementById('chat-session-banner');
@@ -5069,6 +5256,9 @@ async function chatRefreshCapabilities() {
         };
     }
     chatApplyComposerCapabilities();
+    if (!(chatState.availableProfiles || []).length) {
+        chatLoadAvailableProfiles();
+    }
 }
 
 // ── CLIPBOARD PASTE ─────────────────────────────────────
@@ -5129,6 +5319,7 @@ Screens.chat = function () {
                     <span>Chats</span>
                     <span class="badge badge-accent chat-history-active-profile" id="chat-history-active-profile">Portal: ${escH(chatState.activeProfile || 'default')}</span>
                 </div>
+                <div class="chat-history-header-filters" id="chat-history-filter-slot"></div>
                 <div class="chat-history-actions">
                     <button class="btn-icon" title="New Chat" onclick="chatNewSession()" style="width:28px;height:28px">
                         <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
@@ -5250,6 +5441,7 @@ Screens.chat = function () {
     chatRenderTransportControls();
     chatApplyComposerCapabilities();
     chatRefreshCapabilities();
+    chatLoadAvailableProfiles();
 
     // Load sessions
     chatLoadHistory();
@@ -5528,13 +5720,15 @@ async function renderSidebarFoldersTree() {
         ]);
         const folders = folderData.folders || [];
         const sessions = sessionData.sessions || [];
+        const visibleSessions = sessions.filter(chatSessionMatchesProfileFilter);
         chatState.folders = folders.slice();
         const collapsed = sidebarFolderNodeCollapseState();
-        const ungrouped = sessions.filter(session => !(session.session?.folder_id));
+        const ungrouped = visibleSessions.filter(session => !(session.session?.folder_id));
         tree.innerHTML =
             folders.map(folder => {
                 const hidden = !!collapsed[folder.id];
-                const chats = folder.sessions || [];
+                const chats = (folder.sessions || []).filter(chatSessionMatchesProfileFilter);
+                if (!chats.length) return '';
                 const duplicateMeta = chatFolderDuplicateMeta(folder, folders);
                 return '<div class="sidebar-folder-node">' +
                     '<div class="sidebar-folder-node-row" ondragover="chatFolderDragOver(event,\'' + escA(folder.id) + '\')" ondrop="chatDropSessionOnFolder(event,\'' + escA(folder.id) + '\')">' +
@@ -5543,7 +5737,7 @@ async function renderSidebarFoldersTree() {
                     '</button>' +
                     '<button class="sidebar-folder-node-target' + (((chatState.selectedFolderId || chatState.currentFolderId) === folder.id && !chatState.currentSessionId) ? ' active' : '') + '" onclick="sidebarOpenFolder(\'' + escA(folder.id) + '\')">' +
                     '<span class="sidebar-folder-name-wrap"><span class="sidebar-folder-name">' + escH(folder.title || 'Folder') + '</span>' + (duplicateMeta ? '<span class="sidebar-folder-duplicate-meta">' + escH(duplicateMeta) + '</span>' : '') + '</span>' +
-                    '<span class="sidebar-folder-count">' + escH(String(folder.chat_count || chats.length || 0)) + '</span>' +
+                    '<span class="sidebar-folder-count">' + escH(String(chats.length || 0)) + '</span>' +
                     '</button>' +
                     '<div class="sidebar-folder-actions">' +
                     '<button class="btn-icon" title="Add to folder" onclick="event.stopPropagation(); chatOpenFolderAddMenu(\'' + escA(folder.id) + '\')" style="width:20px;height:20px"><svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>' +
@@ -5570,10 +5764,12 @@ async function chatLoadHistory() {
         ]);
         const folders = folderData.folders || [];
         const sessions = sessionData.sessions || [];
+        const visibleSessions = sessions.filter(chatSessionMatchesProfileFilter);
         chatState.folders = folders.slice();
+        chatRenderHistoryProfileFilter(sessions);
         const list = document.getElementById('chat-history-list');
         if (!list) return;
-        const ungrouped = sessions.filter(s => !(s.session && s.session.folder_id));
+        const ungrouped = visibleSessions.filter(s => !(s.session && s.session.folder_id));
         if (folders.length === 0 && ungrouped.length === 0) {
             list.innerHTML = '<div class="chat-history-empty">No chats yet.<br>Click + to start one.</div>';
             chatRenderContextPanel();
@@ -5582,9 +5778,10 @@ async function chatLoadHistory() {
         const renderSessionItem = (s) => {
             const isActive = s.id === chatState.currentSessionId;
             const preview = s.last_message ? escH(s.last_message) : 'Empty';
-            const profile = ((s.session || {}).profile || '').trim();
-            const profileBadge = profile
-                ? ' <span class="badge ' + (profile === (chatState.activeProfile || '') ? 'badge-accent' : 'badge-warning') + '" title="Profile used by this chat session">Session: ' + escH(profile) + '</span>'
+            const profiles = chatSessionProfiles(s);
+            const profileLabel = chatSessionProfilesLabel(s);
+            const profileBadge = profileLabel
+                ? ' <span class="badge ' + ((profiles.length === 1 && profiles[0] === (chatState.activeProfile || '')) ? 'badge-accent' : 'badge-warning') + '" title="Profiles used by this chat session">' + escH(profileLabel) + '</span>'
                 : '';
             return '<div class="chat-history-item' + (isActive ? ' active' : '') + '" data-sid="' + escA(s.id) + '" draggable="true" ondragstart="chatDragSession(event,\'' + escA(s.id) + '\')" onclick="chatLoadSession(\'' + escA(s.id) + '\')">' +
                 '<div class="chat-history-item-title">' + escH(s.title || 'Untitled') + '</div>' +
@@ -5600,7 +5797,8 @@ async function chatLoadHistory() {
             html += folders.map(folder => {
                 const collapsed = chatIsFolderCollapsed(folder.id);
                 const isSelected = folder.id === chatState.selectedFolderId;
-                const chats = folder.sessions || [];
+                const chats = (folder.sessions || []).filter(chatSessionMatchesProfileFilter);
+                if (!chats.length) return '';
                 const duplicateMeta = chatFolderDuplicateMeta(folder, folders);
                 return '<div class="chat-folder-tree">' +
                     '<div class="chat-folder-row' + (isSelected ? ' active' : '') + '" ondragover="chatFolderDragOver(event,\'' + escA(folder.id) + '\')" ondrop="chatDropSessionOnFolder(event,\'' + escA(folder.id) + '\')">' +
@@ -5609,7 +5807,7 @@ async function chatLoadHistory() {
                     '</button>' +
                     '<button class="chat-folder-main" onclick="chatShowFolderOverview(\'' + escA(folder.id) + '\')">' +
                     '<div class="chat-folder-name">' + escH(folder.title || 'Folder') + '</div>' +
-                    '<div class="chat-folder-meta">' + escH((folder.chat_count || chats.length || 0) + ' chats') + (folder.source_docs && folder.source_docs.length ? ' • ' + escH(folder.source_docs.length + ' sources') : '') + (duplicateMeta ? ' • ' + escH(duplicateMeta) : '') + '</div>' +
+                    '<div class="chat-folder-meta">' + escH((chats.length || 0) + ' chats') + (folder.source_docs && folder.source_docs.length ? ' • ' + escH(folder.source_docs.length + ' sources') : '') + (duplicateMeta ? ' • ' + escH(duplicateMeta) : '') + '</div>' +
                     '</button>' +
                     '<div class="chat-folder-actions">' +
                     '<button class="btn-icon" title="Add to folder" onclick="event.stopPropagation();chatOpenFolderAddMenu(\'' + escA(folder.id) + '\')" style="width:22px;height:22px"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>' +
@@ -5931,7 +6129,17 @@ function chatRenderMessages() {
         chatShowWelcome();
         return;
     }
+    const segmentMap = new Map((chatState.currentSegments || []).map(segment => [segment.id, segment]));
+    let lastSegmentKey = '';
     messages.forEach(m => {
+        const segmentId = m.segment_id || '';
+        const segment = segmentMap.get(segmentId) || null;
+        const segmentIndex = Number(m.segment_index || segment?.index || 0) || 0;
+        const segmentKey = segmentId || (segmentIndex ? String(segmentIndex) : '');
+        if (segmentKey && segmentKey !== lastSegmentKey) {
+            msgs.appendChild(chatBuildSegmentNode(m, segment));
+            lastSegmentKey = segmentKey;
+        }
         msgs.appendChild(chatBuildMessageNode(m));
     });
     msgs.scrollTop = msgs.scrollHeight;
@@ -6035,8 +6243,13 @@ function renderFolderSessionChip(session) {
 
 function renderSidebarFolderSessionItem(session, extraClass = 'sidebar-folder-chat') {
     const active = chatState.currentSessionId === session.id ? ' active' : '';
+    const profiles = chatSessionProfiles(session);
+    const profileLabel = chatSessionProfilesLabel(session);
+    const profileHtml = profileLabel
+        ? '<span class="sidebar-chat-profile-badge ' + ((profiles.length === 1 && profiles[0] === (chatState.activeProfile || '')) ? 'active' : 'inactive') + '" title="' + escA(profileLabel) + '">' + escH(profileLabel) + '</span>'
+        : '';
     return '<div class="sidebar-folder-chat-row">' +
-        '<button class="' + extraClass + active + '" draggable="true" ondragstart="chatDragSession(event,\'' + escA(session.id) + '\')" onclick="sidebarOpenChat(\'' + escA(session.id) + '\')" title="' + escA(session.title || 'Untitled') + '">' + escH(session.title || 'Untitled') + '</button>' +
+        '<button class="' + extraClass + active + '" draggable="true" ondragstart="chatDragSession(event,\'' + escA(session.id) + '\')" onclick="sidebarOpenChat(\'' + escA(session.id) + '\')" title="' + escA(session.title || 'Untitled') + '"><span class="sidebar-chat-title">' + escH(session.title || 'Untitled') + '</span>' + profileHtml + '</button>' +
         '<button class="btn-icon sidebar-folder-chat-delete" title="Delete chat" onclick="event.stopPropagation(); chatDeleteSession(\'' + escA(session.id) + '\')" style="width:20px;height:20px"><svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>' +
         '</div>';
 }
@@ -6049,6 +6262,11 @@ window.chatNewSession = function (folderId = '') {
     chatState.currentSessionId = null;
     chatState.localMessages = [];
     chatState.lastSubmission = null;
+    chatState.currentSessionProfile = '';
+    chatState.draftProfile = '';
+    chatState.currentSegments = [];
+    chatState.currentActiveSegmentId = '';
+    chatState.currentActiveSegmentIndex = 1;
     chatReplacePendingFiles([]);
     chatState.selectedFolderId = folderId || chatState.selectedFolderId || '';
     chatState.draftFolderId = folderId || chatState.selectedFolderId || '';
@@ -6079,6 +6297,7 @@ async function chatEnsureSessionRecord() {
     if (chatState.currentSessionId) return chatState.currentSessionId;
     const resp = await api('POST', '/api/chat/sessions', {
         folder_id: chatState.draftFolderId || chatState.selectedFolderId || '',
+        profile: chatVisibleProfile(),
         transport_preference: chatState.transportPreference || 'auto',
     });
     chatState.currentSessionId = resp.session_id;
@@ -6424,10 +6643,25 @@ window.chatSend = async function () {
     }
 
     const files = pendingUploads.map(f => f.name);
+    const activeSegment = chatCurrentSegment();
     // Optimistically add user message to local
-    const userMsg = { role: 'user', content: message, files, timestamp: new Date().toISOString() };
+    const userMsg = {
+        role: 'user',
+        content: message,
+        files,
+        timestamp: new Date().toISOString(),
+        segment_id: activeSegment?.id || chatState.currentActiveSegmentId || '',
+        segment_index: activeSegment?.index || chatState.currentActiveSegmentIndex || 1,
+        profile: chatVisibleProfile(),
+        transport: chatExpectedTransport(),
+    };
     chatState.localMessages.push(userMsg);
-    chatAppendMsg('user', message, files);
+    chatAppendMsg('user', message, files, {
+        segment_id: userMsg.segment_id,
+        segment_index: userMsg.segment_index,
+        profile: userMsg.profile,
+        transport: userMsg.transport,
+    });
     input.value = '';
     chatAutoResize(input);
     document.getElementById('chat-send-btn').disabled = !chatState.currentRequestCancelSupported;
