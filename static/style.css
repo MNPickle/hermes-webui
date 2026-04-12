@@ -2353,7 +2353,7 @@ pre code {
 }
 
 /* When collapsed, hide everything except the toggle button */
-.chat-history.collapsed .chat-history-header > span,
+.chat-history.collapsed .chat-history-header-main,
 .chat-history.collapsed .chat-history-actions > .btn-icon:first-child,
 .chat-history.collapsed .chat-history-list {
   display: none;
@@ -2397,12 +2397,24 @@ pre code {
   z-index: 5;
 }
 
-.chat-history-header > span {
+.chat-history-header-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chat-history-header-main > span:first-child {
   flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.chat-history-active-profile {
+  flex-shrink: 0;
 }
 
 .chat-history-actions {
@@ -2581,6 +2593,10 @@ pre code {
   font-size: 10px;
   color: var(--text-muted);
   margin-top: 3px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .chat-history-item-actions {

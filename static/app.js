@@ -4725,6 +4725,12 @@ function chatVisibleProfile() {
     return chatState.currentSessionProfile || chatState.activeProfile || 'default';
 }
 
+function updateChatHistoryActiveProfileBadge() {
+    const badge = document.getElementById('chat-history-active-profile');
+    if (!badge) return;
+    badge.textContent = 'Portal: ' + (chatState.activeProfile || 'default');
+}
+
 function chatGoHome() {
     chatState.currentSessionId = null;
     chatState.localMessages = [];
@@ -5024,6 +5030,7 @@ async function chatRefreshCapabilities() {
         const policy = data.transport_policy || {};
         chatState.apiServerEnabled = !!data.api_server;
         chatState.activeProfile = data.profile || chatState.activeProfile || '';
+        updateChatHistoryActiveProfileBadge();
         chatState.apiTransportSelectable = !!policy.api_selectable;
         chatState.transportPolicy = {
             requiresCli: !!policy.requires_cli,
@@ -5118,7 +5125,10 @@ Screens.chat = function () {
         <!-- Chat History Sidebar -->
         <div class="chat-history ${chatState.historyOpen ? '' : 'collapsed'}" id="chat-history">
             <div class="chat-history-header">
-                <span>Chats</span>
+                <div class="chat-history-header-main">
+                    <span>Chats</span>
+                    <span class="badge badge-accent chat-history-active-profile" id="chat-history-active-profile">Portal: ${escH(chatState.activeProfile || 'default')}</span>
+                </div>
                 <div class="chat-history-actions">
                     <button class="btn-icon" title="New Chat" onclick="chatNewSession()" style="width:28px;height:28px">
                         <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
@@ -5574,7 +5584,7 @@ async function chatLoadHistory() {
             const preview = s.last_message ? escH(s.last_message) : 'Empty';
             const profile = ((s.session || {}).profile || '').trim();
             const profileBadge = profile
-                ? ' <span class="badge badge-accent" title="Profile used by this chat">' + escH(profile) + '</span>'
+                ? ' <span class="badge ' + (profile === (chatState.activeProfile || '') ? 'badge-accent' : 'badge-warning') + '" title="Profile used by this chat session">Session: ' + escH(profile) + '</span>'
                 : '';
             return '<div class="chat-history-item' + (isActive ? ' active' : '') + '" data-sid="' + escA(s.id) + '" draggable="true" ondragstart="chatDragSession(event,\'' + escA(s.id) + '\')" onclick="chatLoadSession(\'' + escA(s.id) + '\')">' +
                 '<div class="chat-history-item-title">' + escH(s.title || 'Untitled') + '</div>' +
