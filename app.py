@@ -117,6 +117,18 @@ def _runtime_env_source(key: str, allow_repo_env: bool = True) -> str:
     return ""
 
 
+def _resolve_runtime_template(value: str) -> str:
+    raw_value = str(value or "")
+    if not raw_value:
+        return ""
+
+    def replace_env(match: re.Match[str]) -> str:
+        env_key = str(match.group(1) or "").strip()
+        return _runtime_env_value(env_key, "") if env_key else ""
+
+    return re.sub(r"\$\{([A-Z0-9_]+)\}", replace_env, raw_value)
+
+
 def _effective_hermes_api_url(default: str = "http://127.0.0.1:8642") -> str:
     explicit = _runtime_env_value("HERMES_API_URL", "").strip()
     if explicit:
@@ -2642,6 +2654,7 @@ def _resolve_role_target(role: str) -> dict:
             default_target["api_key"] = primary_profile.get("api_key")
         if not default_target["model"]:
             default_target["model"] = primary_profile.get("model") or default_target["model"]
+    default_target["base_url"] = _resolve_runtime_template(default_target.get("base_url") or "").strip()
     default_target["api_key"] = _resolved_target_api_key(default_target)
 
     if role == "primary":
@@ -2668,6 +2681,7 @@ def _resolve_role_target(role: str) -> dict:
                 fallback_target["api_key"] = fallback_profile.get("api_key")
             if not fallback_target["model"]:
                 fallback_target["model"] = fallback_profile.get("model") or fallback_target["model"]
+        fallback_target["base_url"] = _resolve_runtime_template(fallback_target.get("base_url") or "").strip()
         fallback_target["api_key"] = _resolved_target_api_key(fallback_target)
         return fallback_target
 
@@ -2692,6 +2706,7 @@ def _resolve_role_target(role: str) -> dict:
             for key in ("base_url", "api_key", "model", "provider"):
                 if isinstance(vision_cfg.get(key), str) and vision_cfg.get(key).strip():
                     merged[key] = vision_cfg.get(key).strip()
+            merged["base_url"] = _resolve_runtime_template(merged.get("base_url") or "").strip()
             merged["provider"] = _normalize_provider_type(
                 merged.get("provider", ""),
                 base_url=merged.get("base_url", ""),
@@ -8035,7 +8050,7 @@ def _chat_completion_request(target: dict, messages: list[dict]) -> str:
     import urllib.request
 
     payload = {"model": target["model"] or "hermes-agent", "messages": messages, "stream": False}
-    gateway_url = _effective_hermes_api_url(DEFAULT_HERMES_API_URL)
+    api_url = str(target.get("base_url") or "").strip() or _effective_hermes_api_url(DEFAULT_HERMES_API_URL)
     provider_type = str(target.get("provider") or "").strip().lower()
     routing_provider = str(target.get("routing_provider") or "").strip()
     if provider_type == "openrouter" and routing_provider:
@@ -8043,10 +8058,10 @@ def _chat_completion_request(target: dict, messages: list[dict]) -> str:
             "order": [routing_provider],
             "allow_fallbacks": True,
         }
-    headers = _api_server_headers(None, None, {"base_url": gateway_url})
+    headers = _api_server_headers(target.get("api_key"), target.get("provider"), target)
     headers["Content-Type"] = "application/json"
     req = urllib.request.Request(
-        _build_openai_api_url(gateway_url, "chat/completions"),
+        _build_openai_api_url(api_url, "chat/completions"),
         data=json.dumps(payload).encode(),
         headers=headers,
         method="POST",
@@ -8437,7 +8452,7 @@ def _provider_env_api_key(provider: str | None) -> str:
 
 def _resolved_target_api_key(target: dict | None) -> str:
     target = target or {}
-    explicit_api_key = (target.get("api_key") or "").strip()
+    explicit_api_key = _resolve_runtime_template((target.get("api_key") or "").strip()).strip()
     if explicit_api_key:
         return explicit_api_key
     provider_api_key = _provider_env_api_key(target.get("provider"))
@@ -8477,6 +8492,20 @@ def _resolve_api_target(prefer_vision: bool = False) -> dict:
 
 def _resolve_fallback_api_target() -> dict:
     return _resolve_role_target("fallback")
+
+
+def _api_target_missing_credentials(target: dict | None) -> bool:
+    import urllib.parse
+
+    target = target or {}
+    base_url = str(target.get("base_url") or "").strip()
+    if not base_url:
+        return False
+    parsed = urllib.parse.urlparse(base_url)
+    hostname = (parsed.hostname or "").strip().lower()
+    if hostname in {"", "localhost", "127.0.0.1", "::1"}:
+        return False
+    return not bool(_resolved_target_api_key(target))
 
 
 def _openrouter_model_supports_images(target: dict, timeout: int = 3) -> tuple[bool | None, str]:
@@ -8707,6 +8736,9 @@ def _image_attachment_support_status() -> tuple[bool, str]:
     if not vision_ready:
         return False, vision_reason
     target = _resolve_api_target(prefer_vision=True)
+    if _api_target_missing_credentials(target):
+        api_url = target.get("base_url") or _effective_hermes_api_url(DEFAULT_HERMES_API_URL)
+        return False, f"Vision API key is missing for remote endpoint {api_url}"
     api_ok, api_reason, _ = _api_server_probe(timeout=2, prefer_vision=True)
     if api_ok:
         image_model_ok, image_model_reason = _openrouter_model_supports_images(target, timeout=3)

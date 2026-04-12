@@ -495,6 +495,30 @@ class HermesWebUISmokeTests(unittest.TestCase):
         self.assertTrue(data["transport_policy"]["api_selectable"])
         self.assertFalse(data["transport_policy"]["requires_cli"])
 
+    def test_image_attachment_support_requires_credentials_for_remote_endpoint(self):
+        target = {
+            "base_url": "https://ollama.com/v1",
+            "api_key": "",
+            "model": "qwen3.5:cloud",
+            "provider": "auto",
+        }
+
+        with patch.object(mod, "_vision_configured", return_value=(True, "")), \
+             patch.object(mod, "_resolve_api_target", return_value=target), \
+             patch.object(mod, "_api_server_probe", side_effect=AssertionError("probe should not run when credentials are missing")):
+            ready, reason = mod._image_attachment_support_status()
+
+        self.assertFalse(ready)
+        self.assertIn("Vision API key is missing", reason)
+
+    def test_resolved_target_api_key_expands_runtime_template(self):
+        with patch.dict(mod.os.environ, {}, clear=True), \
+             patch.object(mod, "_repo_env_values", return_value={}), \
+             patch.object(mod, "_hermes_env_values", return_value={"OPENAI_API_KEY": "resolved-secret"}):
+            resolved = mod._resolved_target_api_key({"api_key": "${OPENAI_API_KEY}", "provider": "openai"})
+
+        self.assertEqual(resolved, "resolved-secret")
+
     def test_env_api_returns_metadata_and_presets(self):
         env_file = Path(self.tmpdir.name) / ".env"
         env_file.write_text("OPENAI_API_KEY=test-key\nOPENAI_BASE_URL=\n", encoding="utf-8")
@@ -1967,6 +1991,37 @@ Sidecar output:
         self.assertEqual(target["provider"], "openrouter")
         self.assertEqual(target["base_url"], "https://openrouter.ai/api/v1")
         self.assertEqual(target["api_key"], "router-secret")
+
+    def test_chat_completion_request_uses_resolved_target_base_url_and_api_key(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["authorization"] = req.headers.get("Authorization")
+            captured["content_type"] = req.headers.get("Content-type")
+            captured["timeout"] = timeout
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return FakeHTTPResponse({
+                "choices": [{"message": {"content": "vision ok"}}],
+            })
+
+        target = {
+            "model": "vision-model",
+            "provider": "custom",
+            "base_url": "https://vision.example.test/v1",
+            "api_key": "vision-secret",
+        }
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            result = mod._chat_completion_request(target, [{"role": "user", "content": "hello"}])
+
+        self.assertEqual(result, "vision ok")
+        self.assertEqual(captured["url"], "https://vision.example.test/v1/chat/completions")
+        self.assertEqual(captured["authorization"], "Bearer vision-secret")
+        self.assertEqual(captured["content_type"], "application/json")
+        self.assertEqual(captured["timeout"], mod.CHAT_REQUEST_TIMEOUT)
+        self.assertEqual(captured["payload"]["model"], "vision-model")
+        self.assertEqual(captured["payload"]["messages"], [{"role": "user", "content": "hello"}])
 
     def test_frontend_source_does_not_contain_python_unicode_escapes(self):
         source = (Path(mod.APP_ROOT) / "static" / "app.js").read_text(encoding="utf-8")
