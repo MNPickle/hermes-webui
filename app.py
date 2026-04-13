@@ -2637,8 +2637,13 @@ def _resolve_role_target(role: str) -> dict:
         model_cfg.get("default_provider", ""),
         base_url=model_cfg.get("base_url", ""),
     )
+    # The web UI is a gateway *client* — resolve the gateway URL from the
+    # active profile's API_SERVER_PORT (handles multi-gateway setups like
+    # default:8642 / leire:8644).  Falls back to model.base_url only when
+    # no gateway port is configured for the profile.
+    _gateway_url = _profile_api_gateway_url()
     default_target = {
-        "base_url": (model_cfg.get("base_url") or _provider_default_base_url(default_provider) or _effective_hermes_api_url("") or DEFAULT_HERMES_API_URL).strip(),
+        "base_url": (_gateway_url or model_cfg.get("base_url") or _provider_default_base_url(default_provider) or _effective_hermes_api_url("") or DEFAULT_HERMES_API_URL).strip(),
         "api_key": str(model_cfg.get("api_key") or "").strip(),
         "model": str(model_cfg.get("default_model") or "").strip(),
         "provider": default_provider,
@@ -2649,7 +2654,10 @@ def _resolve_role_target(role: str) -> dict:
     primary_profile = _get_provider_profile(default_target.get("profile"), raw)
     if primary_profile:
         default_target["provider"] = primary_profile.get("provider") or default_target["provider"]
-        default_target["base_url"] = primary_profile.get("base_url") or default_target["base_url"]
+        # Only apply primary_profile base_url when no gateway URL was resolved
+        # — the web UI must route through the local gateway, not the upstream LLM.
+        if not _gateway_url:
+            default_target["base_url"] = primary_profile.get("base_url") or default_target["base_url"]
         if primary_profile.get("api_key"):
             default_target["api_key"] = primary_profile.get("api_key")
         if not default_target["model"]:

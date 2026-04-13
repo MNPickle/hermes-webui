@@ -8,7 +8,12 @@
 
 # Goal
 
-Make the currently active Hermes profile visible in the key places of the portal UI, so the user can always understand which profile the portal is using.
+    "accessibility.voice.speechLanguage": "es-ES",
+    "workbench.settings.applyToAllProfiles": [
+        "accessibility.voice.speechLanguage"
+    ],
+
+Make thSpanish Language Pack for Visual Studio CodSpanish Language Pack for Visual Studio Codive Hermes profile visible in the key places of the portal UI, so the user can always understand which profile the portal is using.
 
 
 # Current Situation
