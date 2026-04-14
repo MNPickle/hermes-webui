@@ -8871,6 +8871,9 @@ def api_chat():
     data = request.get_json(silent=True) or {}
     message = data.get("message", "").strip()
     session_id = data.get("session_id")
+    requested_profile = _normalize_hermes_profile_name(data.get("profile") or "")
+    if requested_profile and requested_profile not in _available_hermes_profile_names():
+        return jsonify({"error": "Invalid profile"}), 400
     requested_transport_preference = _normalize_transport_preference(data.get("transport_preference"))
     requested_folder_id = str(data.get("folder_id") or "").strip()
     request_id = (data.get("request_id") or str(uuid.uuid4())).strip()
@@ -8894,7 +8897,7 @@ def api_chat():
                 file_display_names[fpath.name] = display_name
     if not message and not files:
         return jsonify({"error": "Message or attachment is required"}), 400
-    sess = _get_or_create_chat_session(session_id)
+    sess = _get_or_create_chat_session(session_id, profile_name=requested_profile)
     sess["profile"] = _normalize_hermes_profile_name(sess.get("profile")) or _selected_hermes_profile_name()
     if data.get("transport_preference") is not None:
         validated_preference, preference_notice = _validated_transport_preference(requested_transport_preference)

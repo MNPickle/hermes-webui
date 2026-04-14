@@ -949,12 +949,17 @@ window.saveRuntimeProfile = async function (btn) {
     try {
         setBtnLoading(btn, true);
         const selectedProfile = select.value || 'default';
+        const shouldSwitchCurrentChat = !!chatState.currentSessionId && chatVisibleProfile() !== selectedProfile;
         await api('PUT', '/api/runtime/profiles', { profile: selectedProfile });
         chatState.activeProfile = selectedProfile;
-        if (!chatState.currentSessionId) {
+        if (shouldSwitchCurrentChat) {
+            const resp = await api('PUT', '/api/chat/sessions/' + chatState.currentSessionId + '/profile', { profile: selectedProfile });
+            chatApplySessionMetadata(resp.session || null);
+        } else if (!chatState.currentSessionId) {
             chatState.currentSessionProfile = selectedProfile;
             if (currentScreenId() === 'chat') chatRenderSessionBanner();
         }
+        updateChatHistoryActiveProfileBadge();
         _healthCache = null;
         checkHealth();
         window.modelRolesCache = null;
@@ -6864,6 +6869,7 @@ window.chatSend = async function () {
     try {
         const resp = await api('POST', '/api/chat', {
             message, session_id: chatState.currentSessionId,
+            profile: chatVisibleProfile(),
             folder_id: chatState.currentSessionId ? '' : (chatState.draftFolderId || chatState.selectedFolderId || ''),
             transport_preference: chatState.transportPreference || 'auto',
             request_id: chatState.currentRequestId,
