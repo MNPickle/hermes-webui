@@ -2137,17 +2137,55 @@ import secrets as _secrets
 
 _DASHBOARD_USER = os.environ.get("HERMES_DASHBOARD_USER", "admin")
 _DASHBOARD_PASS = os.environ.get("HERMES_DASHBOARD_PASS", "Unaitxo@13")
-_SESSION_TOKENS: dict[str, float] = {}   # token -> expiry timestamp
 _SESSION_TOKEN_TTL = 86400  # 24 hours
+_SESSION_TOKEN_STORE = Path(os.environ.get(
+    "HERMES_WEBUI_TOKEN_STORE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".session_tokens.json"),
+))
+
+
+def _load_session_tokens() -> dict[str, float]:
+    """Load valid session tokens from disk (shared across workers)."""
+    if not _SESSION_TOKEN_STORE.exists():
+        return {}
+    try:
+        data = json.loads(_SESSION_TOKEN_STORE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    now = time.time()
+    return {str(k): float(v) for k, v in data.items()
+            if isinstance(v, (int, float)) and float(v) > now}
+
+
+def _save_session_tokens(tokens: dict[str, float]) -> None:
+    """Persist session tokens to disk."""
+    try:
+        _SESSION_TOKEN_STORE.write_text(json.dumps(tokens), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _register_session_token(token: str, expiry: float) -> None:
+    tokens = _load_session_tokens()
+    tokens[token] = expiry
+    _save_session_tokens(tokens)
+
+
+def _remove_session_token(token: str) -> None:
+    tokens = _load_session_tokens()
+    tokens.pop(token, None)
+    _save_session_tokens(tokens)
 
 
 def _verify_session_cookie() -> bool:
     token = request.cookies.get("hermes_webui")
     if not token:
         return False
-    expiry = _SESSION_TOKENS.get(token)
+    tokens = _load_session_tokens()
+    expiry = tokens.get(token)
     if expiry is None or time.time() > expiry:
-        _SESSION_TOKENS.pop(token, None)
+        if expiry is not None:
+            _remove_session_token(token)
         return False
     return True
 
@@ -2159,7 +2197,7 @@ def webui_login():
     password = data.get("password", "")
     if username == _DASHBOARD_USER and password == _DASHBOARD_PASS:
         token = _secrets.token_urlsafe(32)
-        _SESSION_TOKENS[token] = time.time() + _SESSION_TOKEN_TTL
+        _register_session_token(token, time.time() + _SESSION_TOKEN_TTL)
         resp = jsonify({"ok": True})
         resp.set_cookie(
             "hermes_webui", token,
@@ -2179,7 +2217,8 @@ def webui_auth_check():
 @app.route("/api/logout", methods=["POST"])
 def webui_logout():
     token = request.cookies.get("hermes_webui")
-    _SESSION_TOKENS.pop(token, None)
+    if token:
+        _remove_session_token(token)
     resp = jsonify({"ok": True})
     resp.delete_cookie("hermes_webui")
     return resp
