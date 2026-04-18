@@ -5675,3 +5675,13 @@ kbd {
 }
 .login-btn:hover { background: #2563eb; }
 .login-btn:disabled { opacity: .6; cursor: wait; }
+.card-close-btn {
+    background: none;
+    border: none;
+    font-size: 20px;
+    cursor: pointer;
+    opacity: 0.6;
+}
+.card-close-btn:hover {
+    opacity: 1;
+}

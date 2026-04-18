@@ -543,6 +543,13 @@ function renderGlobalStatusBanner() {
     container.classList.remove('hidden');
     container.innerHTML = `
         <div class="update-banner status-${escA(state.status || '')}">
+            <!-- The Close Button -->
+            <button class="card-close-btn" 
+                    onclick="closeHermesUpdateCard()" 
+                    title="Ocultar tarjeta de actualizaciones"
+                    style="position: absolute; top: 10px; right: 10px; background: transparent; border: none; font-size: 24px; cursor: pointer; color: inherit; line-height: 1; z-index: 9999;">
+            &times;
+            </button>
             <div class="update-banner-copy">
                 <div class="mb-8"><span class="badge ${meta.badge}">${escH(meta.label)}</span></div>
                 <h3>${escH(meta.title)}</h3>
@@ -794,7 +801,16 @@ async function setBtnLoading(el, loading) {
     if (loading) { el.dataset._origText = el.textContent; el.disabled = true; el.classList.add('btn-loading'); }
     else { el.textContent = el.dataset._origText || el.textContent; el.disabled = false; el.classList.remove('btn-loading'); }
 }
-
+function closeHermesUpdateCard() {
+  const banner = document.getElementById('global-status-banner');
+  if (banner) {
+    // Hide the banner
+    banner.style.display = 'none';
+    
+    // Optional: Save the state in localStorage so it stays hidden on refresh
+    // localStorage.setItem('hermes_banner_hidden', 'true');
+  }
+}
 // ── SERVICE ────────────────────────────────────────────────
 async function serviceAction(action) {
     const actionLabels = { start: '\u25b6 Start', stop: '\u25a0 Stop', restart: '\u21bb Restart', doctor: 'Run Diagnostics' };
