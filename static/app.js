@@ -7431,14 +7431,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     bootstrapTokenFromUrl();
     initLoginForm();
 
-    // Check session first
-    const authed = await checkAuthSession();
-    if (authed) {
-        showApp();
-        bootstrapApp();
-    } else {
-        showLoginScreen();
-    }
+    // Always require explicit login — never auto-enter dashboard from a
+    // leftover session cookie.  Show the login screen on every page load.
+    showLoginScreen();
 });
 
 function bootstrapApp() {
