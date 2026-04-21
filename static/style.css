@@ -2441,7 +2441,7 @@ pre code {
   flex: unset;
 }
 
-/* Keep full width only when chat history is expanded */
+/* Keep full width only when chat history is expanded este ojo  */
 #main-wrapper.sidebar-collapsed .chat-history:not(.collapsed) {
   width: 260px;
   min-width: 260px;
