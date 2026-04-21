@@ -428,7 +428,7 @@ pre code {
   width: auto !important;
 }
 #sidebar.collapsed .collapse-arrow {
-  transform: rotate(180deg);
+  transform: none;
 }
 
 /* Sidebar Navigation */
@@ -2736,6 +2736,10 @@ pre code {
   background: var(--bg-primary);
 }
 
+#menu-toggle {
+  display: none !important;
+}
+
 #topbar-history-toggle {
   display: none;
 }
@@ -2752,7 +2756,7 @@ pre code {
   flex-shrink: 0;
 }
 
-#topbar.hidden-by-chat > *:not(.topbar-actions):not(#menu-toggle) {
+#topbar.hidden-by-chat > *:not(.topbar-actions) {
   display: none;
 }
 
@@ -2767,11 +2771,7 @@ pre code {
 /* On mobile, also show the hamburger menu button in chat mode */
 @media (max-width: 768px) {
   #topbar.hidden-by-chat {
-    justify-content: space-between;
-  }
-
-  #topbar.hidden-by-chat #menu-toggle {
-    display: flex;
+    justify-content: flex-end;
   }
 }
 
