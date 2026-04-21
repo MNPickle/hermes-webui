@@ -2736,6 +2736,10 @@ pre code {
   background: var(--bg-primary);
 }
 
+#topbar-history-toggle {
+  display: none;
+}
+
 /* Hide the global topbar when chat is active */
 /* In chat mode, collapse topbar to show only the theme toggle */
 #topbar.hidden-by-chat {
@@ -2748,12 +2752,27 @@ pre code {
   flex-shrink: 0;
 }
 
-#topbar.hidden-by-chat > *:not(.topbar-actions) {
+#topbar.hidden-by-chat > *:not(.topbar-actions):not(#menu-toggle) {
   display: none;
 }
 
-#topbar.hidden-by-chat .topbar-actions > *:not(#theme-toggle) {
+#topbar.hidden-by-chat .topbar-actions > *:not(#theme-toggle):not(#topbar-history-toggle) {
   display: none;
+}
+
+#topbar.hidden-by-chat #topbar-history-toggle {
+  display: inline-flex;
+}
+
+/* On mobile, also show the hamburger menu button in chat mode */
+@media (max-width: 768px) {
+  #topbar.hidden-by-chat {
+    justify-content: space-between;
+  }
+
+  #topbar.hidden-by-chat #menu-toggle {
+    display: flex;
+  }
 }
 
 /* Chat Header */
