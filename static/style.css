@@ -2760,7 +2760,7 @@ pre code {
   flex-shrink: 0;
 }
 
-#topbar.hidden-by-chat > *:not(.topbar-actions) {
+#topbar.hidden-by-chat > *:not(.topbar-actions):not(#menu-toggle) {
   display: none;
 }
 
@@ -2774,8 +2774,12 @@ pre code {
 
 /* On mobile, also show the hamburger menu button in chat mode */
 @media (max-width: 768px) {
+  #menu-toggle {
+    display: inline-flex !important;
+  }
+
   #topbar.hidden-by-chat {
-    justify-content: flex-end;
+    justify-content: space-between;
   }
 }
 
