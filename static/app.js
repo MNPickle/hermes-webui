@@ -5442,7 +5442,7 @@ function chatRenderTransportControls() {
         return '<option value="' + escA(name) + '"' + (name === chatVisibleProfile() ? ' selected' : '') + '>' + escH(name) + '</option>';
     }).join('');
     const switchSummary = chatState.currentSessionId
-        ? 'The next messages in this chat will use the selected profile after you apply it.'
+        ? 'Changing the profile applies immediately to the next messages in this chat.'
         : 'Choose the profile you want to use before the next new chat turn.';
     mount.innerHTML =
         '<div class="chat-runtime-controls">' +
@@ -5454,7 +5454,6 @@ function chatRenderTransportControls() {
                 '<div class="chat-transport-label">Profile</div>' +
                 '<div class="chat-profile-controls">' +
                     '<select id="chat-profile-select" class="chat-profile-select" onchange="chatHandleProfileDraftChange()">' + profileOptions + '</select>' +
-                    '<button class="chat-runtime-apply-btn" type="button" onclick="chatApplyRuntimeProfile()"' + (profileOptions ? '' : ' disabled') + '>Use Profile</button>' +
                 '</div>' +
             '</div>' +
         '</div>' +
@@ -5466,25 +5465,22 @@ function chatRenderTransportControls() {
     chatHandleProfileDraftChange();
 }
 
-window.chatHandleProfileDraftChange = function () {
-    const select = document.getElementById('chat-profile-select');
-    const button = document.querySelector('.chat-runtime-apply-btn');
-    if (!select || !button) return;
-    button.disabled = !select.value || select.value === chatVisibleProfile();
-};
-
-window.chatApplyRuntimeProfile = async function () {
+window.chatHandleProfileDraftChange = async function () {
     const select = document.getElementById('chat-profile-select');
     if (!select || !select.value) return;
-    const nextProfile = select.value;
+    if (select.value === chatVisibleProfile()) return;
+    await chatApplyRuntimeProfile(select.value);
+};
+
+window.chatApplyRuntimeProfile = async function (nextProfileFromSelect) {
+    const select = document.getElementById('chat-profile-select');
+    const nextProfile = nextProfileFromSelect || (select ? select.value : '');
+    if (!nextProfile) return;
     if (nextProfile === chatVisibleProfile()) {
         toast('This chat is already using that profile', 'info', 1500);
-        chatHandleProfileDraftChange();
         return;
     }
-    const button = document.querySelector('.chat-runtime-apply-btn');
     try {
-        if (button) button.disabled = true;
         if (chatState.currentSessionId) {
             const resp = await api('PUT', '/api/chat/sessions/' + chatState.currentSessionId + '/profile', { profile: nextProfile });
             chatApplySessionMetadata(resp.session || null);
@@ -5529,14 +5525,18 @@ function chatRenderSessionBanner() {
         text = text || 'Hermes did not return a resumable session id for this chat yet, so follow-up continuity may be limited.';
         cls = 'warning';
     }
-    if (chatState.currentTransport === 'api') {
-        badges.push('<span class="badge badge-warning">API replay transport</span>');
-    } else if (chatState.currentTransport === 'cli') {
-        badges.push('<span class="badge badge-info">Hermes CLI transport</span>');
-    }
     if (profile) {
         badges.push('<span class="badge badge-accent">Profile: ' + escH(profile) + '</span>');
     }
+
+    const activeTransport = chatState.currentTransport || chatExpectedTransport();
+    badges.push('<span class="badge badge-info">Transport: ' + escH(chatTransportPreferenceLabel(activeTransport)) + '</span>');
+
+    const preferredTransport = chatExpectedTransport();
+    if (activeTransport && preferredTransport && activeTransport !== preferredTransport) {
+        badges.push('<span class="badge badge-warning">Next: ' + escH(chatTransportPreferenceLabel(preferredTransport)) + '</span>');
+    }
+
     if (chatState.lastTurnUsedSidecarVision) {
         badges.push('<span class="badge badge-info">Sidecar vision used</span>');
         if (!chatState.currentTransportNotice && chatState.lastTurnSidecarAssets.length) {
