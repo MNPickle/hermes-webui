@@ -2740,6 +2740,10 @@ pre code {
   display: none !important;
 }
 
+#topbar .topbar-actions {
+  margin-left: auto;
+}
+
 #topbar-history-toggle {
   display: none;
 }
