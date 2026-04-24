@@ -26,91 +26,96 @@ function clearToken() {
     localStorage.removeItem('hermes_webui_token');
 }
 
-// AuthRequired sentinel — thrown only when user cancels the token prompt
-// (api() retries internally after prompt; this is for the cancel path only)
+function bootstrapTokenFromUrl() {
+    try {
+        const url = new URL(window.location.href);
+        const token = (url.searchParams.get('token') || '').trim();
+        if (!token) return;
+        setToken(token);
+        url.searchParams.delete('token');
+        window.history.replaceState({}, document.title, url.pathname + (url.search || '') + url.hash);
+    } catch {}
+}
+
+// AuthRequired sentinel
 class AuthRequired extends Error {
     constructor() { super('Authentication required'); this.name = 'AuthRequired'; }
 }
 
-let _tokenPromptActive = false;
-let _tokenPromptDeferred = null;
+// --- Login screen flow ---
+let _authed = false;
 
-function promptForToken() {
-    if (_tokenPromptActive) return null;
-    _tokenPromptActive = true;
-    // Create a deferred that waiting requests will await
-    let resolveDeferred;
-    _tokenPromptDeferred = new Promise(resolve => { resolveDeferred = resolve; });
+async function checkAuthSession() {
     try {
-        const token = prompt('Enter your HERMES_WEBUI_TOKEN to access the admin panel:\n\n(Set this with: export HERMES_WEBUI_TOKEN=your-token-here)');
-        if (token && token.trim()) {
-            const trimmed = token.trim();
-            setToken(trimmed);
-            resolveDeferred(trimmed); // resolve the deferred so all waiters retry
-            return trimmed;
+        const resp = await fetch(API.base + '/api/auth/check', { credentials: 'include' });
+        return resp.ok;
+    } catch { return false; }
+}
+
+function showLoginScreen() {
+    document.getElementById('login-screen').style.display = 'flex';
+    document.getElementById('app').style.display = 'none';
+}
+
+function showApp() {
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('app').style.display = '';
+    _authed = true;
+}
+
+function initLoginForm() {
+    const form = document.getElementById('login-form');
+    if (!form) return;
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const btn = document.getElementById('login-submit');
+        const errEl = document.getElementById('login-error');
+        const username = document.getElementById('login-username').value.trim();
+        const password = document.getElementById('login-password').value;
+        errEl.style.display = 'none';
+        btn.disabled = true;
+        btn.textContent = 'Signing in...';
+        try {
+            const resp = await fetch(API.base + '/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password }),
+                credentials: 'include',
+            });
+            if (resp.ok) {
+                showApp();
+                bootstrapApp();
+            } else {
+                const d = await resp.json().catch(() => ({}));
+                errEl.textContent = d.error || 'Invalid credentials';
+                errEl.style.display = 'block';
+            }
+        } catch (err) {
+            errEl.textContent = 'Connection error';
+            errEl.style.display = 'block';
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Sign in';
         }
-        resolveDeferred(null); // user cancelled
-        return null;
-    } finally {
-        _tokenPromptActive = false;
-        _tokenPromptDeferred = null;
-    }
+    });
 }
 
 async function authFetch(path, options = {}, signal) {
-    const fetchWithToken = async (tokenValue) => {
-        const headers = new Headers(options.headers || {});
-        if (tokenValue && !headers.has('Authorization')) headers.set('Authorization', 'Bearer ' + tokenValue);
-        return fetch(API.base + path, { ...options, headers, signal });
-    };
-    const readAuthError = async (resp) => {
-        let errMsg = 'Authentication failed';
-        try {
-            const d = await resp.clone().json();
-            errMsg = d.error || d.message || errMsg;
-        } catch {}
-        return errMsg;
-    };
+    const headers = new Headers(options.headers || {});
+    // Include cookies for session auth
+    const fetchOpts = { ...options, headers, signal, credentials: 'include' };
 
-    let token = getToken();
-    let resp = await fetchWithToken(token);
-    if (!resp.ok && resp.status === 401) {
-        let errMsg = await readAuthError(resp);
-        if (/not configured/i.test(errMsg)) {
-            throw new Error(errMsg);
-        }
+    // Also send Bearer token if available (legacy compat)
+    const token = getToken();
+    if (token && !headers.has('Authorization')) headers.set('Authorization', 'Bearer ' + token);
 
-        // Another request may have prompted and stored a newer token while this
-        // request was still resolving its own 401. Retry once with the latest
-        // saved token before prompting again.
-        const latestSavedToken = getToken();
-        if (latestSavedToken && latestSavedToken !== token) {
-            resp = await fetchWithToken(latestSavedToken);
-            if (resp.ok) return resp;
-            if (resp.status !== 401) return resp;
-            token = latestSavedToken;
-            errMsg = await readAuthError(resp);
-        }
-
-        // Only clear the token we actually attempted. Another request may have
-        // already replaced localStorage with a newer valid token.
-        if (token && getToken() === token) clearToken();
-
-        let savedToken = null;
-        if (_tokenPromptActive && _tokenPromptDeferred) {
-            savedToken = await _tokenPromptDeferred;
-        } else {
-            savedToken = promptForToken();
-        }
-        if (!savedToken) throw new AuthRequired();
-
-        resp = await fetchWithToken(savedToken);
-        if (resp.ok) return resp;
-        if (resp.status === 401) {
-            if (getToken() === savedToken) clearToken();
-            errMsg = await readAuthError(resp);
-            throw new Error(errMsg || 'Authentication failed: check your token');
-        }
+    let resp = await fetch(API.base + path, fetchOpts);
+    if (resp.ok) return resp;
+    if (resp.status === 401) {
+        // Session expired — show login screen
+        _authed = false;
+        showLoginScreen();
+        throw new AuthRequired();
     }
     return resp;
 }
@@ -136,11 +141,16 @@ async function api(method, path, body, signal) {
             }
         }
         let errMsg = 'Request failed';
+        let errData = null;
         try {
             const d = await resp.json();
+            errData = d;
             errMsg = d.error || d.message || (Array.isArray(d.details) ? d.details.join('; ') : errMsg);
         } catch {}
-        throw new Error(errMsg);
+        const err = new Error(errMsg);
+        err.status = resp.status;
+        err.responseData = errData;
+        throw err;
     }
     return resp.json();
 }
@@ -289,6 +299,48 @@ function refreshCurrentScreen() {
 }
 
 let _healthCache = null, _healthTs = 0;
+
+function activeProfileBadgeH(profile, compact = false) {
+    const value = String(profile || 'unknown').trim() || 'unknown';
+    const label = compact ? '' : '<span class="profile-indicator-label">Profile</span>';
+    return '' +
+        '<div class="profile-indicator">' +
+            label +
+            '<span class="badge badge-accent" title="Active Hermes profile">' + escH(value) + '</span>' +
+        '</div>';
+}
+
+function activeProfileSidebarH(profile) {
+    const value = String(profile || 'unknown').trim() || 'unknown';
+    return '' +
+        '<div class="profile-indicator profile-indicator--sidebar">' +
+            '<span class="profile-indicator-label">Profile</span>' +
+            '<span class="badge badge-accent" title="Active Hermes profile">' + escH(value) + '</span>' +
+        '</div>';
+}
+
+function runtimeProfileContextCardH(health, apiUrl, title = 'Runtime Context', description = '') {
+    const resolvedApiUrl = String(apiUrl || health?.api_url || '(not set)').trim() || '(not set)';
+    return '' +
+        '<div class="card mb-16"><div class="card-header"><span>' + escH(title) + '</span></div><div class="card-body">' +
+            (description ? '<p class="text-sm text-secondary mb-16">' + escH(description) + '</p>' : '') +
+            '<div class="form-row">' +
+                '<div class="form-group"><label class="form-label">Active Profile</label><div>' + activeProfileBadgeH(health?.profile) + '</div></div>' +
+                '<div class="form-group"><label class="form-label">Hermes Home</label><div class="font-mono text-sm">' + escH(health?.hermes_home || '?') + '</div></div>' +
+                '<div class="form-group"><label class="form-label">API Server</label><div class="font-mono text-sm">' + escH(resolvedApiUrl) + '</div></div>' +
+                '<div class="form-group"><label class="form-label">Gateway Status</label><div>' + (health?.gateway_running ? '<span class="badge badge-success">Running</span>' : '<span class="badge badge-danger">Stopped</span>') + '</div></div>' +
+            '</div>' +
+        '</div></div>';
+}
+
+function updateActiveProfileIndicators(health) {
+    const profile = health?.profile || 'unknown';
+    const topbar = document.getElementById('topbar-active-profile');
+    const sidebar = document.getElementById('sidebar-active-profile');
+    if (topbar) topbar.innerHTML = activeProfileBadgeH(profile, true);
+    if (sidebar) sidebar.innerHTML = activeProfileSidebarH(profile);
+}
+
 async function checkHealth() {
     const now = Date.now();
     if (_healthCache && (now - _healthTs) < 5000) return;
@@ -299,6 +351,7 @@ async function checkHealth() {
         const running = d.gateway_running;
         dot.className = 'status-dot ' + (running ? 'online' : 'warning');
         txt.textContent = running ? 'Gateway Running' : 'Gateway Stopped';
+        updateActiveProfileIndicators(d);
         const ver = document.getElementById('sidebar-version');
         if (ver) {
             ver.textContent = `UI v${WEB_UI_VERSION}`;
@@ -312,6 +365,7 @@ async function checkHealth() {
     } catch (e) {
         document.querySelector('#connection-status .status-dot').className = 'status-dot error';
         document.querySelector('#connection-status .status-text').textContent = 'Error';
+        updateActiveProfileIndicators({ profile: 'unavailable' });
     }
     _healthCache = true; _healthTs = now;
 }
@@ -489,6 +543,13 @@ function renderGlobalStatusBanner() {
     container.classList.remove('hidden');
     container.innerHTML = `
         <div class="update-banner status-${escA(state.status || '')}">
+            <!-- The Close Button -->
+            <button class="card-close-btn" 
+                    onclick="closeHermesUpdateCard()" 
+                    title="Ocultar tarjeta de actualizaciones"
+                    style="position: absolute; top: 10px; right: 10px; background: transparent; border: none; font-size: 24px; cursor: pointer; color: inherit; line-height: 1; z-index: 9999;">
+            &times;
+            </button>
             <div class="update-banner-copy">
                 <div class="mb-8"><span class="badge ${meta.badge}">${escH(meta.label)}</span></div>
                 <h3>${escH(meta.title)}</h3>
@@ -711,6 +772,7 @@ Screens.dashboard = async function () {
             <div class="card-header"><span>System Info</span></div>
             <div class="card-body">
                 <div class="form-row">
+                    <div class="form-group"><label class="form-label">Active Profile</label><div>${activeProfileBadgeH(health.profile)}</div></div>
                     <div class="form-group"><label class="form-label">OS</label><div class="text-sm">${escH(sys.os_info || '?')}</div></div>
                     <div class="form-group"><label class="form-label">Disk Free</label><div class="text-sm">${fmtBytes(sys.disk_free)}</div></div>
                     <div class="form-group"><label class="form-label">Hermes Home</label><div class="font-mono text-sm">${escH(health.hermes_home || '?')}</div></div>
@@ -739,7 +801,16 @@ async function setBtnLoading(el, loading) {
     if (loading) { el.dataset._origText = el.textContent; el.disabled = true; el.classList.add('btn-loading'); }
     else { el.textContent = el.dataset._origText || el.textContent; el.disabled = false; el.classList.remove('btn-loading'); }
 }
-
+function closeHermesUpdateCard() {
+  const banner = document.getElementById('global-status-banner');
+  if (banner) {
+    // Hide the banner
+    banner.style.display = 'none';
+    
+    // Optional: Save the state in localStorage so it stays hidden on refresh
+    // localStorage.setItem('hermes_banner_hidden', 'true');
+  }
+}
 // ── SERVICE ────────────────────────────────────────────────
 async function serviceAction(action) {
     const actionLabels = { start: '\u25b6 Start', stop: '\u25a0 Stop', restart: '\u21bb Restart', doctor: 'Run Diagnostics' };
@@ -770,14 +841,170 @@ async function reloadConfig() {
     catch (e) { toast('Reload failed: ' + e.message, 'error'); }
 }
 
+async function loadRuntimeProfiles() {
+    return api('GET', '/api/runtime/profiles');
+}
+
+async function loadRuntimeProfileApiToken(profileName) {
+    return api('GET', '/api/runtime/profiles/' + encodeURIComponent(profileName) + '/api-token');
+}
+
+const runtimeProfileSettingsState = {
+    profileData: null,
+    tokenMeta: null,
+};
+
+function renderRuntimeProfileCard(profileData, status) {
+    const selected = profileData?.selected || 'default';
+    const profiles = Array.isArray(profileData?.profiles) ? profileData.profiles : [];
+    const options = profiles.map(profile => ({
+        value: profile.name,
+        label: profile.name + (profile.is_root_active ? ' - backend active' : ''),
+    }));
+    const currentApiUrl = status?.api_url || profileData?.paths?.env || '(unknown)';
+    return '' +
+        '<div class="card mb-16"><div class="card-header"><span>Hermes Profile</span></div><div class="card-body">' +
+            '<p class="text-sm text-secondary mb-16">Choose which Hermes profile this portal should read for config, env vars, CLI chats, and gateway actions. This does not modify the backend\'s own active profile file.</p>' +
+            '<div style="display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:16px;align-items:start;margin-bottom:16px">' +
+                '<div style="display:flex;flex-direction:column;gap:12px">' +
+                    '<div class="form-group"><label class="form-label">Profile</label>' + selectH('runtime-profile-select', options, selected) + '</div>' +
+                    '<div class="form-group"><label class="form-label">API Server</label><div class="font-mono text-sm">' + escH(currentApiUrl) + '</div></div>' +
+                    '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
+                        '<button class="btn btn-primary" onclick="saveRuntimeProfile(this)">Use Profile</button>' +
+                        '<button class="btn" onclick="Screens.settings()">Refresh</button>' +
+                    '</div>' +
+                '</div>' +
+                '<div style="display:flex;flex-direction:column;gap:12px">' +
+                    '<div class="form-group"><label class="form-label">Hermes Home</label><div id="runtime-profile-home" class="font-mono text-sm">' + escH(profileData?.paths?.home || '') + '</div></div>' +
+                    '<div class="card" style="border-style:dashed"><div class="card-body">' +
+                        '<div style="display:grid;grid-template-columns:minmax(0, 1fr);gap:12px">' +
+                            '<div class="form-group" style="flex:2 1 320px"><label class="form-label">API Server Token</label>' + inputH('runtime-profile-api-token', '', 'password', 'Set or replace the token for this gateway port') + '<div id="runtime-profile-api-token-status" class="form-hint" style="margin-top:8px"></div></div>' +
+                            '<div class="form-group" style="flex:1 1 220px"><label class="form-label">Stored In</label><div id="runtime-profile-api-token-path" class="font-mono text-sm text-muted">Loading...</div></div>' +
+                        '</div>' +
+                        '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
+                            '<button class="btn btn-primary" onclick="saveRuntimeProfileApiToken(this)">Save API Token</button>' +
+                            '<button class="btn" onclick="clearRuntimeProfileApiToken(this)">Clear Token</button>' +
+                        '</div>' +
+                    '</div></div>' +
+                '</div>' +
+            '</div>' +
+        '</div></div>';
+}
+
+function runtimeProfileSelectionMeta(profileName) {
+    const profiles = Array.isArray(runtimeProfileSettingsState.profileData?.profiles) ? runtimeProfileSettingsState.profileData.profiles : [];
+    return profiles.find(profile => profile.name === profileName) || null;
+}
+
+async function refreshRuntimeProfileTokenCard(profileName) {
+    const normalized = profileName || document.getElementById('runtime-profile-select')?.value || 'default';
+    const homeEl = document.getElementById('runtime-profile-home');
+    const pathEl = document.getElementById('runtime-profile-api-token-path');
+    const statusEl = document.getElementById('runtime-profile-api-token-status');
+    const input = document.getElementById('runtime-profile-api-token');
+    const profileMeta = runtimeProfileSelectionMeta(normalized);
+    if (homeEl && profileMeta?.home) homeEl.textContent = profileMeta.home;
+    if (pathEl) pathEl.textContent = 'Loading...';
+    if (statusEl) statusEl.textContent = 'Loading token status...';
+    if (input) input.value = '';
+    try {
+        const tokenMeta = await loadRuntimeProfileApiToken(normalized);
+        runtimeProfileSettingsState.tokenMeta = tokenMeta;
+        if (pathEl) pathEl.textContent = tokenMeta.env_path || '(unknown)';
+        if (statusEl) {
+            statusEl.textContent = tokenMeta.has_token
+                ? ('Gateway port ' + (tokenMeta.api_port || '?') + ' saved as ' + (tokenMeta.token_key || 'HERMES_API_TOKEN') + ': ' + (tokenMeta.masked_token || 'hidden'))
+                : ('No API token saved for gateway port ' + (tokenMeta.api_port || '?') + '.');
+        }
+    } catch (e) {
+        runtimeProfileSettingsState.tokenMeta = null;
+        if (pathEl) pathEl.textContent = '(unavailable)';
+        if (statusEl) statusEl.textContent = 'Token status unavailable: ' + e.message;
+    }
+}
+
+window.saveRuntimeProfileApiToken = async function (btn) {
+    const select = document.getElementById('runtime-profile-select');
+    const input = document.getElementById('runtime-profile-api-token');
+    if (!select || !input) return;
+    const profileName = select.value || 'default';
+    const token = input.value || '';
+    if (!token.trim()) {
+        toast('Enter a token first, or use Clear Token.', 'warning');
+        return;
+    }
+    try {
+        setBtnLoading(btn, true);
+        await api('PUT', '/api/runtime/profiles/' + encodeURIComponent(profileName) + '/api-token', { token: token.trim() });
+        input.value = '';
+        toast('API token saved for profile ' + profileName, 'success');
+        await refreshRuntimeProfileTokenCard(profileName);
+    } catch (e) {
+        toast('API token save failed: ' + e.message, 'error');
+    } finally {
+        setBtnLoading(btn, false);
+    }
+};
+
+window.clearRuntimeProfileApiToken = async function (btn) {
+    const select = document.getElementById('runtime-profile-select');
+    const input = document.getElementById('runtime-profile-api-token');
+    if (!select) return;
+    const profileName = select.value || 'default';
+    try {
+        setBtnLoading(btn, true);
+        await api('PUT', '/api/runtime/profiles/' + encodeURIComponent(profileName) + '/api-token', { token: '' });
+        if (input) input.value = '';
+        toast('API token cleared for profile ' + profileName, 'success');
+        await refreshRuntimeProfileTokenCard(profileName);
+    } catch (e) {
+        toast('API token clear failed: ' + e.message, 'error');
+    } finally {
+        setBtnLoading(btn, false);
+    }
+};
+
+window.saveRuntimeProfile = async function (btn) {
+    const select = document.getElementById('runtime-profile-select');
+    if (!select) return;
+    try {
+        setBtnLoading(btn, true);
+        const selectedProfile = select.value || 'default';
+        const shouldSwitchCurrentChat = !!chatState.currentSessionId && chatVisibleProfile() !== selectedProfile;
+        await api('PUT', '/api/runtime/profiles', { profile: selectedProfile });
+        chatState.activeProfile = selectedProfile;
+        if (shouldSwitchCurrentChat) {
+            const resp = await api('PUT', '/api/chat/sessions/' + chatState.currentSessionId + '/profile', { profile: selectedProfile });
+            chatApplySessionMetadata(resp.session || null);
+        } else if (!chatState.currentSessionId) {
+            chatState.currentSessionProfile = selectedProfile;
+            if (currentScreenId() === 'chat') chatRenderSessionBanner();
+        }
+        updateChatHistoryActiveProfileBadge();
+        _healthCache = null;
+        checkHealth();
+        window.modelRolesCache = null;
+        window.providerEnvCache = null;
+        toast('Hermes profile updated', 'success');
+        await Screens.settings();
+    } catch (e) {
+        toast('Profile update failed: ' + e.message, 'error');
+    } finally {
+        setBtnLoading(btn, false);
+    }
+};
+
 // ── SETTINGS ───────────────────────────────────────────────
 Screens.settings = async function () {
     const content = document.getElementById('content');
     try {
-        const [cfg, status] = await Promise.all([
+        const [cfg, status, profileData] = await Promise.all([
             api('GET', '/api/config'),
             api('GET', '/api/chat/status').catch(() => ({})),
+            loadRuntimeProfiles(),
         ]);
+        runtimeProfileSettingsState.profileData = profileData;
+        runtimeProfileSettingsState.tokenMeta = null;
         const personalities = Object.keys(cfg.personalities || {});
         const runtime = status.runtime || {};
         const tabs = [
@@ -793,7 +1020,7 @@ Screens.settings = async function () {
             { id: 'misc', label: 'Misc', sections: ['human_delay', 'approvals', 'code_execution', 'skills', 'streaming', 'delegation'] }
         ];
 
-            let tabsHtml = '<div class="tabs">' + tabs.map((t, i) => '<button class="tab' + (i === 0 ? ' active' : '') + '" data-tab="' + t.id + '">' + t.label + '</button>').join('') + '</div>';
+            let tabsHtml = renderRuntimeProfileCard(profileData, status) + '<div class="tabs">' + tabs.map((t, i) => '<button class="tab' + (i === 0 ? ' active' : '') + '" data-tab="' + t.id + '">' + t.label + '</button>').join('') + '</div>';
         let panelsHtml = tabs.map((t, i) => {
             let formHtml = '';
             t.sections.forEach(sec => {
@@ -839,6 +1066,11 @@ Screens.settings = async function () {
                 content.querySelector('[data-tab="' + tab.dataset.tab + '"].tab-pane')?.classList.add('active');
             });
         });
+        const runtimeSelect = document.getElementById('runtime-profile-select');
+        if (runtimeSelect) {
+            runtimeSelect.addEventListener('change', () => refreshRuntimeProfileTokenCard(runtimeSelect.value || 'default'));
+            await refreshRuntimeProfileTokenCard(runtimeSelect.value || 'default');
+        }
     } catch (e) {
         content.innerHTML = '<div class="empty-state"><div class="empty-icon">\u26a0\ufe0f</div><h3>Error</h3><p>' + escH(e.message) + '</p></div>';
     }
@@ -1123,6 +1355,7 @@ Screens.service = async function () {
             <div class="card-header"><span>Gateway Service</span><span class="badge ${health.gateway_running ? 'badge-success' : 'badge-danger'}">${health.gateway_running ? 'Running' : 'Stopped'}</span></div>
             <div class="card-body">
                 <div class="form-row" style="margin-bottom:16px">
+                    <div class="form-group"><label class="form-label">Active Profile</label><div>${activeProfileBadgeH(health.profile)}</div></div>
                     <div class="form-group"><label class="form-label">PID</label><div>${health.gateway_pid || 'N/A'}</div></div>
                     <div class="form-group"><label class="form-label">Version</label><div>${escH(health.version || '?')}</div></div>
                     <div class="form-group"><label class="form-label">Uptime</label><div>${escH(sys.uptime || '?')}</div></div>
@@ -1139,6 +1372,7 @@ Screens.service = async function () {
             <div class="card-header"><span>System Information</span></div>
             <div class="card-body">
                 <div class="form-row">
+                    <div class="form-group"><label class="form-label">Active Profile</label><div>${activeProfileBadgeH(health.profile)}</div></div>
                     <div class="form-group"><label class="form-label">Python</label><div class="font-mono text-sm">${escH(sys.python_version || '?')}</div></div>
                     <div class="form-group"><label class="form-label">OS</label><div class="text-sm">${escH(sys.os_info || '?')}</div></div>
                     <div class="form-group"><label class="form-label">Disk Free</label><div class="text-sm">${fmtBytes(sys.disk_free)}</div></div>
@@ -1284,16 +1518,23 @@ async function loadProviderDiscoveryEndpoints(profileName, modelId, force = fals
     return data;
 }
 
-function modelRoleCardH(role, info) {
+function modelRoleCardH(role, info, status = null) {
     const meta = MODEL_ROLE_META[role] || { title: role, description: '' };
     const enabled = role === 'primary' ? true : !!info?.enabled;
-    const statusBadge = role === 'primary'
+    let statusBadge = role === 'primary'
         ? '<span class="badge badge-success">Required</span>'
         : '<span class="badge ' + (enabled ? 'badge-info' : 'badge-secondary') + '">' + (enabled ? 'Enabled' : 'Disabled') + '</span>';
+    if (status && status.label) {
+        statusBadge = '<span class="badge ' + escH(status.tone || 'badge-secondary') + '">' + escH(status.label) + '</span>';
+    }
     const profileLabel = info?.profile || '(not linked)';
+    const providerType = String(info?.provider || '').trim().toLowerCase();
     const providerLabel = info?.provider_label || info?.provider || '(not set)';
     const modelLabel = info?.model || '(not set)';
-    const routeLabel = info?.routing_provider || 'Auto';
+    const routeTitle = providerType === 'openrouter' ? 'OpenRouter Endpoint' : 'Routing';
+    const routeLabel = providerType === 'openrouter'
+        ? (info?.routing_provider || 'Auto')
+        : 'Direct';
     return '' +
         '<div class="card model-role-card">' +
             '<div class="card-header"><span>' + escH(meta.title) + '</span>' + statusBadge + '</div>' +
@@ -1303,7 +1544,7 @@ function modelRoleCardH(role, info) {
                     '<div class="model-role-meta-item"><label class="form-label">Provider Profile</label><div class="font-mono text-sm">' + escH(profileLabel) + '</div></div>' +
                     '<div class="model-role-meta-item"><label class="form-label">Provider Type</label><div class="text-sm">' + escH(providerLabel) + '</div></div>' +
                     '<div class="model-role-meta-item"><label class="form-label">Model</label><div class="font-mono text-sm">' + escH(modelLabel) + '</div></div>' +
-                    '<div class="model-role-meta-item"><label class="form-label">OpenRouter Endpoint</label><div class="font-mono text-sm">' + escH(routeLabel) + '</div></div>' +
+                    '<div class="model-role-meta-item"><label class="form-label">' + escH(routeTitle) + '</label><div class="font-mono text-sm">' + escH(routeLabel) + '</div></div>' +
                 '</div>' +
                 '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:16px">' +
                     '<button class="btn btn-primary" onclick="editModelRole(\'' + escA(role) + '\')">Edit</button>' +
@@ -1315,10 +1556,11 @@ function modelRoleCardH(role, info) {
 Screens.providers = async function () {
     const content = document.getElementById('content');
     try {
-        const [data, chatStatus, roleData] = await Promise.all([
+        const [data, chatStatus, roleData, health] = await Promise.all([
             api('GET', '/api/providers'),
             api('GET', '/api/chat/status').catch(() => null),
             loadModelRoles(true),
+            api('GET', '/api/health').catch(() => ({ gateway_running: false, profile: 'unknown', hermes_home: '?' })),
         ]);
         const def = data.default || {};
         const custom = data.custom || [];
@@ -1332,7 +1574,13 @@ Screens.providers = async function () {
         const availableProfiles = roleData?.profiles || [];
         const implicitProfiles = availableProfiles.filter(profile => !(custom || []).some(saved => saved.name === profile.name));
 
-        let html = '<div class="card mb-16"><div class="card-body">';
+        let html = runtimeProfileContextCardH(
+            health,
+            primaryRole.base_url || chatStatus?.api_url || def.base_url || '',
+            'Providers Runtime Context',
+            'Provider Profiles and Model Roles are profile-sensitive. The active portal profile determines which Hermes home, env, gateway, and API server runtime you are inspecting here.'
+        );
+        html += '<div class="card mb-16"><div class="card-body">';
         html += '<p class="text-sm text-secondary mb-16">Provider Profiles store connection details like provider type, base URL, API key, and an optional suggested model. Model Roles decides which saved provider Hermes uses for Primary Chat, Fallback Chat, and Vision.</p>';
         html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
         html += '<button class="btn btn-primary" onclick="navigate(\'models\')">Open Model Roles</button>';
@@ -1838,14 +2086,32 @@ window.disableModelRole = async function (role) {
 Screens.models = async function () {
     const content = document.getElementById('content');
     try {
-        const data = await loadModelRoles(true);
+        const [data, chatStatus, health] = await Promise.all([
+            loadModelRoles(true),
+            api('GET', '/api/chat/status').catch(() => null),
+            api('GET', '/api/health').catch(() => ({ gateway_running: false, profile: 'unknown', hermes_home: '?' })),
+        ]);
         const roles = data.roles || {};
         const profiles = data.profiles || [];
-        let html = '<div class="card mb-16"><div class="card-body">';
+        const primaryRole = roles.primary || {};
+        const readiness = chatStatus?.readiness || {};
+        const screenshotReady = !!readiness.screenshots_ready;
+        let html = runtimeProfileContextCardH(
+            health,
+            chatStatus?.api_url || primaryRole.base_url || '',
+            'Models Runtime Context',
+            'Model Roles resolve within the active portal profile. This profile determines the Hermes home, gateway runtime, and API server context behind the roles shown below.'
+        );
+        html += '<div class="card mb-16"><div class="card-body">';
         html += '<p class="text-sm text-secondary">Model Roles decide which saved provider profile and model Hermes uses for primary chat, fallback chat, and vision. Provider Profiles live in the Providers screen; this screen is where you assign them.</p>';
         html += '</div></div>';
         html += '<div class="model-role-grid">';
-        ['primary', 'fallback', 'vision'].forEach(role => { html += modelRoleCardH(role, roles[role] || {}); });
+        ['primary', 'fallback', 'vision'].forEach(role => {
+            const status = role === 'vision'
+                ? { label: screenshotReady ? 'Ready' : 'Not Ready', tone: screenshotReady ? 'badge-success' : 'badge-danger' }
+                : null;
+            html += modelRoleCardH(role, roles[role] || {}, status);
+        });
         html += '</div>';
 
         html += '<div class="card mt-16"><div class="card-header"><span>Saved Provider Profiles</span><button class="btn btn-primary" onclick="navigate(\'providers\')">Open Providers</button></div>';
@@ -4422,7 +4688,16 @@ window.copyLogs = function () {
 
 const chatState = {
     currentSessionId: null,
+    activeProfile: '',
+    currentSessionProfile: '',
+    draftProfile: '',
+    availableProfiles: [],
+    currentSegments: [],
+    currentActiveSegmentId: '',
+    currentActiveSegmentIndex: 1,
+    historyProfileFilter: 'all',
     currentRequestId: null,
+    requestProgressErrorCount: 0,
     currentRequestCancelSupported: false,
     isThinking: false,
     pendingFiles: [],
@@ -4457,7 +4732,7 @@ const chatState = {
         reasons: [],
     },
     runtimeStatus: null,
-    transportPreference: 'auto',
+    transportPreference: localStorage.getItem('hermes-transport-preference') || 'auto',
     currentTransport: null,
     currentContinuity: null,
     currentTransportNotice: '',
@@ -4472,6 +4747,11 @@ const chatState = {
     currentFolderSourceDocs: [],
     lastSubmission: null,
     cancelRequested: false,
+    lastRequestErrorNotice: '',
+    requestProgressPoll: null,
+    persistDebugTrace: false,
+    lastProgressLines: [],
+    lastProgressTransport: '',
 };
 
 function makeRequestId() {
@@ -4577,6 +4857,10 @@ function chatReplacePendingFiles(files) {
 }
 
 function chatResetComposerAfterRequest() {
+    if (chatState.requestProgressPoll) {
+        clearInterval(chatState.requestProgressPoll);
+        chatState.requestProgressPoll = null;
+    }
     chatState.isThinking = false;
     chatState.currentRequestId = null;
     chatState.chatAbortController = null;
@@ -4594,8 +4878,188 @@ function chatResetComposerAfterRequest() {
     chatSyncSendButton();
 }
 
+function chatBindMessagesScroll(container) {
+    if (!container || container.dataset.scrollBound === 'true') return;
+    container.dataset.scrollBound = 'true';
+    container.dataset.autoScroll = 'true';
+    container.addEventListener('scroll', () => {
+        const isNearBottom = (container.scrollHeight - container.clientHeight - container.scrollTop) < 8;
+        container.dataset.autoScroll = isNearBottom ? 'true' : 'false';
+    });
+}
+
+function chatShouldAutoScroll(container) {
+    if (!container) return false;
+    chatBindMessagesScroll(container);
+    return container.dataset.autoScroll !== 'false';
+}
+
+function chatBindProgressLog(panel) {
+    if (!panel || panel.dataset.scrollBound === 'true') return;
+    panel.dataset.scrollBound = 'true';
+    panel.dataset.autoScroll = 'true';
+    panel.addEventListener('scroll', () => {
+        const isNearBottom = (panel.scrollHeight - panel.clientHeight - panel.scrollTop) < 8;
+        panel.dataset.autoScroll = isNearBottom ? 'true' : 'false';
+    });
+}
+
+function chatRenderLogPanel(panel, lines = [], transport = '') {
+    if (!panel) return;
+    chatBindProgressLog(panel);
+    const shouldAutoScroll = panel.dataset.autoScroll !== 'false';
+    const rows = Array.isArray(lines) ? lines.filter(Boolean) : [];
+    if (!rows.length) {
+        panel.innerHTML = '<div class="chat-progress-empty">' + escH(
+            transport === 'cli'
+                ? 'Waiting for Hermes CLI activity...'
+                : 'Live tool activity is only available for Hermes CLI transport.'
+        ) + '</div>';
+        return;
+    }
+    panel.innerHTML = rows.map(line => '<div class="chat-progress-line">' + escH(line) + '</div>').join('');
+    if (shouldAutoScroll) {
+        panel.scrollTop = panel.scrollHeight;
+    }
+}
+
+function chatSetDebugTraceStatus(label) {
+    chatState.lastProgressStatus = label || 'Idle';
+}
+
+function chatRenderProgressLines(lines = [], transport = '') {
+    const panel = document.getElementById('chat-progress-log');
+    chatState.lastProgressLines = Array.isArray(lines) ? lines.filter(Boolean) : [];
+    chatState.lastProgressTransport = transport || '';
+    chatRenderLogPanel(panel, lines, transport);
+    chatSetDebugTraceStatus(chatState.isThinking ? 'Running' : 'Updated');
+}
+
+function chatRenderProgressError(message) {
+    const panel = document.getElementById('chat-progress-log');
+    if (panel) {
+        chatBindProgressLog(panel);
+        panel.innerHTML = '<div class="chat-progress-error">' + escH(message || 'Live progress is temporarily unavailable.') + '</div>';
+    }
+    chatState.lastProgressLines = [message || 'Live progress is temporarily unavailable.'];
+    chatState.lastProgressTransport = 'cli';
+    chatSetDebugTraceStatus('Error');
+}
+
+function chatRenderPersistentProgressBubble(statusLabel) {
+    if (!chatState.persistDebugTrace) return;
+    const container = document.getElementById('chat-messages');
+    if (!container) return;
+    const existing = document.getElementById('chat-persistent-progress');
+    if (existing) existing.remove();
+    const bubble = document.createElement('div');
+    bubble.id = 'chat-persistent-progress';
+    bubble.className = 'chat-thinking chat-persistent-progress';
+    bubble.innerHTML = '<div class="chat-thinking-bubble"><div class="chat-thinking-header"><span class="chat-thinking-icon"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></span><span class="chat-thinking-text">Debug trace (' + escH(statusLabel || chatState.lastProgressStatus || 'Completed') + ')</span></div><div class="chat-progress-log" id="chat-persistent-progress-log"></div></div>';
+    container.appendChild(bubble);
+    chatRenderLogPanel(document.getElementById('chat-persistent-progress-log'), chatState.lastProgressLines || [], chatState.lastProgressTransport || '');
+}
+
+async function chatFetchRequestProgress(requestId) {
+    if (!requestId || chatState.currentRequestId !== requestId) return;
+    try {
+        const resp = await authFetch('/api/chat/status?request_id=' + encodeURIComponent(requestId) + '&_ts=' + Date.now(), {
+            method: 'GET',
+            cache: 'no-store',
+            headers: {
+                'Cache-Control': 'no-store, no-cache, max-age=0',
+                'Pragma': 'no-cache',
+            },
+        });
+        if (!resp.ok) {
+            // Progress endpoint can briefly return 404 before backend registers request.
+            // Tolerate a few misses, then reset to avoid infinite stuck polling.
+            chatState.requestProgressErrorCount = (chatState.requestProgressErrorCount || 0) + 1;
+            if (chatState.requestProgressErrorCount <= 6) {
+                return;
+            }
+            chatResetComposerAfterRequest();
+            return;
+        }
+        chatState.requestProgressErrorCount = 0;
+        const progress = await resp.json();
+        if (chatState.currentRequestId !== requestId) return;
+        chatRenderProgressLines(progress.progress_lines || [], progress.transport || '');
+        if (progress.status && progress.status !== 'running' && progress.status !== 'cancel_requested') {
+            if (chatState.requestProgressPoll) {
+                clearInterval(chatState.requestProgressPoll);
+                chatState.requestProgressPoll = null;
+            }
+        }
+    } catch (e) {
+        if (chatState.currentRequestId === requestId) {
+            chatRenderProgressError('Live CLI activity could not be loaded: ' + (e.message || 'request failed'));
+        }
+        if (chatState.requestProgressPoll) {
+            clearInterval(chatState.requestProgressPoll);
+            chatState.requestProgressPoll = null;
+        }
+    }
+}
+
+function chatStartRequestProgress(requestId, expectedTransport) {
+    if (chatState.requestProgressPoll) {
+        clearInterval(chatState.requestProgressPoll);
+        chatState.requestProgressPoll = null;
+    }
+    chatState.requestProgressErrorCount = 0;
+    chatState.lastProgressLines = [];
+    chatState.lastProgressTransport = expectedTransport || '';
+    chatSetDebugTraceStatus('Running');
+    const persisted = document.getElementById('chat-persistent-progress');
+    if (persisted) persisted.remove();
+    chatRenderProgressLines([], expectedTransport || '');
+    chatFetchRequestProgress(requestId);
+    chatState.requestProgressPoll = window.setInterval(() => {
+        chatFetchRequestProgress(requestId);
+    }, 900);
+}
+
+function chatFormatNoticeTimestamp(date = new Date()) {
+    try {
+        return date.toLocaleTimeString();
+    } catch (e) {
+        return date.toISOString();
+    }
+}
+
+function chatSetRequestErrorNotice(message) {
+    chatState.lastRequestErrorNotice = String(message || '').trim();
+    chatRenderSessionBanner();
+}
+
+function chatClearRequestErrorNotice() {
+    if (!chatState.lastRequestErrorNotice) return;
+    chatState.lastRequestErrorNotice = '';
+    chatRenderSessionBanner();
+}
+
 function chatApplySessionMetadata(meta = null) {
+    chatState.lastRequestErrorNotice = '';
     const session = meta || {};
+    const sessionSegments = Array.isArray(session.segments) ? session.segments.slice() : [];
+    const activeSegmentId = session.active_segment_id || '';
+    const activeSegment = sessionSegments.find(segment => segment.id === activeSegmentId)
+        || sessionSegments[sessionSegments.length - 1]
+        || null;
+    const resolvedSessionProfile = activeSegment?.profile || session.profile || '';
+    if (resolvedSessionProfile) {
+        chatState.currentSessionProfile = resolvedSessionProfile;
+        chatState.draftProfile = '';
+    } else if (chatState.currentSessionId) {
+        chatState.currentSessionProfile = chatState.activeProfile || '';
+        chatState.draftProfile = '';
+    } else {
+        chatState.currentSessionProfile = '';
+    }
+    chatState.currentSegments = sessionSegments;
+    chatState.currentActiveSegmentId = activeSegmentId;
+    chatState.currentActiveSegmentIndex = Number(session.active_segment_index || 1) || 1;
     chatState.transportPreference = session.transport_preference || chatState.transportPreference || 'auto';
     chatState.currentTransport = session.transport_mode || null;
     chatState.currentContinuity = session.continuity_mode || null;
@@ -4621,7 +5085,177 @@ function chatApplySessionMetadata(meta = null) {
     chatRenderTransportControls();
 }
 
+function chatVisibleProfile() {
+    return chatState.currentSessionProfile || chatState.draftProfile || chatState.activeProfile || 'default';
+}
+
+function chatCurrentSegment() {
+    return (chatState.currentSegments || []).find(segment => segment.id === chatState.currentActiveSegmentId)
+        || chatState.currentSegments[chatState.currentSegments.length - 1]
+        || null;
+}
+
+async function chatLoadAvailableProfiles() {
+    try {
+        const data = await loadRuntimeProfiles();
+        chatState.availableProfiles = Array.isArray(data?.profiles) ? data.profiles.slice() : [];
+    } catch (e) {
+        chatState.availableProfiles = [];
+    }
+    chatRenderTransportControls();
+}
+
+function chatTransportLabel(value) {
+    if (value === 'cli') return 'CLI';
+    if (value === 'api') return 'API';
+    return 'Auto';
+}
+
+function chatSegmentToneClass(profile) {
+    const normalized = String(profile || '').trim().toLowerCase();
+    if (!normalized || normalized === 'default') return 'chat-segment-tone-blue';
+    if (normalized === 'leire') return 'chat-segment-tone-green';
+    return 'chat-segment-tone-green';
+}
+
+function chatMessageToneClass(profile) {
+    const normalized = String(profile || '').trim().toLowerCase();
+    if (!normalized || normalized === 'default') return 'chat-msg-tone-blue';
+    if (normalized === 'leire') return 'chat-msg-tone-green';
+    return 'chat-msg-tone-green';
+}
+
+function chatProfileTextToneClass(profiles) {
+    const names = Array.isArray(profiles) ? profiles.map(value => String(value || '').trim().toLowerCase()).filter(Boolean) : [];
+    if (!names.length) return 'sidebar-chat-profile-badge-blue';
+    if (names.length === 1 && names[0] === 'default') return 'sidebar-chat-profile-badge-blue';
+    return 'sidebar-chat-profile-badge-green';
+}
+
+function chatBuildSegmentNode(message, segment) {
+    const div = document.createElement('div');
+    const profile = message?.profile || segment?.profile || chatVisibleProfile();
+    const transport = message?.transport || segment?.transport || '';
+    const continuityReady = transport === 'cli' && !!segment?.hermes_session_id;
+    div.className = 'chat-segment-marker ' + chatSegmentToneClass(profile);
+    const chips = [
+        '<span class="badge badge-info">Profile: ' + escH(profile || 'default') + '</span>',
+    ];
+    if (transport) {
+        chips.push('<span class="badge">Transport: ' + escH(chatTransportLabel(transport)) + '</span>');
+    }
+    if (continuityReady) {
+        chips.push('<span class="badge badge-success">CLI continuity ready</span>');
+    }
+    div.innerHTML = '<div class="chat-segment-marker-line"></div><div class="chat-segment-marker-body"><div class="chat-segment-marker-title">Profile changed</div><div class="chat-segment-marker-badges">' + chips.join('') + '</div>' + (transport === 'cli' ? '<div class="chat-segment-marker-detail">' + escH(continuityReady ? 'This profile can resume its own Hermes CLI session when you return to it.' : 'This profile is starting a fresh Hermes CLI continuity path.') + '</div>' : '') + '</div><div class="chat-segment-marker-line"></div>';
+    return div;
+}
+
+function updateChatHistoryActiveProfileBadge() {
+    const badge = document.getElementById('chat-history-active-profile');
+    if (!badge) return;
+    badge.textContent = 'Portal: ' + (chatState.activeProfile || 'default');
+}
+
+function chatSessionProfile(session) {
+    return String((session?.session || {}).profile || session?.profile || '').trim();
+}
+
+function chatSessionProfiles(session) {
+    const names = [];
+    const addName = (value) => {
+        const name = String(value || '').trim();
+        if (name && !names.includes(name)) names.push(name);
+    };
+    const segments = Array.isArray((session?.session || {}).segments) ? (session.session.segments || []) : [];
+    segments.forEach(segment => addName(segment?.profile));
+    addName(chatSessionProfile(session));
+    return names;
+}
+
+function chatSessionProfilesLabel(session) {
+    const profiles = chatSessionProfiles(session);
+    if (!profiles.length) return '';
+    if (profiles.length === 1) return 'Profile: ' + profiles[0];
+    return 'Profiles: ' + profiles.join(', ');
+}
+
+function chatProfileNameToneClass(profile) {
+    const normalized = String(profile || '').trim().toLowerCase();
+    if (!normalized || normalized === 'default') return 'sidebar-chat-profile-name-blue';
+    if (normalized === 'leire') return 'sidebar-chat-profile-name-green';
+    return 'sidebar-chat-profile-name-green';
+}
+
+function chatSessionProfilesBadgeHtml(session) {
+    const profiles = chatSessionProfiles(session);
+    if (!profiles.length) return '';
+    const prefix = profiles.length === 1 ? 'Profile:' : 'Profiles:';
+    const namesHtml = profiles.map((profile, index) => {
+        const separator = index ? '<span class="sidebar-chat-profile-separator">, </span>' : '';
+        return separator + '<span class="sidebar-chat-profile-name ' + chatProfileNameToneClass(profile) + '">' + escH(profile) + '</span>';
+    }).join('');
+    const label = profiles.length === 1 ? 'Profile: ' + profiles[0] : 'Profiles: ' + profiles.join(', ');
+    return '<span class="sidebar-chat-profile-badge" title="' + escA(label) + '"><span class="sidebar-chat-profile-prefix">' + escH(prefix) + '</span> ' + namesHtml + '</span>';
+}
+
+function chatFilteredProfileOptions(sessions = []) {
+    const names = new Set();
+    (chatState.availableProfiles || []).forEach(profile => {
+        const name = String(profile?.name || '').trim();
+        if (name) names.add(name);
+    });
+    sessions.forEach(session => {
+        chatSessionProfiles(session).forEach(name => names.add(name));
+    });
+    if (chatState.activeProfile) names.add(chatState.activeProfile);
+    return ['all', ...Array.from(names).sort()];
+}
+
+function chatSessionMatchesProfileFilter(session) {
+    const filter = String(chatState.historyProfileFilter || 'all');
+    if (!filter || filter === 'all') return true;
+    return chatSessionProfiles(session).includes(filter);
+}
+
+function chatRenderHistoryProfileFilter(sessions = []) {
+    const mounts = [
+        document.getElementById('chat-history-filter-slot'),
+        document.getElementById('sidebar-history-profile-filter-slot'),
+    ].filter(Boolean);
+    if (!mounts.length) return;
+    const options = chatFilteredProfileOptions(sessions);
+    if (!options.length || options.length === 1) {
+        mounts.forEach(mount => { mount.innerHTML = ''; });
+        return;
+    }
+    if (!options.includes(chatState.historyProfileFilter)) {
+        chatState.historyProfileFilter = 'all';
+    }
+    const html =
+        '<label class="chat-history-filter-label" for="chat-history-profile-filter">Filter</label>' +
+        '<select id="chat-history-profile-filter" class="chat-history-filter-select" onchange="chatSetHistoryProfileFilter(this.value)">' +
+        options.map(value => '<option value="' + escA(value) + '"' + (value === chatState.historyProfileFilter ? ' selected' : '') + '>' + escH(value === 'all' ? 'All profiles' : value) + '</option>').join('') +
+        '</select>';
+    mounts.forEach((mount, index) => {
+        mount.innerHTML = html.replace(/chat-history-profile-filter/g, index === 0 ? 'chat-history-profile-filter' : 'sidebar-history-profile-filter');
+    });
+}
+
+window.chatSetHistoryProfileFilter = function (value) {
+    chatState.historyProfileFilter = value || 'all';
+    chatLoadHistory();
+};
+
 function chatGoHome() {
+    if (chatState.requestProgressPoll) {
+        clearInterval(chatState.requestProgressPoll);
+        chatState.requestProgressPoll = null;
+    }
+    chatState.isThinking = false;
+    chatState.currentRequestId = null;
+    chatState.currentRequestCancelSupported = false;
+    chatState.cancelRequested = false;
     chatState.currentSessionId = null;
     chatState.localMessages = [];
     chatState.lastSubmission = null;
@@ -4822,20 +5456,84 @@ function chatRenderTransportControls() {
     if (chatState.currentSessionId && chatState.currentTransport && current !== chatState.currentTransport) {
         note += ' Next turn preference: ' + chatTransportPreferenceLabel(current) + '.';
     }
+    const availableProfiles = Array.isArray(chatState.availableProfiles) ? chatState.availableProfiles : [];
+    const activeSegment = chatCurrentSegment();
+    const profileOptions = availableProfiles.map(profile => {
+        const name = profile?.name || 'default';
+        return '<option value="' + escA(name) + '"' + (name === chatVisibleProfile() ? ' selected' : '') + '>' + escH(name) + '</option>';
+    }).join('');
+    const switchSummary = chatState.currentSessionId
+        ? 'Changing the profile applies immediately to the next messages in this chat.'
+        : 'Choose the profile you want to use before the next new chat turn.';
     mount.innerHTML =
-        '<div class="chat-transport-wrap">' +
-            '<div class="chat-transport-label">Transport</div>' +
-            '<div class="chat-transport-buttons">' + buttons + '</div>' +
+        '<div class="chat-runtime-controls">' +
+            '<div class="chat-transport-wrap">' +
+                '<div class="chat-transport-label">Transport</div>' +
+                '<div class="chat-transport-buttons">' + buttons + '</div>' +
+            '</div>' +
+            '<div class="chat-profile-wrap">' +
+                '<div class="chat-transport-label">Profile</div>' +
+                '<div class="chat-profile-controls">' +
+                    '<select id="chat-profile-select" class="chat-profile-select" onchange="chatHandleProfileDraftChange()">' + profileOptions + '</select>' +
+                '</div>' +
+            '</div>' +
         '</div>' +
-        '<div class="chat-transport-note">' + escH(note) + '</div>';
+        '<div class="chat-transport-note">' + escH(note) + '</div>' +
+        '<div class="chat-runtime-note">' +
+            (activeSegment ? '<span class="badge">Current profile: ' + escH(activeSegment.profile || chatVisibleProfile()) + '</span> ' : '') +
+            escH(switchSummary) +
+        '</div>';
+    chatHandleProfileDraftChange();
 }
+
+window.chatHandleProfileDraftChange = async function () {
+    const select = document.getElementById('chat-profile-select');
+    if (!select || !select.value) return;
+    if (select.value === chatVisibleProfile()) return;
+    await chatApplyRuntimeProfile(select.value);
+};
+
+window.chatApplyRuntimeProfile = async function (nextProfileFromSelect) {
+    const select = document.getElementById('chat-profile-select');
+    const nextProfile = nextProfileFromSelect || (select ? select.value : '');
+    if (!nextProfile) return;
+    if (nextProfile === chatVisibleProfile()) {
+        toast('This chat is already using that profile', 'info', 1500);
+        return;
+    }
+    try {
+        if (chatState.currentSessionId) {
+            const resp = await api('PUT', '/api/chat/sessions/' + chatState.currentSessionId + '/profile', { profile: nextProfile });
+            chatApplySessionMetadata(resp.session || null);
+            toast('Chat profile changed to ' + nextProfile, 'success', 1500);
+        } else {
+            chatState.draftProfile = nextProfile;
+            chatState.currentSessionProfile = '';
+            chatState.currentSegments = [{ id: 'segment-1', index: 1, profile: nextProfile, transport: '', start_message_index: 0 }];
+            chatState.currentActiveSegmentId = 'segment-1';
+            chatState.currentActiveSegmentIndex = 1;
+            chatRenderSessionBanner();
+            toast('Next chat will use profile ' + nextProfile, 'success', 1500);
+        }
+        chatRenderTransportControls();
+    } catch (e) {
+        toast('Profile change failed: ' + e.message, 'error');
+        chatRenderTransportControls();
+    }
+};
 
 function chatRenderSessionBanner() {
     const banner = document.getElementById('chat-session-banner');
     if (!banner) return;
     const badges = [];
+    const profile = chatVisibleProfile();
     let text = chatState.currentTransportNotice || '';
     let cls = 'success';
+    if (chatState.lastRequestErrorNotice) {
+        badges.push('<span class="badge badge-warning">Send failed</span>');
+        text = text ? (chatState.lastRequestErrorNotice + ' ' + text) : chatState.lastRequestErrorNotice;
+        cls = 'warning';
+    }
     if (chatState.currentContinuity === 'hermes_resume') {
         badges.push('<span class="badge badge-success">Hermes session backed</span>');
         text = text || 'This chat stays attached to the Hermes CLI session.';
@@ -4848,11 +5546,18 @@ function chatRenderSessionBanner() {
         text = text || 'Hermes did not return a resumable session id for this chat yet, so follow-up continuity may be limited.';
         cls = 'warning';
     }
-    if (chatState.currentTransport === 'api') {
-        badges.push('<span class="badge badge-warning">API replay transport</span>');
-    } else if (chatState.currentTransport === 'cli') {
-        badges.push('<span class="badge badge-info">Hermes CLI transport</span>');
+    if (profile) {
+        badges.push('<span class="badge badge-accent">Profile: ' + escH(profile) + '</span>');
     }
+
+    const activeTransport = chatState.currentTransport || chatExpectedTransport();
+    badges.push('<span class="badge badge-info">Transport: ' + escH(chatTransportPreferenceLabel(activeTransport)) + '</span>');
+
+    const preferredTransport = chatExpectedTransport();
+    if (activeTransport && preferredTransport && activeTransport !== preferredTransport) {
+        badges.push('<span class="badge badge-warning">Next: ' + escH(chatTransportPreferenceLabel(preferredTransport)) + '</span>');
+    }
+
     if (chatState.lastTurnUsedSidecarVision) {
         badges.push('<span class="badge badge-info">Sidecar vision used</span>');
         if (!chatState.currentTransportNotice && chatState.lastTurnSidecarAssets.length) {
@@ -4914,7 +5619,11 @@ async function chatRefreshCapabilities() {
         const caps = data.capabilities || {};
         const reasons = data.capability_reasons || {};
         const policy = data.transport_policy || {};
+        const debug = data.debug || {};
         chatState.apiServerEnabled = !!data.api_server;
+        chatState.activeProfile = data.profile || chatState.activeProfile || '';
+        updateChatHistoryActiveProfileBadge();
+        chatState.persistDebugTrace = !!debug.persist_trace;
         chatState.apiTransportSelectable = !!policy.api_selectable;
         chatState.transportPolicy = {
             requiresCli: !!policy.requires_cli,
@@ -4934,6 +5643,7 @@ async function chatRefreshCapabilities() {
         };
     } catch (e) {
         chatState.apiServerEnabled = false;
+        chatState.persistDebugTrace = false;
         chatState.apiTransportSelectable = false;
         chatState.transportPolicy = {
             requiresCli: false,
@@ -4953,6 +5663,9 @@ async function chatRefreshCapabilities() {
         };
     }
     chatApplyComposerCapabilities();
+    if (!(chatState.availableProfiles || []).length) {
+        chatLoadAvailableProfiles();
+    }
 }
 
 // ── CLIPBOARD PASTE ─────────────────────────────────────
@@ -5009,13 +5722,14 @@ Screens.chat = function () {
         <!-- Chat History Sidebar -->
         <div class="chat-history ${chatState.historyOpen ? '' : 'collapsed'}" id="chat-history">
             <div class="chat-history-header">
-                <span>Chats</span>
+                <div class="chat-history-header-main">
+                    <span>Chats</span>
+                    <span class="badge badge-accent chat-history-active-profile" id="chat-history-active-profile">Portal: ${escH(chatState.activeProfile || 'default')}</span>
+                </div>
+                <div class="chat-history-header-filters" id="chat-history-filter-slot"></div>
                 <div class="chat-history-actions">
                     <button class="btn-icon" title="New Chat" onclick="chatNewSession()" style="width:28px;height:28px">
                         <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                    </button>
-                    <button class="btn-icon" title="Toggle sidebar" onclick="chatToggleHistory()" style="width:28px;height:28px">
-                        <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
                     </button>
                 </div>
             </div>
@@ -5131,13 +5845,20 @@ Screens.chat = function () {
     chatRenderTransportControls();
     chatApplyComposerCapabilities();
     chatRefreshCapabilities();
+    chatLoadAvailableProfiles();
 
     // Load sessions
     chatLoadHistory();
 
-    // Render current session or welcome
-    if (chatState.currentSessionId) {
+    // Render current session, in-flight draft, or welcome
+    const hasInFlightOrDraft = (Array.isArray(chatState.localMessages) && chatState.localMessages.length > 0)
+        || chatState.isThinking
+        || !!chatState.currentRequestId;
+    if (chatState.currentSessionId || hasInFlightOrDraft) {
         chatRenderMessages();
+        if (chatState.isThinking) {
+            chatRestoreThinkingBubble();
+        }
     } else if (chatState.selectedFolderId) {
         const folder = chatFindFolder(chatState.selectedFolderId);
         if (folder) chatRenderFolderOverview(folder);
@@ -5409,13 +6130,15 @@ async function renderSidebarFoldersTree() {
         ]);
         const folders = folderData.folders || [];
         const sessions = sessionData.sessions || [];
+        const visibleSessions = sessions.filter(chatSessionMatchesProfileFilter);
         chatState.folders = folders.slice();
         const collapsed = sidebarFolderNodeCollapseState();
-        const ungrouped = sessions.filter(session => !(session.session?.folder_id));
+        const ungrouped = visibleSessions.filter(session => !(session.session?.folder_id));
         tree.innerHTML =
             folders.map(folder => {
                 const hidden = !!collapsed[folder.id];
-                const chats = folder.sessions || [];
+                const chats = (folder.sessions || []).filter(chatSessionMatchesProfileFilter);
+                if (!chats.length) return '';
                 const duplicateMeta = chatFolderDuplicateMeta(folder, folders);
                 return '<div class="sidebar-folder-node">' +
                     '<div class="sidebar-folder-node-row" ondragover="chatFolderDragOver(event,\'' + escA(folder.id) + '\')" ondrop="chatDropSessionOnFolder(event,\'' + escA(folder.id) + '\')">' +
@@ -5424,7 +6147,7 @@ async function renderSidebarFoldersTree() {
                     '</button>' +
                     '<button class="sidebar-folder-node-target' + (((chatState.selectedFolderId || chatState.currentFolderId) === folder.id && !chatState.currentSessionId) ? ' active' : '') + '" onclick="sidebarOpenFolder(\'' + escA(folder.id) + '\')">' +
                     '<span class="sidebar-folder-name-wrap"><span class="sidebar-folder-name">' + escH(folder.title || 'Folder') + '</span>' + (duplicateMeta ? '<span class="sidebar-folder-duplicate-meta">' + escH(duplicateMeta) + '</span>' : '') + '</span>' +
-                    '<span class="sidebar-folder-count">' + escH(String(folder.chat_count || chats.length || 0)) + '</span>' +
+                    '<span class="sidebar-folder-count">' + escH(String(chats.length || 0)) + '</span>' +
                     '</button>' +
                     '<div class="sidebar-folder-actions">' +
                     '<button class="btn-icon" title="Add to folder" onclick="event.stopPropagation(); chatOpenFolderAddMenu(\'' + escA(folder.id) + '\')" style="width:20px;height:20px"><svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>' +
@@ -5451,10 +6174,12 @@ async function chatLoadHistory() {
         ]);
         const folders = folderData.folders || [];
         const sessions = sessionData.sessions || [];
+        const visibleSessions = sessions.filter(chatSessionMatchesProfileFilter);
         chatState.folders = folders.slice();
+        chatRenderHistoryProfileFilter(sessions);
         const list = document.getElementById('chat-history-list');
         if (!list) return;
-        const ungrouped = sessions.filter(s => !(s.session && s.session.folder_id));
+        const ungrouped = visibleSessions.filter(s => !(s.session && s.session.folder_id));
         if (folders.length === 0 && ungrouped.length === 0) {
             list.innerHTML = '<div class="chat-history-empty">No chats yet.<br>Click + to start one.</div>';
             chatRenderContextPanel();
@@ -5463,10 +6188,15 @@ async function chatLoadHistory() {
         const renderSessionItem = (s) => {
             const isActive = s.id === chatState.currentSessionId;
             const preview = s.last_message ? escH(s.last_message) : 'Empty';
+            const profiles = chatSessionProfiles(s);
+            const profileLabel = chatSessionProfilesLabel(s);
+            const profileBadge = profileLabel
+                ? ' <span class="badge ' + ((profiles.length === 1 && profiles[0] === (chatState.activeProfile || '')) ? 'badge-accent' : 'badge-warning') + '" title="Profiles used by this chat session">' + escH(profileLabel) + '</span>'
+                : '';
             return '<div class="chat-history-item' + (isActive ? ' active' : '') + '" data-sid="' + escA(s.id) + '" draggable="true" ondragstart="chatDragSession(event,\'' + escA(s.id) + '\')" onclick="chatLoadSession(\'' + escA(s.id) + '\')">' +
                 '<div class="chat-history-item-title">' + escH(s.title || 'Untitled') + '</div>' +
                 '<div class="chat-history-item-preview">' + preview + '</div>' +
-                '<div class="chat-history-item-meta">' + escH((s.message_count || 0) + ' msgs') + '</div>' +
+                '<div class="chat-history-item-meta">' + escH((s.message_count || 0) + ' msgs') + profileBadge + '</div>' +
                 '<div class="chat-history-item-actions">' +
                 '<button class="btn-icon" title="Rename" onclick="event.stopPropagation();chatRenameSessionPrompt(\'' + escA(s.id) + '\', \'' + escA(s.title || 'Untitled') + '\')" style="width:22px;height:22px"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg></button>' +
                 '<button class="btn-icon" title="Delete" onclick="event.stopPropagation();chatDeleteSession(\'' + escA(s.id) + '\')" style="width:22px;height:22px"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>' +
@@ -5477,7 +6207,8 @@ async function chatLoadHistory() {
             html += folders.map(folder => {
                 const collapsed = chatIsFolderCollapsed(folder.id);
                 const isSelected = folder.id === chatState.selectedFolderId;
-                const chats = folder.sessions || [];
+                const chats = (folder.sessions || []).filter(chatSessionMatchesProfileFilter);
+                if (!chats.length) return '';
                 const duplicateMeta = chatFolderDuplicateMeta(folder, folders);
                 return '<div class="chat-folder-tree">' +
                     '<div class="chat-folder-row' + (isSelected ? ' active' : '') + '" ondragover="chatFolderDragOver(event,\'' + escA(folder.id) + '\')" ondrop="chatDropSessionOnFolder(event,\'' + escA(folder.id) + '\')">' +
@@ -5486,7 +6217,7 @@ async function chatLoadHistory() {
                     '</button>' +
                     '<button class="chat-folder-main" onclick="chatShowFolderOverview(\'' + escA(folder.id) + '\')">' +
                     '<div class="chat-folder-name">' + escH(folder.title || 'Folder') + '</div>' +
-                    '<div class="chat-folder-meta">' + escH((folder.chat_count || chats.length || 0) + ' chats') + (folder.source_docs && folder.source_docs.length ? ' • ' + escH(folder.source_docs.length + ' sources') : '') + (duplicateMeta ? ' • ' + escH(duplicateMeta) : '') + '</div>' +
+                    '<div class="chat-folder-meta">' + escH((chats.length || 0) + ' chats') + (folder.source_docs && folder.source_docs.length ? ' • ' + escH(folder.source_docs.length + ' sources') : '') + (duplicateMeta ? ' • ' + escH(duplicateMeta) : '') + '</div>' +
                     '</button>' +
                     '<div class="chat-folder-actions">' +
                     '<button class="btn-icon" title="Add to folder" onclick="event.stopPropagation();chatOpenFolderAddMenu(\'' + escA(folder.id) + '\')" style="width:22px;height:22px"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>' +
@@ -5514,15 +6245,52 @@ async function chatLoadHistory() {
 window.chatLoadSession = async function (sid) {
     try {
         const data = await api('GET', '/api/chat/sessions/' + sid + '/messages');
+        if (chatState.requestProgressPoll) {
+            clearInterval(chatState.requestProgressPoll);
+            chatState.requestProgressPoll = null;
+        }
         chatState.currentSessionId = sid;
         chatState.localMessages = data.messages || [];
         chatApplySessionMetadata(data.session || null);
-        chatRenderMessages();
+        const activeRequestId = String(data?.session?.active_request_id || '').trim();
+        if (activeRequestId) {
+            chatState.currentRequestId = activeRequestId;
+            chatState.isThinking = true;
+            chatState.currentRequestCancelSupported = !!data?.session?.active_request_cancel_supported;
+            chatState.cancelRequested = String(data?.session?.active_request_status || '').toLowerCase() === 'cancel_requested';
+            chatRenderMessages();
+            chatRestoreThinkingBubble();
+            chatStartRequestProgress(
+                activeRequestId,
+                data?.session?.active_request_transport || data?.session?.transport_mode || ''
+            );
+        } else {
+            chatState.currentRequestId = null;
+            chatState.isThinking = false;
+            chatState.currentRequestCancelSupported = false;
+            chatState.cancelRequested = false;
+            chatRenderMessages();
+            chatSyncSendButton();
+        }
     } catch (e) {
         toast('Failed to load session', 'error');
     }
     chatLoadHistory();  // refresh active state
 };
+
+async function chatRestoreSessionAfterFailure(sessionId) {
+    if (!sessionId) return false;
+    try {
+        const data = await api('GET', '/api/chat/sessions/' + sessionId + '/messages');
+        chatState.currentSessionId = sessionId;
+        chatState.localMessages = data.messages || [];
+        chatApplySessionMetadata(data.session || null);
+        chatRenderMessages();
+        return true;
+    } catch {
+        return false;
+    }
+}
 
 window.chatDeleteSession = async function (sid) {
     const activeScreen = document.querySelector('.nav-item.active')?.dataset.screen || 'chat';
@@ -5788,6 +6556,7 @@ function chatRenderFolderOverview(folder) {
 function chatPrepareTranscriptForConversation() {
     const msgs = document.getElementById('chat-messages');
     if (!msgs) return null;
+    chatBindMessagesScroll(msgs);
     if (msgs.querySelector('#chat-welcome') || msgs.querySelector('.chat-folder-overview')) {
         msgs.innerHTML = '';
     }
@@ -5797,6 +6566,7 @@ function chatPrepareTranscriptForConversation() {
 function chatRenderMessages() {
     const msgs = document.getElementById('chat-messages');
     if (!msgs) return;
+    const shouldAutoScroll = chatShouldAutoScroll(msgs);
     msgs.innerHTML = '';
     const messages = chatState.localMessages;
     if (!messages || messages.length === 0) {
@@ -5808,10 +6578,22 @@ function chatRenderMessages() {
         chatShowWelcome();
         return;
     }
+    const segmentMap = new Map((chatState.currentSegments || []).map(segment => [segment.id, segment]));
+    let lastSegmentKey = '';
     messages.forEach(m => {
+        const segmentId = m.segment_id || '';
+        const segment = segmentMap.get(segmentId) || null;
+        const segmentIndex = Number(m.segment_index || segment?.index || 0) || 0;
+        const segmentKey = segmentId || (segmentIndex ? String(segmentIndex) : '');
+        if (segmentKey && segmentKey !== lastSegmentKey) {
+            msgs.appendChild(chatBuildSegmentNode(m, segment));
+            lastSegmentKey = segmentKey;
+        }
         msgs.appendChild(chatBuildMessageNode(m));
     });
-    msgs.scrollTop = msgs.scrollHeight;
+    if (shouldAutoScroll) {
+        msgs.scrollTop = msgs.scrollHeight;
+    }
     chatEnhanceCodeBlocks();
 }
 
@@ -5831,6 +6613,7 @@ function chatBuildMessageNode(message) {
     const content = message.content;
     const files = message.files || [];
     const time = message.timestamp ? new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+    const profile = message?.profile || '';
     const avatarSvg = role === 'user'
         ? '<svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>'
         : '<svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>';
@@ -5847,7 +6630,7 @@ function chatBuildMessageNode(message) {
         bubbleHtml = '<div class="chat-bubble"><div class="chat-bubble-content">' + chatRenderMd(content) + '</div><button class="chat-msg-copy" onclick="chatCopyMsg(this)" data-text="' + escapedPlain + '" title="Copy message"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>';
     }
     const div = document.createElement('div');
-    div.className = 'chat-msg ' + role;
+    div.className = 'chat-msg ' + role + ' ' + chatMessageToneClass(profile);
     div.innerHTML = '<div class="chat-msg-inner"><div class="chat-msg-avatar">' + avatarSvg + '</div><div class="chat-msg-body">' + chatMessageBadges(message) + bubbleHtml + filesHtml + (time ? '<div class="chat-msg-time">' + time + '</div>' : '') + '</div></div>';
     return div;
 }
@@ -5912,8 +6695,9 @@ function renderFolderSessionChip(session) {
 
 function renderSidebarFolderSessionItem(session, extraClass = 'sidebar-folder-chat') {
     const active = chatState.currentSessionId === session.id ? ' active' : '';
+    const profileHtml = chatSessionProfilesBadgeHtml(session);
     return '<div class="sidebar-folder-chat-row">' +
-        '<button class="' + extraClass + active + '" draggable="true" ondragstart="chatDragSession(event,\'' + escA(session.id) + '\')" onclick="sidebarOpenChat(\'' + escA(session.id) + '\')" title="' + escA(session.title || 'Untitled') + '">' + escH(session.title || 'Untitled') + '</button>' +
+        '<button class="' + extraClass + active + '" draggable="true" ondragstart="chatDragSession(event,\'' + escA(session.id) + '\')" onclick="sidebarOpenChat(\'' + escA(session.id) + '\')" title="' + escA(session.title || 'Untitled') + '"><span class="sidebar-chat-title">' + escH(session.title || 'Untitled') + '</span>' + profileHtml + '</button>' +
         '<button class="btn-icon sidebar-folder-chat-delete" title="Delete chat" onclick="event.stopPropagation(); chatDeleteSession(\'' + escA(session.id) + '\')" style="width:20px;height:20px"><svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>' +
         '</div>';
 }
@@ -5926,6 +6710,11 @@ window.chatNewSession = function (folderId = '') {
     chatState.currentSessionId = null;
     chatState.localMessages = [];
     chatState.lastSubmission = null;
+    chatState.currentSessionProfile = '';
+    chatState.draftProfile = '';
+    chatState.currentSegments = [];
+    chatState.currentActiveSegmentId = '';
+    chatState.currentActiveSegmentIndex = 1;
     chatReplacePendingFiles([]);
     chatState.selectedFolderId = folderId || chatState.selectedFolderId || '';
     chatState.draftFolderId = folderId || chatState.selectedFolderId || '';
@@ -5956,6 +6745,7 @@ async function chatEnsureSessionRecord() {
     if (chatState.currentSessionId) return chatState.currentSessionId;
     const resp = await api('POST', '/api/chat/sessions', {
         folder_id: chatState.draftFolderId || chatState.selectedFolderId || '',
+        profile: chatVisibleProfile(),
         transport_preference: chatState.transportPreference || 'auto',
     });
     chatState.currentSessionId = resp.session_id;
@@ -5971,6 +6761,7 @@ window.chatSetTransportPreference = async function (value) {
         toast(chatState.transportPolicy.reason || 'API transport is unavailable right now', 'warning');
         return;
     }
+    localStorage.setItem('hermes-transport-preference', next);
     try {
         if (chatState.currentSessionId) {
             const resp = await api('PUT', '/api/chat/sessions/' + chatState.currentSessionId + '/transport', {
@@ -6264,6 +7055,10 @@ window.chatSend = async function () {
     const message = input.value.trim();
     if (!message && chatState.pendingFiles.length === 0) return;
     if (chatState.isThinking) return;
+    const previousSessionId = chatState.currentSessionId || '';
+    const previousMessages = Array.isArray(chatState.localMessages)
+        ? chatState.localMessages.map(m => ({ ...m }))
+        : [];
 
     // Remove welcome if present
     const welcome = document.getElementById('chat-welcome');
@@ -6282,11 +7077,13 @@ window.chatSend = async function () {
     // Show thinking indicator
     const existing = document.getElementById('chat-thinking-dots');
     if (existing) existing.remove();
+    const persisted = document.getElementById('chat-persistent-progress');
+    if (persisted) persisted.remove();
     const msgs = document.getElementById('chat-messages');
     const dots = document.createElement('div');
     dots.id = 'chat-thinking-dots';
     dots.className = 'chat-thinking';
-    dots.innerHTML = '<div class="chat-thinking-bubble"><span class="chat-thinking-icon"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></span><span class="chat-thinking-text">Hermes is thinking<span class="chat-thinking-ellipsis"></span></span>' + (chatState.currentRequestCancelSupported ? '<button class="chat-stop-btn" id="chat-stop-btn" onclick="chatAbort()" title="Stop"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>' : '') + '</div>';
+    dots.innerHTML = '<div class="chat-thinking-bubble"><div class="chat-thinking-header"><span class="chat-thinking-icon"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></span><span class="chat-thinking-text">Hermes (' + escH(chatVisibleProfile()) + ') is thinking<span class="chat-thinking-ellipsis"></span></span>' + (chatState.currentRequestCancelSupported ? '<button class="chat-stop-btn" id="chat-stop-btn" onclick="chatAbort()" title="Stop"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>' : '') + '</div><div class="chat-progress-log" id="chat-progress-log"></div></div>';
     if (msgs) msgs.appendChild(dots);
 
     // Swap send button to stop
@@ -6301,10 +7098,25 @@ window.chatSend = async function () {
     }
 
     const files = pendingUploads.map(f => f.name);
+    const activeSegment = chatCurrentSegment();
     // Optimistically add user message to local
-    const userMsg = { role: 'user', content: message, files, timestamp: new Date().toISOString() };
+    const userMsg = {
+        role: 'user',
+        content: message,
+        files,
+        timestamp: new Date().toISOString(),
+        segment_id: activeSegment?.id || chatState.currentActiveSegmentId || '',
+        segment_index: activeSegment?.index || chatState.currentActiveSegmentIndex || 1,
+        profile: chatVisibleProfile(),
+        transport: chatExpectedTransport(),
+    };
     chatState.localMessages.push(userMsg);
-    chatAppendMsg('user', message, files);
+    chatAppendMsg('user', message, files, {
+        segment_id: userMsg.segment_id,
+        segment_index: userMsg.segment_index,
+        profile: userMsg.profile,
+        transport: userMsg.transport,
+    });
     input.value = '';
     chatAutoResize(input);
     document.getElementById('chat-send-btn').disabled = !chatState.currentRequestCancelSupported;
@@ -6313,15 +7125,18 @@ window.chatSend = async function () {
     const controller = new AbortController();
     chatState.chatAbortController = controller;
     chatState.currentRequestId = makeRequestId();
+    chatStartRequestProgress(chatState.currentRequestId, chatExpectedTransport());
 
     try {
         const resp = await api('POST', '/api/chat', {
             message, session_id: chatState.currentSessionId,
+            profile: chatVisibleProfile(),
             folder_id: chatState.currentSessionId ? '' : (chatState.draftFolderId || chatState.selectedFolderId || ''),
             transport_preference: chatState.transportPreference || 'auto',
             request_id: chatState.currentRequestId,
             files: pendingUploads.map(f => ({ stored_as: f.stored_as, name: f.name })),
         }, controller.signal);
+        chatClearRequestErrorNotice();
         chatState.currentSessionId = resp.session_id;
         chatApplySessionMetadata(resp.session || null);
         if (resp.user_message && chatState.localMessages.length > 0) {
@@ -6330,13 +7145,17 @@ window.chatSend = async function () {
         const assistantMsg = resp.assistant_message || { role: 'assistant', content: resp.response, timestamp: new Date().toISOString() };
         chatState.localMessages.push(assistantMsg);
         chatRenderMessages();
+        chatSetDebugTraceStatus('Completed');
+        chatRenderPersistentProgressBubble('Completed');
     } catch (e) {
         input.value = message;
         chatAutoResize(input);
         chatRenderFileBar();
         chatSyncSendButton();
+        const failedSessionId = e?.responseData?.session_id || chatState.currentSessionId || '';
 
         if (e.name === 'AbortError' || chatState.cancelRequested) {
+            chatSetDebugTraceStatus('Cancelled');
             chatState.localMessages.pop();
             const container = document.getElementById('chat-messages');
             if (container) {
@@ -6344,6 +7163,7 @@ window.chatSend = async function () {
                 const last = uls[uls.length - 1];
                 if (last) last.remove();
             }
+            chatRenderPersistentProgressBubble('Cancelled');
             chatResetComposerAfterRequest();
             if (chatState.localMessages.length === 0) {
                 chatRenderMessages();
@@ -6354,6 +7174,7 @@ window.chatSend = async function () {
             return;
         }
         // Roll back the optimistic user message — it was never processed
+        chatSetDebugTraceStatus('Failed');
         chatState.localMessages.pop(); // remove failed user msg from state
         // Now find and remove the user bubble (always the last .user in the container)
         const container = document.getElementById('chat-messages');
@@ -6362,12 +7183,18 @@ window.chatSend = async function () {
             const lastUser = userBubbles[userBubbles.length - 1];
             if (lastUser) lastUser.remove();
         }
+        chatRenderPersistentProgressBubble('Failed');
         chatResetComposerAfterRequest();
-        if (chatState.localMessages.length === 0) {
+        const restored = await chatRestoreSessionAfterFailure(failedSessionId);
+        if (!restored) {
+            chatState.currentSessionId = previousSessionId;
+            chatState.localMessages = previousMessages;
             chatRenderMessages();
         }
         chatLoadHistory();
-        toast(e.message || 'Request failed', 'error', 5000);
+        const errorAt = chatFormatNoticeTimestamp(new Date());
+        chatSetRequestErrorNotice('Send failed at ' + errorAt + '. Message restored as unsent draft.');
+        toast((e.message || 'Request failed') + ' (' + errorAt + ')', 'error', 5000);
         input.focus();
         return;
     }
@@ -6420,6 +7247,7 @@ window.chatExport = function () {
 function chatAppendMsg(role, content, files = [], messageMeta = {}) {
     const container = document.getElementById('chat-messages');
     if (!container) return;
+    const shouldAutoScroll = chatShouldAutoScroll(container);
     const div = chatBuildMessageNode({
         role,
         content,
@@ -6428,7 +7256,9 @@ function chatAppendMsg(role, content, files = [], messageMeta = {}) {
         ...messageMeta,
     });
     container.appendChild(div);
-    container.scrollTop = container.scrollHeight;
+    if (shouldAutoScroll) {
+        container.scrollTop = container.scrollHeight;
+    }
 }
 
 // ── COPY MESSAGE ───────────────────────────────────────────
@@ -6571,10 +7401,38 @@ function chatFileIcon(mime) {
 }
 function chatFmtSize(b) { return b < 1024 ? b + ' B' : b < 1048576 ? (b / 1024).toFixed(1) + ' KB' : (b / 1048576).toFixed(1) + ' MB'; }
 
+function chatRestoreThinkingBubble() {
+    if (!document.getElementById('chat-thinking-dots')) {
+        const msgs = document.getElementById('chat-messages');
+        if (!msgs) return;
+        const dots = document.createElement('div');
+        dots.id = 'chat-thinking-dots';
+        dots.className = 'chat-thinking';
+        dots.innerHTML = '<div class="chat-thinking-bubble"><div class="chat-thinking-header"><span class="chat-thinking-icon"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></span><span class="chat-thinking-text">Hermes (' + escH(chatVisibleProfile()) + ') is thinking<span class="chat-thinking-ellipsis"></span></span>' + (chatState.currentRequestCancelSupported ? '<button class="chat-stop-btn" id="chat-stop-btn" onclick="chatAbort()" title="Stop"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>' : '') + '</div><div class="chat-progress-log" id="chat-progress-log"></div></div>';
+        msgs.appendChild(dots);
+    }
+    const sendBtn = document.getElementById('chat-send-btn');
+    if (sendBtn && chatState.currentRequestCancelSupported) {
+        sendBtn.disabled = false;
+        sendBtn.classList.add('chat-stop-state');
+        sendBtn.onclick = chatAbort;
+        const svg = sendBtn.querySelector('svg');
+        if (svg) svg.innerHTML = '<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>';
+    } else if (sendBtn) {
+        sendBtn.disabled = true;
+    }
+}
+
 function chatSyncSendButton() {
     const input = document.getElementById('chat-input');
     const sendBtn = document.getElementById('chat-send-btn');
     if (!sendBtn) return;
+    if (chatState.isThinking) {
+        sendBtn.classList.add('chat-stop-state');
+        sendBtn.onclick = chatState.currentRequestCancelSupported ? chatAbort : chatSend;
+        sendBtn.disabled = !chatState.currentRequestCancelSupported;
+        return;
+    }
     sendBtn.disabled = !(input?.value.trim() || chatState.pendingFiles.length > 0);
 }
 
@@ -6661,8 +7519,32 @@ function chatStopVoiceUI() {
    INIT
    ═══════════════════════════════════════════════════════════════ */
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+    bootstrapTokenFromUrl();
+    initLoginForm();
+
+    // Always require explicit login — never auto-enter dashboard from a
+    // leftover session cookie.  Show the login screen on every page load.
+    showLoginScreen();
+});
+
+function bootstrapApp() {
     ThemeManager.init();
+
+    const isMobileViewport = () => window.innerWidth <= 768;
+    const normalizeSidebarForViewport = () => {
+        const sidebar = document.getElementById('sidebar');
+        const mainWrapper = document.getElementById('main-wrapper');
+        if (!sidebar || !mainWrapper) return;
+
+        if (isMobileViewport()) {
+            // Mobile supports only overlay open/closed states.
+            sidebar.classList.remove('collapsed');
+            mainWrapper.classList.remove('sidebar-collapsed');
+        } else {
+            sidebar.classList.remove('mobile-open');
+        }
+    };
 
     document.querySelectorAll('.nav-item').forEach(item => {
         item.addEventListener('click', () => {
@@ -6683,17 +7565,37 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('menu-toggle').addEventListener('click', () => {
         // On desktop: toggle the sidebar collapse (same as collapse button)
         // On mobile: toggle the mobile overlay
-        if (window.innerWidth > 768) {
-            document.getElementById('sidebar').classList.toggle('collapsed');
-            document.getElementById('main-wrapper').classList.toggle('sidebar-collapsed');
+        const sidebar = document.getElementById('sidebar');
+        const mainWrapper = document.getElementById('main-wrapper');
+        if (!sidebar || !mainWrapper) return;
+
+        if (!isMobileViewport()) {
+            sidebar.classList.remove('mobile-open');
+            sidebar.classList.toggle('collapsed');
+            mainWrapper.classList.toggle('sidebar-collapsed');
         } else {
-            document.getElementById('sidebar').classList.toggle('mobile-open');
+            // Always open the full overlay, never the mini (collapsed) sidebar on mobile.
+            sidebar.classList.remove('collapsed');
+            mainWrapper.classList.remove('sidebar-collapsed');
+            sidebar.classList.toggle('mobile-open');
         }
     });
 
     document.getElementById('sidebar-collapse').addEventListener('click', () => {
-        document.getElementById('sidebar').classList.toggle('collapsed');
-        document.getElementById('main-wrapper').classList.toggle('sidebar-collapsed');
+        const sidebar = document.getElementById('sidebar');
+        const mainWrapper = document.getElementById('main-wrapper');
+        if (!sidebar || !mainWrapper) return;
+
+        if (isMobileViewport()) {
+            // In mobile, this button closes/opens the overlay only.
+            sidebar.classList.remove('collapsed');
+            mainWrapper.classList.remove('sidebar-collapsed');
+            sidebar.classList.toggle('mobile-open');
+            return;
+        }
+
+        sidebar.classList.toggle('collapsed');
+        mainWrapper.classList.toggle('sidebar-collapsed');
         renderSidebarFoldersTree();
     });
 
@@ -6704,6 +7606,7 @@ document.addEventListener('DOMContentLoaded', () => {
         toast('Theme: ' + ThemeManager.getLabel(), 'info', 2000);
     });
 
+    updateActiveProfileIndicators({ profile: 'loading' });
     checkHealth();
     HermesUpdate.ensureLoaded().catch(() => {});
     // Support ?chat or #chat for direct navigation
@@ -6711,13 +7614,15 @@ document.addEventListener('DOMContentLoaded', () => {
     const hash = window.location.hash.replace('#', '');
     const direct = params.get('go') || hash || '';
     navigate(direct && Screens[direct] ? direct : 'chat');
+    normalizeSidebarForViewport();
+    window.addEventListener('resize', normalizeSidebarForViewport);
     renderSidebarFoldersTree();
     // Listen for hash changes
     window.addEventListener('hashchange', () => {
         const h = window.location.hash.replace('#', '');
         if (h && Screens[h]) navigate(h);
     });
-});
+}
 
-setInterval(checkHealth, 10000);
-setInterval(() => { HermesUpdate.refresh(false, { silent: true }).catch(() => {}); }, 300000);
+setInterval(() => { if (_authed) checkHealth(); }, 10000);
+setInterval(() => { if (_authed) HermesUpdate.refresh(false, { silent: true }).catch(() => {}); }, 300000);

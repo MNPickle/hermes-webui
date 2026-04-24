@@ -256,6 +256,138 @@ class HermesWebUISmokeTests(unittest.TestCase):
         self.assertEqual(captured["url"], "https://vision.example.test/v1/chat/completions")
         self.assertEqual(captured["payload"]["model"], "vision-model")
 
+    def test_call_api_server_uses_api_token_alias_for_authorization(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=300):
+            captured["headers"] = dict(req.header_items())
+            return FakeHTTPResponse({"choices": [{"message": {"content": "api ok"}}]})
+
+        with patch.dict(mod.os.environ, {"HERMES_API_TOKEN": "server-token"}, clear=False), \
+             patch.object(mod, "_normalized_model_config", return_value={
+                 "default_model": "default-model",
+                 "base_url": "https://api.example.test/v1",
+             }), \
+             patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            result = mod._call_api_server({}, [{"role": "user", "content": "hello"}], "sid-1")
+
+        self.assertEqual(result, "api ok")
+        self.assertEqual(captured["headers"].get("Authorization"), "Bearer server-token")
+
+    def test_call_api_server_prefers_port_scoped_repo_token_over_generic_repo_env(self):
+        captured = {}
+        hermes_root = Path(self.tmpdir.name) / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        leire_home = profiles_dir / "leire"
+        profiles_dir.mkdir(parents=True)
+        leire_home.mkdir(parents=True)
+        (leire_home / ".env").write_text("API_SERVER_PORT=8643\n", encoding="utf-8")
+        repo_env = Path(self.tmpdir.name) / "repo.env"
+        repo_env.write_text("HERMES_API_TOKEN=repo-token\nHERMES_API_TOKEN_PORT_8643=port-token\n", encoding="utf-8")
+        state_path = Path(self.tmpdir.name) / "webui_profile"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text("leire\n", encoding="utf-8")
+
+        def fake_urlopen(req, timeout=300):
+            captured["headers"] = dict(req.header_items())
+            return FakeHTTPResponse({"choices": [{"message": {"content": "api ok"}}]})
+
+        with patch.object(mod, "HERMES_HOME", hermes_root), \
+             patch.object(mod, "CONFIG_PATH", hermes_root / "config.yaml"), \
+             patch.object(mod, "ENV_PATH", hermes_root / ".env"), \
+             patch.object(mod, "HERMES_PROFILES_DIR", profiles_dir), \
+             patch.object(mod, "WEBUI_PROFILE_STATE_PATH", state_path), \
+             patch.object(mod, "REPO_ENV_PATH", repo_env), \
+             patch.object(mod, "_normalized_model_config", return_value={
+                 "default_model": "default-model",
+                 "base_url": "https://api.example.test:8643/v1",
+             }), \
+             patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            result = mod._call_api_server({}, [{"role": "user", "content": "hello"}], "sid-1")
+
+        self.assertEqual(result, "api ok")
+        self.assertEqual(captured["headers"].get("Authorization"), "Bearer port-token")
+
+    def test_call_api_server_prefers_gateway_port_over_target_base_url_port(self):
+        captured = {}
+        hermes_root = Path(self.tmpdir.name) / ".hermes"
+        repo_env = Path(self.tmpdir.name) / "repo.env"
+        repo_env.write_text(
+            "HERMES_API_TOKEN_PORT_8642=gateway-token\nHERMES_API_TOKEN_PORT_443=target-token\n",
+            encoding="utf-8",
+        )
+
+        def fake_urlopen(req, timeout=300):
+            captured["headers"] = dict(req.header_items())
+            return FakeHTTPResponse({"choices": [{"message": {"content": "api ok"}}]})
+
+        with patch.object(mod, "HERMES_HOME", hermes_root), \
+             patch.object(mod, "ENV_PATH", hermes_root / ".env"), \
+             patch.object(mod, "REPO_ENV_PATH", repo_env), \
+             patch.object(mod, "_effective_hermes_api_url", return_value="http://127.0.0.1:8642"), \
+             patch.object(mod, "_normalized_model_config", return_value={
+                 "default_model": "default-model",
+                 "base_url": "https://ollama.com/v1",
+             }), \
+             patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            result = mod._call_api_server({}, [{"role": "user", "content": "hello"}], "sid-1")
+
+        self.assertEqual(result, "api ok")
+        self.assertEqual(captured["headers"].get("Authorization"), "Bearer gateway-token")
+
+    def test_runtime_profile_api_token_endpoint_reads_repo_env_token_for_gateway_port(self):
+        hermes_root = Path(self.tmpdir.name) / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        leire_home = profiles_dir / "leire"
+        profiles_dir.mkdir(parents=True)
+        leire_home.mkdir(parents=True)
+        (leire_home / ".env").write_text("API_SERVER_PORT=8643\n", encoding="utf-8")
+        repo_env = Path(self.tmpdir.name) / "repo.env"
+        repo_env.write_text("HERMES_API_TOKEN_PORT_8643=profile-token\n", encoding="utf-8")
+
+        with patch.object(mod, "_current_webui_token", return_value="test-token"), \
+             patch.object(mod, "HERMES_HOME", hermes_root), \
+             patch.object(mod, "ENV_PATH", hermes_root / ".env"), \
+             patch.object(mod, "HERMES_PROFILES_DIR", profiles_dir), \
+             patch.object(mod, "REPO_ENV_PATH", repo_env):
+            resp = self.client.get("/api/runtime/profiles/leire/api-token", headers=self.headers)
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        body = resp.get_json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["profile"], "leire")
+        self.assertEqual(body["env_path"], str(repo_env))
+        self.assertEqual(body["api_port"], "8643")
+        self.assertTrue(body["has_token"])
+        self.assertEqual(body["token_key"], "HERMES_API_TOKEN_PORT_8643")
+        self.assertTrue(body["masked_token"].endswith("oken"))
+
+    def test_runtime_profile_api_token_endpoint_writes_canonical_repo_token_for_gateway_port(self):
+        hermes_root = Path(self.tmpdir.name) / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        leire_home = profiles_dir / "leire"
+        profiles_dir.mkdir(parents=True)
+        leire_home.mkdir(parents=True)
+        (leire_home / ".env").write_text("API_SERVER_PORT=8643\n", encoding="utf-8")
+        repo_env = Path(self.tmpdir.name) / "repo.env"
+        repo_env.write_text("API_SERVER_KEY_PORT_8643=old-token\n", encoding="utf-8")
+
+        with patch.object(mod, "_current_webui_token", return_value="test-token"), \
+             patch.object(mod, "HERMES_HOME", hermes_root), \
+             patch.object(mod, "ENV_PATH", hermes_root / ".env"), \
+             patch.object(mod, "HERMES_PROFILES_DIR", profiles_dir), \
+             patch.object(mod, "REPO_ENV_PATH", repo_env):
+            resp = self.client.put(
+                "/api/runtime/profiles/leire/api-token",
+                json={"token": "new-profile-token"},
+                headers=self.headers,
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        saved = repo_env.read_text(encoding="utf-8")
+        self.assertIn("HERMES_API_TOKEN_PORT_8643=new-profile-token", saved)
+        self.assertNotIn("API_SERVER_KEY_PORT_8643=old-token", saved)
+
     def test_call_api_server_surfaces_top_level_error_payload(self):
         def fake_urlopen(req, timeout=300):
             return FakeHTTPResponse({"error": {"message": "image too small"}})
@@ -342,6 +474,51 @@ class HermesWebUISmokeTests(unittest.TestCase):
         self.assertEqual(data["limits"]["max_upload_bytes"], mod.MAX_UPLOAD_SIZE)
         self.assertEqual(data["limits"]["max_request_body_bytes"], mod.MAX_REQUEST_BODY_SIZE)
 
+    def test_chat_status_enables_api_transport_when_probe_is_reachable(self):
+        with patch.object(mod, "_current_webui_token", return_value="test-token"), \
+             patch.object(mod, "_api_server_healthcheck", return_value=True), \
+             patch.object(mod, "_api_server_probe", return_value=(True, "", {"probe": "models", "status": 200, "url": "https://ollama.com/v1/models"})), \
+             patch.object(mod, "_image_attachment_support_status", return_value=(False, "Hermes vision is not configured")), \
+             patch.object(mod, "_vision_configured", return_value=(False, "Hermes vision is not configured")), \
+             patch.object(mod, "_resolve_api_target", return_value={"base_url": "https://ollama.com/v1", "model": "", "api_key": ""}), \
+             patch.object(mod, "_chat_runtime_status", return_value=runtime_status_stub(
+                 requires_cli=False,
+                 reasons=["1 integration is configured."],
+                 integrations={"configured_count": 1, "configured_names": ["Discord"]},
+             )):
+            resp = self.client.get("/api/chat/status", headers=self.headers)
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        data = resp.get_json()
+        self.assertTrue(data["api_server"])
+        self.assertTrue(data["api_probe"]["reachable"])
+        self.assertTrue(data["transport_policy"]["api_selectable"])
+        self.assertFalse(data["transport_policy"]["requires_cli"])
+
+    def test_image_attachment_support_requires_credentials_for_remote_endpoint(self):
+        target = {
+            "base_url": "https://ollama.com/v1",
+            "api_key": "",
+            "model": "qwen3.5:cloud",
+            "provider": "auto",
+        }
+
+        with patch.object(mod, "_vision_configured", return_value=(True, "")), \
+             patch.object(mod, "_resolve_api_target", return_value=target), \
+             patch.object(mod, "_api_server_probe", side_effect=AssertionError("probe should not run when credentials are missing")):
+            ready, reason = mod._image_attachment_support_status()
+
+        self.assertFalse(ready)
+        self.assertIn("Vision API key is missing", reason)
+
+    def test_resolved_target_api_key_expands_runtime_template(self):
+        with patch.dict(mod.os.environ, {}, clear=True), \
+             patch.object(mod, "_repo_env_values", return_value={}), \
+             patch.object(mod, "_hermes_env_values", return_value={"OPENAI_API_KEY": "resolved-secret"}):
+            resolved = mod._resolved_target_api_key({"api_key": "${OPENAI_API_KEY}", "provider": "openai"})
+
+        self.assertEqual(resolved, "resolved-secret")
+
     def test_env_api_returns_metadata_and_presets(self):
         env_file = Path(self.tmpdir.name) / ".env"
         env_file.write_text("OPENAI_API_KEY=test-key\nOPENAI_BASE_URL=\n", encoding="utf-8")
@@ -384,6 +561,409 @@ class HermesWebUISmokeTests(unittest.TestCase):
 
         self.assertEqual(resp.status_code, 200, resp.data)
         self.assertEqual(env_file.read_text(encoding="utf-8"), "OPENAI_API_KEY=sk-new-value\n")
+
+    def test_runtime_profile_switch_changes_config_source(self):
+        hermes_root = Path(self.tmpdir.name) / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        leire_home = profiles_dir / "leire"
+        hermes_root.mkdir()
+        profiles_dir.mkdir()
+        leire_home.mkdir(parents=True)
+        (hermes_root / "config.yaml").write_text("agent:\n  personality: default\n", encoding="utf-8")
+        (leire_home / "config.yaml").write_text("agent:\n  personality: leire\n", encoding="utf-8")
+        state_path = Path(self.tmpdir.name) / "webui_profile"
+
+        with patch.object(mod, "HERMES_HOME", hermes_root), \
+             patch.object(mod, "CONFIG_PATH", hermes_root / "config.yaml"), \
+             patch.object(mod, "ENV_PATH", hermes_root / ".env"), \
+             patch.object(mod, "SKILLS_DIR", hermes_root / "skills"), \
+             patch.object(mod, "SESSIONS_DIR", hermes_root / "sessions"), \
+             patch.object(mod, "BACKUP_DIR", hermes_root / "backups"), \
+             patch.object(mod, "HERMES_PROFILES_DIR", profiles_dir), \
+             patch.object(mod, "WEBUI_PROFILE_STATE_PATH", state_path):
+            mod.cfg.load()
+
+            before = self.client.get("/api/config", headers=self.headers)
+            self.assertEqual(before.status_code, 200, before.data)
+            self.assertEqual(before.get_json()["agent"]["personality"], "default")
+
+            switched = self.client.put("/api/runtime/profiles", json={"profile": "leire"}, headers=self.headers)
+            self.assertEqual(switched.status_code, 200, switched.data)
+            self.assertEqual(switched.get_json()["selected"], "leire")
+
+            after = self.client.get("/api/config", headers=self.headers)
+            self.assertEqual(after.status_code, 200, after.data)
+            self.assertEqual(after.get_json()["agent"]["personality"], "leire")
+
+    def test_runtime_profile_switch_changes_chat_status_api_url(self):
+        hermes_root = Path(self.tmpdir.name) / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        leire_home = profiles_dir / "leire"
+        hermes_root.mkdir()
+        profiles_dir.mkdir()
+        leire_home.mkdir(parents=True)
+        (leire_home / ".env").write_text("HERMES_API_URL=http://127.0.0.1:9876\n", encoding="utf-8")
+        state_path = Path(self.tmpdir.name) / "webui_profile"
+
+        with patch.dict(mod.os.environ, {"HERMES_WEBUI_TOKEN": "test-token"}, clear=True), \
+             patch.object(mod, "HERMES_HOME", hermes_root), \
+             patch.object(mod, "CONFIG_PATH", hermes_root / "config.yaml"), \
+             patch.object(mod, "ENV_PATH", hermes_root / ".env"), \
+             patch.object(mod, "SKILLS_DIR", hermes_root / "skills"), \
+             patch.object(mod, "SESSIONS_DIR", hermes_root / "sessions"), \
+             patch.object(mod, "BACKUP_DIR", hermes_root / "backups"), \
+             patch.object(mod, "HERMES_PROFILES_DIR", profiles_dir), \
+             patch.object(mod, "WEBUI_PROFILE_STATE_PATH", state_path), \
+             patch.object(mod, "_check_api_server", return_value=False), \
+             patch.object(mod, "_api_server_probe", return_value=(False, "disabled", None)), \
+             patch.object(mod, "_image_attachment_support_status", return_value=(False, "disabled")), \
+             patch.object(mod, "_vision_configured", return_value=(False, "not configured")), \
+             patch.object(mod, "_resolve_api_target", return_value={"base_url": "", "model": "", "api_key": ""}), \
+             patch.object(mod, "_chat_runtime_status", return_value=runtime_status_stub()):
+            switched = self.client.put("/api/runtime/profiles", json={"profile": "leire"}, headers=self.headers)
+            self.assertEqual(switched.status_code, 200, switched.data)
+
+            resp = self.client.get("/api/chat/status", headers=self.headers)
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        data = resp.get_json()
+        self.assertEqual(data["profile"], "leire")
+        self.assertEqual(data["api_url"], "http://127.0.0.1:9876")
+
+    def test_chat_session_history_preserves_profile_used(self):
+        hermes_root = Path(self.tmpdir.name) / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        profiles_dir.mkdir(parents=True)
+        (profiles_dir / "leire").mkdir()
+        state_path = Path(self.tmpdir.name) / "webui_profile"
+
+        with patch.object(mod, "HERMES_HOME", hermes_root), \
+             patch.object(mod, "CONFIG_PATH", hermes_root / "config.yaml"), \
+             patch.object(mod, "ENV_PATH", hermes_root / ".env"), \
+             patch.object(mod, "SKILLS_DIR", hermes_root / "skills"), \
+             patch.object(mod, "SESSIONS_DIR", hermes_root / "sessions"), \
+             patch.object(mod, "BACKUP_DIR", hermes_root / "backups"), \
+             patch.object(mod, "HERMES_PROFILES_DIR", profiles_dir), \
+             patch.object(mod, "WEBUI_PROFILE_STATE_PATH", state_path), \
+             patch.object(mod, "_check_api_server", return_value=False), \
+             patch.object(mod, "_image_attachment_support_status", return_value=(False, "disabled")), \
+             patch.object(mod, "_call_hermes_direct", return_value=("ok", "hermes-session-1")):
+            switched = self.client.put("/api/runtime/profiles", json={"profile": "leire"}, headers=self.headers)
+            self.assertEqual(switched.status_code, 200, switched.data)
+
+            sent = self.client.post("/api/chat", json={"message": "hello"}, headers=self.headers)
+            self.assertEqual(sent.status_code, 200, sent.data)
+            session_id = sent.get_json()["session_id"]
+
+            switched_back = self.client.put("/api/runtime/profiles", json={"profile": "default"}, headers=self.headers)
+            self.assertEqual(switched_back.status_code, 200, switched_back.data)
+
+            listing = self.client.get("/api/chat/sessions", headers=self.headers)
+            self.assertEqual(listing.status_code, 200, listing.data)
+            sessions = listing.get_json()["sessions"]
+            matching = next(item for item in sessions if item["id"] == session_id)
+            self.assertEqual(matching["session"]["profile"], "leire")
+
+            messages = self.client.get(f"/api/chat/sessions/{session_id}/messages", headers=self.headers)
+            self.assertEqual(messages.status_code, 200, messages.data)
+            self.assertEqual(messages.get_json()["session"]["profile"], "leire")
+
+    def test_chat_session_profile_switch_creates_new_runtime_segment(self):
+        hermes_root = Path(self.tmpdir.name) / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        profiles_dir.mkdir(parents=True)
+        (profiles_dir / "leire").mkdir()
+        state_path = Path(self.tmpdir.name) / "webui_profile"
+
+        with patch.object(mod, "HERMES_HOME", hermes_root), \
+             patch.object(mod, "CONFIG_PATH", hermes_root / "config.yaml"), \
+             patch.object(mod, "ENV_PATH", hermes_root / ".env"), \
+             patch.object(mod, "SKILLS_DIR", hermes_root / "skills"), \
+             patch.object(mod, "SESSIONS_DIR", hermes_root / "sessions"), \
+             patch.object(mod, "BACKUP_DIR", hermes_root / "backups"), \
+             patch.object(mod, "HERMES_PROFILES_DIR", profiles_dir), \
+             patch.object(mod, "WEBUI_PROFILE_STATE_PATH", state_path):
+            created = self.client.post("/api/chat/sessions", json={}, headers=self.headers)
+            self.assertEqual(created.status_code, 200, created.data)
+            session_id = created.get_json()["session_id"]
+            created_session = created.get_json()["session"]
+            self.assertEqual(created_session["profile"], "default")
+            self.assertEqual(created_session["active_segment_index"], 1)
+            self.assertEqual(len(created_session["segments"]), 1)
+
+            switched = self.client.put(
+                f"/api/chat/sessions/{session_id}/profile",
+                json={"profile": "leire"},
+                headers=self.headers,
+            )
+            self.assertEqual(switched.status_code, 200, switched.data)
+            session = switched.get_json()["session"]
+            self.assertEqual(session["profile"], "leire")
+            self.assertEqual(session["active_segment_index"], 2)
+            self.assertEqual(len(session["segments"]), 2)
+            self.assertEqual(session["segments"][0]["profile"], "default")
+            self.assertEqual(session["segments"][1]["profile"], "leire")
+
+            persisted = mod._load_session(session_id)
+            self.assertEqual(persisted["profile"], "leire")
+            self.assertEqual(persisted["active_segment_id"], "segment-2")
+            self.assertEqual(len(persisted["segments"]), 2)
+
+    def test_chat_session_profile_switch_is_local_and_used_on_next_turn(self):
+        hermes_root = Path(self.tmpdir.name) / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        profiles_dir.mkdir(parents=True)
+        (profiles_dir / "leire").mkdir()
+        state_path = Path(self.tmpdir.name) / "webui_profile"
+        seen_profiles = []
+
+        def fake_call(session, message, files=None, request_id=None, file_display_names=None):
+            seen_profiles.append(mod._selected_hermes_profile_name())
+            return (f"ok:{mod._selected_hermes_profile_name()}", "hermes-session-1")
+
+        with patch.object(mod, "HERMES_HOME", hermes_root), \
+             patch.object(mod, "CONFIG_PATH", hermes_root / "config.yaml"), \
+             patch.object(mod, "ENV_PATH", hermes_root / ".env"), \
+             patch.object(mod, "SKILLS_DIR", hermes_root / "skills"), \
+             patch.object(mod, "SESSIONS_DIR", hermes_root / "sessions"), \
+             patch.object(mod, "BACKUP_DIR", hermes_root / "backups"), \
+             patch.object(mod, "HERMES_PROFILES_DIR", profiles_dir), \
+             patch.object(mod, "WEBUI_PROFILE_STATE_PATH", state_path), \
+             patch.object(mod, "_check_api_server", return_value=False), \
+             patch.object(mod, "_image_attachment_support_status", return_value=(False, "disabled")), \
+             patch.object(mod, "_call_hermes_direct", side_effect=fake_call):
+            created = self.client.post("/api/chat/sessions", json={}, headers=self.headers)
+            self.assertEqual(created.status_code, 200, created.data)
+            session_id = created.get_json()["session_id"]
+
+            first = self.client.post(
+                "/api/chat",
+                json={"message": "hello", "session_id": session_id},
+                headers=self.headers,
+            )
+            self.assertEqual(first.status_code, 200, first.data)
+            self.assertEqual(first.get_json()["assistant_message"]["profile"], "default")
+
+            switched = self.client.put(
+                f"/api/chat/sessions/{session_id}/profile",
+                json={"profile": "leire"},
+                headers=self.headers,
+            )
+            self.assertEqual(switched.status_code, 200, switched.data)
+            self.assertFalse(state_path.exists())
+
+            second = self.client.post(
+                "/api/chat",
+                json={"message": "follow up", "session_id": session_id},
+                headers=self.headers,
+            )
+            self.assertEqual(second.status_code, 200, second.data)
+            second_json = second.get_json()
+            self.assertEqual(second_json["session"]["profile"], "leire")
+            self.assertEqual(second_json["assistant_message"]["profile"], "leire")
+            self.assertEqual(second_json["assistant_message"]["content"], "ok:leire")
+            self.assertEqual(seen_profiles, ["default", "leire"])
+
+    def test_chat_session_create_accepts_local_profile_without_writing_global_state(self):
+        hermes_root = Path(self.tmpdir.name) / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        profiles_dir.mkdir(parents=True)
+        (profiles_dir / "leire").mkdir()
+        state_path = Path(self.tmpdir.name) / "webui_profile"
+
+        with patch.object(mod, "HERMES_HOME", hermes_root), \
+             patch.object(mod, "CONFIG_PATH", hermes_root / "config.yaml"), \
+             patch.object(mod, "ENV_PATH", hermes_root / ".env"), \
+             patch.object(mod, "SKILLS_DIR", hermes_root / "skills"), \
+             patch.object(mod, "SESSIONS_DIR", hermes_root / "sessions"), \
+             patch.object(mod, "BACKUP_DIR", hermes_root / "backups"), \
+             patch.object(mod, "HERMES_PROFILES_DIR", profiles_dir), \
+             patch.object(mod, "WEBUI_PROFILE_STATE_PATH", state_path):
+            created = self.client.post(
+                "/api/chat/sessions",
+                json={"profile": "leire"},
+                headers=self.headers,
+            )
+            self.assertEqual(created.status_code, 200, created.data)
+
+            session = created.get_json()["session"]
+            self.assertEqual(session["profile"], "leire")
+            self.assertEqual(session["segments"][0]["profile"], "leire")
+            self.assertFalse(state_path.exists())
+
+    def test_chat_session_profile_switch_reuses_prior_profile_cli_continuity(self):
+        hermes_root = Path(self.tmpdir.name) / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        profiles_dir.mkdir(parents=True)
+        (profiles_dir / "leire").mkdir()
+        state_path = Path(self.tmpdir.name) / "webui_profile"
+        seen_calls = []
+
+        def fake_call(session, message, files=None, request_id=None, file_display_names=None):
+            selected_profile = mod._selected_hermes_profile_name()
+            seen_calls.append({
+                "profile": selected_profile,
+                "resume": session.get("hermes_session_id"),
+            })
+            if selected_profile == "default":
+                return ("ok:default", "hermes-default-1")
+            return ("ok:leire", "hermes-leire-1")
+
+        with patch.object(mod, "HERMES_HOME", hermes_root), \
+             patch.object(mod, "CONFIG_PATH", hermes_root / "config.yaml"), \
+             patch.object(mod, "ENV_PATH", hermes_root / ".env"), \
+             patch.object(mod, "SKILLS_DIR", hermes_root / "skills"), \
+             patch.object(mod, "SESSIONS_DIR", hermes_root / "sessions"), \
+             patch.object(mod, "BACKUP_DIR", hermes_root / "backups"), \
+             patch.object(mod, "HERMES_PROFILES_DIR", profiles_dir), \
+             patch.object(mod, "WEBUI_PROFILE_STATE_PATH", state_path), \
+             patch.object(mod, "_check_api_server", return_value=False), \
+             patch.object(mod, "_image_attachment_support_status", return_value=(False, "disabled")), \
+             patch.object(mod, "_call_hermes_direct", side_effect=fake_call):
+            created = self.client.post("/api/chat/sessions", json={}, headers=self.headers)
+            self.assertEqual(created.status_code, 200, created.data)
+            session_id = created.get_json()["session_id"]
+
+            first = self.client.post(
+                "/api/chat",
+                json={"message": "hello default", "session_id": session_id},
+                headers=self.headers,
+            )
+            self.assertEqual(first.status_code, 200, first.data)
+
+            switched_to_leire = self.client.put(
+                f"/api/chat/sessions/{session_id}/profile",
+                json={"profile": "leire"},
+                headers=self.headers,
+            )
+            self.assertEqual(switched_to_leire.status_code, 200, switched_to_leire.data)
+
+            second = self.client.post(
+                "/api/chat",
+                json={"message": "hello leire", "session_id": session_id},
+                headers=self.headers,
+            )
+            self.assertEqual(second.status_code, 200, second.data)
+
+            switched_to_default = self.client.put(
+                f"/api/chat/sessions/{session_id}/profile",
+                json={"profile": "default"},
+                headers=self.headers,
+            )
+            self.assertEqual(switched_to_default.status_code, 200, switched_to_default.data)
+            switched_session = switched_to_default.get_json()["session"]
+            self.assertEqual(switched_session["profile"], "default")
+            self.assertEqual(switched_session["active_segment_index"], 3)
+            self.assertEqual(switched_session["segments"][2]["hermes_session_id"], "hermes-default-1")
+
+            third = self.client.post(
+                "/api/chat",
+                json={"message": "back to default", "session_id": session_id},
+                headers=self.headers,
+            )
+            self.assertEqual(third.status_code, 200, third.data)
+            self.assertEqual(third.get_json()["session"]["profile"], "default")
+
+            self.assertEqual(seen_calls, [
+                {"profile": "default", "resume": None},
+                {"profile": "leire", "resume": None},
+                {"profile": "default", "resume": "hermes-default-1"},
+            ])
+
+            persisted = mod._load_session(session_id)
+            self.assertEqual(persisted["hermes_session_id"], "hermes-default-1")
+            self.assertEqual(persisted["segments"][0]["hermes_session_id"], "hermes-default-1")
+            self.assertEqual(persisted["segments"][1]["hermes_session_id"], "hermes-leire-1")
+            self.assertEqual(persisted["segments"][2]["hermes_session_id"], "hermes-default-1")
+
+    def test_chat_session_reload_uses_last_profile_with_messages(self):
+        hermes_root = Path(self.tmpdir.name) / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        profiles_dir.mkdir(parents=True)
+        (profiles_dir / "leire").mkdir()
+        state_path = Path(self.tmpdir.name) / "webui_profile"
+        seen_calls = []
+
+        def fake_call(session, message, files=None, request_id=None, file_display_names=None):
+            selected_profile = mod._selected_hermes_profile_name()
+            seen_calls.append({
+                "profile": selected_profile,
+                "resume": session.get("hermes_session_id"),
+            })
+            if selected_profile == "default":
+                return ("ok:default", "hermes-default-1")
+            return ("ok:leire", "hermes-leire-1")
+
+        with patch.object(mod, "HERMES_HOME", hermes_root), \
+             patch.object(mod, "CONFIG_PATH", hermes_root / "config.yaml"), \
+             patch.object(mod, "ENV_PATH", hermes_root / ".env"), \
+             patch.object(mod, "SKILLS_DIR", hermes_root / "skills"), \
+             patch.object(mod, "SESSIONS_DIR", hermes_root / "sessions"), \
+             patch.object(mod, "BACKUP_DIR", hermes_root / "backups"), \
+             patch.object(mod, "HERMES_PROFILES_DIR", profiles_dir), \
+             patch.object(mod, "WEBUI_PROFILE_STATE_PATH", state_path), \
+             patch.object(mod, "_check_api_server", return_value=False), \
+             patch.object(mod, "_image_attachment_support_status", return_value=(False, "disabled")), \
+             patch.object(mod, "_call_hermes_direct", side_effect=fake_call):
+            created = self.client.post("/api/chat/sessions", json={}, headers=self.headers)
+            self.assertEqual(created.status_code, 200, created.data)
+            session_id = created.get_json()["session_id"]
+
+            first = self.client.post(
+                "/api/chat",
+                json={"message": "hello default", "session_id": session_id},
+                headers=self.headers,
+            )
+            self.assertEqual(first.status_code, 200, first.data)
+
+            switched_to_leire = self.client.put(
+                f"/api/chat/sessions/{session_id}/profile",
+                json={"profile": "leire"},
+                headers=self.headers,
+            )
+            self.assertEqual(switched_to_leire.status_code, 200, switched_to_leire.data)
+
+            second = self.client.post(
+                "/api/chat",
+                json={"message": "hello leire", "session_id": session_id},
+                headers=self.headers,
+            )
+            self.assertEqual(second.status_code, 200, second.data)
+
+            switched_to_default = self.client.put(
+                f"/api/chat/sessions/{session_id}/profile",
+                json={"profile": "default"},
+                headers=self.headers,
+            )
+            self.assertEqual(switched_to_default.status_code, 200, switched_to_default.data)
+            self.assertEqual(switched_to_default.get_json()["session"]["profile"], "default")
+
+            reloaded = self.client.get(f"/api/chat/sessions/{session_id}/messages", headers=self.headers)
+            self.assertEqual(reloaded.status_code, 200, reloaded.data)
+            reloaded_session = reloaded.get_json()["session"]
+            self.assertEqual(reloaded_session["profile"], "leire")
+            self.assertEqual(reloaded_session["active_segment_id"], "segment-2")
+            self.assertEqual(len(reloaded_session["segments"]), 2)
+
+            third = self.client.post(
+                "/api/chat",
+                json={"message": "still leire", "session_id": session_id},
+                headers=self.headers,
+            )
+            self.assertEqual(third.status_code, 200, third.data)
+            self.assertEqual(third.get_json()["session"]["profile"], "leire")
+            self.assertEqual(third.get_json()["assistant_message"]["profile"], "leire")
+
+            self.assertEqual(seen_calls, [
+                {"profile": "default", "resume": None},
+                {"profile": "leire", "resume": None},
+                {"profile": "leire", "resume": "hermes-leire-1"},
+            ])
+
+            persisted = mod._load_session(session_id)
+            self.assertEqual(persisted["profile"], "leire")
+            self.assertEqual(persisted["active_segment_id"], "segment-2")
+            self.assertEqual(len(persisted["segments"]), 2)
 
     def test_skill_setup_readiness_detects_missing_requirements(self):
         skill_root = Path(self.tmpdir.name) / "skills"
@@ -1071,6 +1651,132 @@ Sidecar output:
         self.assertEqual(session_meta["continuity_mode"], "local_replay")
         self.assertFalse(session_meta["hermes_session_backed"])
 
+    def test_api_replay_is_limited_to_active_profile_segment(self):
+        hermes_root = Path(self.tmpdir.name) / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        profiles_dir.mkdir(parents=True)
+        (profiles_dir / "leire").mkdir()
+        state_path = Path(self.tmpdir.name) / "webui_profile"
+        captured_requests = []
+
+        def fake_call_api_server(session, messages, sid, files=None, prefer_vision=False, file_display_names=None):
+            captured_requests.append({
+                "profile": mod._selected_hermes_profile_name(),
+                "messages": copy.deepcopy(messages),
+                "prefer_vision": prefer_vision,
+            })
+            return f"api:{mod._selected_hermes_profile_name()}"
+
+        with patch.object(mod, "HERMES_HOME", hermes_root), \
+             patch.object(mod, "CONFIG_PATH", hermes_root / "config.yaml"), \
+             patch.object(mod, "ENV_PATH", hermes_root / ".env"), \
+             patch.object(mod, "SKILLS_DIR", hermes_root / "skills"), \
+             patch.object(mod, "SESSIONS_DIR", hermes_root / "sessions"), \
+             patch.object(mod, "BACKUP_DIR", hermes_root / "backups"), \
+             patch.object(mod, "HERMES_PROFILES_DIR", profiles_dir), \
+             patch.object(mod, "WEBUI_PROFILE_STATE_PATH", state_path), \
+               patch.object(mod, "_current_webui_token", return_value="test-token"), \
+             patch.object(mod, "_check_api_server", return_value=True), \
+             patch.object(mod, "_chat_runtime_status", return_value=runtime_status_stub()), \
+             patch.object(mod, "_image_attachment_support_status", return_value=(False, "")), \
+             patch.object(mod, "_call_api_server", side_effect=fake_call_api_server), \
+             patch.object(mod, "_call_hermes_direct", side_effect=AssertionError("CLI should not be used")), \
+             patch.object(mod, "_call_hermes_prompt", side_effect=AssertionError("CLI prompt path should not be used")):
+            created = self.client.post("/api/chat/sessions", json={}, headers=self.headers)
+            self.assertEqual(created.status_code, 200, created.data)
+            session_id = created.get_json()["session_id"]
+
+            first = self.client.post(
+                "/api/chat",
+                json={"message": "hello default", "session_id": session_id, "transport_preference": "api"},
+                headers=self.headers,
+            )
+            self.assertEqual(first.status_code, 200, first.data)
+
+            switched = self.client.put(
+                f"/api/chat/sessions/{session_id}/profile",
+                json={"profile": "leire"},
+                headers=self.headers,
+            )
+            self.assertEqual(switched.status_code, 200, switched.data)
+
+            second = self.client.post(
+                "/api/chat",
+                json={"message": "hello leire", "session_id": session_id, "transport_preference": "api"},
+                headers=self.headers,
+            )
+            self.assertEqual(second.status_code, 200, second.data)
+
+            self.assertEqual(len(captured_requests), 2)
+            self.assertEqual([entry["content"] for entry in captured_requests[0]["messages"]], ["hello default"])
+            self.assertEqual([entry["content"] for entry in captured_requests[1]["messages"]], ["hello leire"])
+            self.assertEqual(captured_requests[1]["profile"], "leire")
+            self.assertEqual(second.get_json()["session"]["profile"], "leire")
+
+    def test_api_replay_does_not_inherit_image_history_across_segments(self):
+        hermes_root = Path(self.tmpdir.name) / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        profiles_dir.mkdir(parents=True)
+        (profiles_dir / "leire").mkdir()
+        state_path = Path(self.tmpdir.name) / "webui_profile"
+        image_path = mod.UPLOAD_FOLDER / "shot.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nstub")
+        captured_requests = []
+
+        def fake_call_api_server(session, messages, sid, files=None, prefer_vision=False, file_display_names=None):
+            captured_requests.append({
+                "profile": mod._selected_hermes_profile_name(),
+                "messages": copy.deepcopy(messages),
+                "prefer_vision": prefer_vision,
+                "files": [path.name for path in (files or [])],
+            })
+            return f"api:{mod._selected_hermes_profile_name()}"
+
+        with patch.object(mod, "HERMES_HOME", hermes_root), \
+             patch.object(mod, "CONFIG_PATH", hermes_root / "config.yaml"), \
+             patch.object(mod, "ENV_PATH", hermes_root / ".env"), \
+             patch.object(mod, "SKILLS_DIR", hermes_root / "skills"), \
+             patch.object(mod, "SESSIONS_DIR", hermes_root / "sessions"), \
+             patch.object(mod, "BACKUP_DIR", hermes_root / "backups"), \
+             patch.object(mod, "HERMES_PROFILES_DIR", profiles_dir), \
+             patch.object(mod, "WEBUI_PROFILE_STATE_PATH", state_path), \
+               patch.object(mod, "_current_webui_token", return_value="test-token"), \
+             patch.object(mod, "_check_api_server", return_value=True), \
+             patch.object(mod, "_chat_runtime_status", return_value=runtime_status_stub()), \
+             patch.object(mod, "_image_attachment_support_status", return_value=(True, "")), \
+             patch.object(mod, "_call_api_server", side_effect=fake_call_api_server), \
+             patch.object(mod, "_call_hermes_direct", side_effect=AssertionError("CLI should not be used")), \
+             patch.object(mod, "_call_hermes_prompt", side_effect=AssertionError("CLI prompt path should not be used")):
+            created = self.client.post("/api/chat/sessions", json={}, headers=self.headers)
+            self.assertEqual(created.status_code, 200, created.data)
+            session_id = created.get_json()["session_id"]
+
+            first = self.client.post(
+                "/api/chat",
+                json={"message": "describe image", "session_id": session_id, "transport_preference": "api", "files": [image_path.name]},
+                headers=self.headers,
+            )
+            self.assertEqual(first.status_code, 200, first.data)
+
+            switched = self.client.put(
+                f"/api/chat/sessions/{session_id}/profile",
+                json={"profile": "leire"},
+                headers=self.headers,
+            )
+            self.assertEqual(switched.status_code, 200, switched.data)
+
+            second = self.client.post(
+                "/api/chat",
+                json={"message": "plain text leire", "session_id": session_id, "transport_preference": "api"},
+                headers=self.headers,
+            )
+            self.assertEqual(second.status_code, 200, second.data)
+
+            self.assertEqual(len(captured_requests), 2)
+            self.assertTrue(captured_requests[0]["prefer_vision"])
+            self.assertFalse(captured_requests[1]["prefer_vision"])
+            self.assertEqual([entry["content"] for entry in captured_requests[1]["messages"]], ["plain text leire"])
+
     def test_auto_transport_preference_is_not_sticky_to_last_transport(self):
         with patch.object(mod, "_check_api_server", return_value=True), \
              patch.object(mod, "_chat_runtime_status", return_value=runtime_status_stub()), \
@@ -1256,6 +1962,22 @@ Sidecar output:
         self.assertEqual(data["roles"]["primary"]["profile"], "openrouter")
         self.assertEqual(data["roles"]["vision"]["profile"], "openrouter")
 
+    def test_model_roles_preserve_declared_custom_provider_name_for_implicit_profile(self):
+        mod.cfg._config = {
+            "model": {
+                "provider": "custom",
+                "default": "qwen3.5:cloud",
+                "base_url": "https://ollama.com/v1",
+            }
+        }
+
+        resp = self.client.get("/api/model-roles", headers=self.headers)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        data = resp.get_json()
+        profiles = data["profiles"]
+        self.assertTrue(any(profile["name"] == "custom" for profile in profiles))
+        self.assertEqual(data["roles"]["primary"]["profile"], "custom")
+
     def test_resolve_api_target_defaults_known_provider_base_url(self):
         with patch.dict(mod.os.environ, {"OPENROUTER_API_KEY": "router-secret"}, clear=True):
             mod.cfg._config = {
@@ -1269,6 +1991,37 @@ Sidecar output:
         self.assertEqual(target["provider"], "openrouter")
         self.assertEqual(target["base_url"], "https://openrouter.ai/api/v1")
         self.assertEqual(target["api_key"], "router-secret")
+
+    def test_chat_completion_request_uses_resolved_target_base_url_and_api_key(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["authorization"] = req.headers.get("Authorization")
+            captured["content_type"] = req.headers.get("Content-type")
+            captured["timeout"] = timeout
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return FakeHTTPResponse({
+                "choices": [{"message": {"content": "vision ok"}}],
+            })
+
+        target = {
+            "model": "vision-model",
+            "provider": "custom",
+            "base_url": "https://vision.example.test/v1",
+            "api_key": "vision-secret",
+        }
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            result = mod._chat_completion_request(target, [{"role": "user", "content": "hello"}])
+
+        self.assertEqual(result, "vision ok")
+        self.assertEqual(captured["url"], "https://vision.example.test/v1/chat/completions")
+        self.assertEqual(captured["authorization"], "Bearer vision-secret")
+        self.assertEqual(captured["content_type"], "application/json")
+        self.assertEqual(captured["timeout"], mod.CHAT_REQUEST_TIMEOUT)
+        self.assertEqual(captured["payload"]["model"], "vision-model")
+        self.assertEqual(captured["payload"]["messages"], [{"role": "user", "content": "hello"}])
 
     def test_frontend_source_does_not_contain_python_unicode_escapes(self):
         source = (Path(mod.APP_ROOT) / "static" / "app.js").read_text(encoding="utf-8")

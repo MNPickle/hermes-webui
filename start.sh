@@ -8,19 +8,70 @@ PORT="${1:-${PORT:-5000}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="${APP_DIR:-$SCRIPT_DIR}"
 
+wait_for_http_ready() {
+    local max_attempts="${1:-15}"
+    local attempt=1
+
+    while [ "$attempt" -le "$max_attempts" ]; do
+        if curl -fsS "http://127.0.0.1:$PORT/" > /dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+
+    return 1
+}
+
+port_listener_pids() {
+    ss -ltnp 2>/dev/null \
+        | awk -v port=":$PORT" '$4 ~ port { print }' \
+        | grep -o 'pid=[0-9]\+' \
+        | cut -d= -f2 \
+        | sort -u
+}
+
+webui_listener_pids() {
+    local pid
+    for pid in $(port_listener_pids); do
+        if ps -p "$pid" -o args= 2>/dev/null | grep -Eq "$APP_DIR|gunicorn|flask"; then
+            echo "$pid"
+        fi
+    done | sort -u
+}
+
+stop_pids() {
+    local pids="$1"
+    [ -n "$pids" ] || return 0
+
+    echo "  Stopping stale Web UI process(es): $pids"
+    kill $pids 2>/dev/null || true
+
+    local attempt=1
+    while [ "$attempt" -le 10 ]; do
+        if [ -z "$(port_listener_pids)" ]; then
+            return 0
+        fi
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+
+    kill -9 $pids 2>/dev/null || true
+}
+
 detect_webui_venv() {
     local candidate
     if [ -n "${WEBUI_VENV:-}" ]; then
         echo "$WEBUI_VENV"
         return
     fi
-    for candidate in "$APP_DIR/.venv" "$HOME/.hermes/.venv"; do
+    for candidate in "$APP_DIR/venv" "$HOME/.hermes/hermes-agent/venv"; do
         if [ -x "$candidate/bin/python" ]; then
             echo "$candidate"
             return
         fi
     done
-    echo "$APP_DIR/.venv"
+    echo "$APP_DIR/venv"
 }
 
 WEBUI_VENV="$(detect_webui_venv)"
@@ -59,6 +110,28 @@ if curl -s "http://127.0.0.1:$PORT/" > /dev/null 2>&1; then
     exit 0
 fi
 
+LISTENER_PIDS="$(port_listener_pids)"
+WEBUI_LISTENER_PIDS="$(webui_listener_pids)"
+
+if [ -n "$LISTENER_PIDS" ]; then
+    if [ -n "$WEBUI_LISTENER_PIDS" ]; then
+        echo "  Existing Web UI process is holding port $PORT but is not ready yet"
+        echo "  Waiting briefly before deciding whether to replace it..."
+        if wait_for_http_ready 10; then
+            echo "  Web UI became ready on port $PORT"
+            echo "  Open http://127.0.0.1:$PORT in your browser"
+            echo "=========================================="
+            exit 0
+        fi
+        stop_pids "$WEBUI_LISTENER_PIDS"
+    else
+        echo "  Port $PORT is already in use by another process: $LISTENER_PIDS"
+        echo "  Refusing to start a second Web UI on top of it."
+        echo "=========================================="
+        exit 1
+    fi
+fi
+
 # Export repo .env for child processes launched by this script.
 # app.py also loads the same file on import, so direct gunicorn stays consistent.
 if [ -f "$APP_DIR/.env" ]; then
@@ -79,7 +152,7 @@ else
     CHAT_TIMEOUT="${HERMES_CHAT_TIMEOUT:-300}"
     GUNICORN_TIMEOUT_HEADROOM="${GUNICORN_TIMEOUT_HEADROOM:-90}"
     GUNICORN_TIMEOUT="${GUNICORN_TIMEOUT:-$((CHAT_TIMEOUT + GUNICORN_TIMEOUT_HEADROOM))}"
-    GUNICORN_WORKERS="${GUNICORN_WORKERS:-2}"
+    GUNICORN_WORKERS="${GUNICORN_WORKERS:-4}"
     GUNICORN_GRACEFUL_TIMEOUT="${GUNICORN_GRACEFUL_TIMEOUT:-30}"
     GUNICORN_KEEPALIVE="${GUNICORN_KEEPALIVE:-10}"
     GUNICORN_MAX_REQUESTS="${GUNICORN_MAX_REQUESTS:-200}"

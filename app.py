@@ -20,10 +20,12 @@ import time
 import logging
 import tempfile
 import threading
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from functools import wraps
 from contextlib import contextmanager
+from urllib.parse import urlparse
 
 import yaml
 from dotenv import dotenv_values, load_dotenv, set_key, unset_key
@@ -47,6 +49,7 @@ logger = logging.getLogger('hermes-webui')
 # Paths
 # ---------------------------------------------------------------------------
 APP_ROOT = Path(__file__).resolve().parent
+PROFILE_OVERRIDE = ContextVar("PROFILE_OVERRIDE", default="")
 
 
 def _load_runtime_env() -> Path:
@@ -73,9 +76,10 @@ def _repo_env_values() -> dict:
 
 
 def _hermes_env_values() -> dict:
-    if ENV_PATH.exists():
+    env_path = _selected_env_path() if "_selected_env_path" in globals() else ENV_PATH
+    if env_path.exists():
         return {
-            key: value for key, value in dotenv_values(str(ENV_PATH)).items()
+            key: value for key, value in dotenv_values(str(env_path)).items()
             if value is not None
         }
     return {}
@@ -112,11 +116,288 @@ def _runtime_env_source(key: str, allow_repo_env: bool = True) -> str:
             return "hermes_env"
     return ""
 
+
+def _resolve_runtime_template(value: str) -> str:
+    raw_value = str(value or "")
+    if not raw_value:
+        return ""
+
+    def replace_env(match: re.Match[str]) -> str:
+        env_key = str(match.group(1) or "").strip()
+        return _runtime_env_value(env_key, "") if env_key else ""
+
+    return re.sub(r"\$\{([A-Z0-9_]+)\}", replace_env, raw_value)
+
+
+def _effective_hermes_api_url(default: str = "http://127.0.0.1:8642") -> str:
+    explicit = _runtime_env_value("HERMES_API_URL", "").strip()
+    if explicit:
+        return explicit
+
+    host = _runtime_env_value("API_SERVER_HOST", "").strip() or "127.0.0.1"
+    port = _runtime_env_value("API_SERVER_PORT", "").strip()
+    if not port:
+        return default
+    if host in ("0.0.0.0", "::", "[::]"):
+        host = "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{port}"
+
 HERMES_HOME = Path.home() / ".hermes"
 HERMES_REPO_DIR = HERMES_HOME / "hermes-agent"
 CONFIG_PATH = HERMES_HOME / "config.yaml"
 ENV_PATH = HERMES_HOME / ".env"
 SKILLS_DIR = HERMES_HOME / "skills"
+HERMES_PROFILES_DIR = HERMES_HOME / "profiles"
+WEBUI_PROFILE_STATE_PATH = APP_ROOT / "run" / "webui_profile"
+
+
+def _normalize_hermes_profile_name(name: str | None) -> str:
+    normalized = str(name or "").strip()
+    return normalized or "default"
+
+
+def _root_active_profile_name() -> str:
+    active_profile_path = HERMES_HOME / "active_profile"
+    try:
+        return _normalize_hermes_profile_name(active_profile_path.read_text(encoding="utf-8").strip())
+    except Exception:
+        return "default"
+
+
+def _available_hermes_profile_names() -> list[str]:
+    names = ["default"]
+    try:
+        if HERMES_PROFILES_DIR.exists():
+            names.extend(
+                sorted(
+                    entry.name
+                    for entry in HERMES_PROFILES_DIR.iterdir()
+                    if entry.is_dir() and entry.name.strip()
+                )
+            )
+    except Exception:
+        pass
+    deduped = []
+    for name in names:
+        normalized = _normalize_hermes_profile_name(name)
+        if normalized not in deduped:
+            deduped.append(normalized)
+    return deduped
+
+
+def _profile_home(profile_name: str | None = None) -> Path:
+    normalized = _normalize_hermes_profile_name(profile_name)
+    if normalized == "default":
+        return HERMES_HOME
+    return HERMES_PROFILES_DIR / normalized
+
+
+def _selected_hermes_profile_name() -> str:
+    override_raw = str(PROFILE_OVERRIDE.get() or "").strip()
+    if override_raw:
+        override = _normalize_hermes_profile_name(override_raw)
+        if override in _available_hermes_profile_names():
+            return override
+    try:
+        if WEBUI_PROFILE_STATE_PATH.exists():
+            stored = _normalize_hermes_profile_name(WEBUI_PROFILE_STATE_PATH.read_text(encoding="utf-8").strip())
+            if stored in _available_hermes_profile_names():
+                return stored
+    except Exception:
+        pass
+    fallback = _root_active_profile_name()
+    if fallback in _available_hermes_profile_names():
+        return fallback
+    return "default"
+
+
+def _set_selected_hermes_profile_name(profile_name: str) -> str:
+    normalized = _normalize_hermes_profile_name(profile_name)
+    available = _available_hermes_profile_names()
+    if normalized not in available:
+        raise ValueError(f"Unknown Hermes profile: {normalized}")
+    WEBUI_PROFILE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    WEBUI_PROFILE_STATE_PATH.write_text(normalized, encoding="utf-8")
+    return normalized
+
+
+@contextmanager
+def _scoped_profile_override(profile_name: str | None):
+    raw_profile = str(profile_name or "").strip()
+    normalized = _normalize_hermes_profile_name(raw_profile) if raw_profile else ""
+    if normalized and normalized not in _available_hermes_profile_names():
+        normalized = ""
+    token = PROFILE_OVERRIDE.set(normalized)
+    try:
+        yield normalized or _selected_hermes_profile_name()
+    finally:
+        PROFILE_OVERRIDE.reset(token)
+
+
+def _selected_hermes_home() -> Path:
+    if _selected_hermes_profile_name() == "default":
+        return HERMES_HOME
+    return _profile_home(_selected_hermes_profile_name())
+
+
+def _selected_config_path() -> Path:
+    if _selected_hermes_profile_name() == "default":
+        return CONFIG_PATH
+    return _selected_hermes_home() / "config.yaml"
+
+
+def _selected_env_path() -> Path:
+    if _selected_hermes_profile_name() == "default":
+        return ENV_PATH
+    return _selected_hermes_home() / ".env"
+
+
+def _env_path_for_profile(profile_name: str | None = None) -> Path:
+    normalized = _normalize_hermes_profile_name(profile_name)
+    if normalized == "default":
+        return ENV_PATH
+    return _profile_home(normalized) / ".env"
+
+
+def _api_url_port(api_url: str | None) -> str:
+    raw = str(api_url or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    try:
+        if parsed.port:
+            return str(parsed.port)
+    except ValueError:
+        return ""
+    if parsed.scheme == "https":
+        return "443"
+    if parsed.scheme == "http":
+        return "80"
+    return ""
+
+
+def _api_token_repo_keys_for_port(port: str | None) -> list[str]:
+    normalized = str(port or "").strip()
+    if not normalized:
+        return ["HERMES_API_TOKEN", "HERMES_API_KEY", "API_SERVER_TOKEN", "API_SERVER_KEY"]
+    return [
+        f"HERMES_API_TOKEN_PORT_{normalized}",
+        f"HERMES_API_KEY_PORT_{normalized}",
+        f"API_SERVER_TOKEN_PORT_{normalized}",
+        f"API_SERVER_KEY_PORT_{normalized}",
+        "HERMES_API_TOKEN",
+        "HERMES_API_KEY",
+        "API_SERVER_TOKEN",
+        "API_SERVER_KEY",
+    ]
+
+
+def _profile_api_gateway_url(profile_name: str | None = None) -> str:
+    # When no explicit profile is given, preserve the currently active
+    # PROFILE_OVERRIDE so that nested calls don't accidentally clear it.
+    effective = profile_name if profile_name is not None else (PROFILE_OVERRIDE.get("") or None)
+    with _scoped_profile_override(effective):
+        hermes_env = _hermes_env_values()
+        explicit = str(hermes_env.get("HERMES_API_URL") or "").strip()
+        if explicit:
+            return explicit
+        host = str(hermes_env.get("API_SERVER_HOST") or "").strip() or "127.0.0.1"
+        port = str(hermes_env.get("API_SERVER_PORT") or "").strip()
+        if port:
+            if host in ("0.0.0.0", "::", "[::]"):
+                host = "127.0.0.1"
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            return f"http://{host}:{port}"
+    return _effective_hermes_api_url(DEFAULT_HERMES_API_URL)
+
+
+def _profile_primary_api_url(profile_name: str | None = None) -> str:
+    with _scoped_profile_override(profile_name):
+        target = _resolve_api_target(prefer_vision=False) or {}
+        target_url = str(target.get("base_url") or "").strip()
+        if target_url:
+            return target_url
+    return _profile_api_gateway_url(profile_name)
+
+
+def _selected_skills_dir() -> Path:
+    if _selected_hermes_profile_name() == "default":
+        return SKILLS_DIR
+    return _selected_hermes_home() / "skills"
+
+
+def _selected_sessions_dir() -> Path:
+    if _selected_hermes_profile_name() == "default":
+        return SESSIONS_DIR
+    return _selected_hermes_home() / "sessions"
+
+
+def _selected_backup_dir() -> Path:
+    if _selected_hermes_profile_name() == "default":
+        return BACKUP_DIR
+    return _selected_hermes_home() / "backups"
+
+
+def _selected_gateway_pid_path() -> Path:
+    return _selected_hermes_home() / "gateway.pid"
+
+
+def _selected_gateway_log_path() -> Path:
+    return _selected_hermes_home() / "logs" / "gateway.log"
+
+
+def _selected_hermes_profile_payload() -> dict:
+    selected = _selected_hermes_profile_name()
+    root_active = _root_active_profile_name()
+    return {
+        "selected": selected,
+        "profiles": [
+            {
+                "name": name,
+                "home": str(_profile_home(name)),
+                "is_default": name == "default",
+                "is_root_active": name == root_active,
+            }
+            for name in _available_hermes_profile_names()
+        ],
+        "paths": {
+            "home": str(_selected_hermes_home()),
+            "config": str(_selected_config_path()),
+            "env": str(_selected_env_path()),
+            "skills": str(_selected_skills_dir()),
+            "sessions": str(_selected_sessions_dir()),
+        },
+    }
+
+
+def _profile_api_token_metadata(profile_name: str | None = None) -> dict:
+    normalized = _normalize_hermes_profile_name(profile_name)
+    if normalized not in _available_hermes_profile_names():
+        raise ValueError(f"Unknown Hermes profile: {normalized}")
+    api_url = _profile_api_gateway_url(normalized)
+    port = _api_url_port(api_url)
+    env_path = REPO_ENV_PATH
+    raw = _repo_env_values()
+    token_key = ""
+    token_value = ""
+    for key in _api_token_repo_keys_for_port(port):
+        value = str(raw.get(key) or "").strip()
+        if value:
+            token_key = key
+            token_value = value
+            break
+    return {
+        "profile": normalized,
+        "api_url": api_url,
+        "api_port": port,
+        "env_path": str(env_path),
+        "token_key": token_key,
+        "has_token": bool(token_value),
+        "masked_token": _mask_value(token_key or "HERMES_API_TOKEN", token_value) if token_value else "",
+    }
 
 # Hermes executable - try current install locations with fallback
 def _find_hermes_bin():
@@ -151,7 +432,8 @@ MAX_REQUEST_BODY_SIZE = max(
 )
 REQUEST_LOG_SLOW_MS = max(250, int(_runtime_env_value("HERMES_WEBUI_SLOW_REQUEST_MS", "1500")))
 UPLOAD_STREAM_CHUNK_SIZE = 1024 * 1024
-HERMES_API_URL = _runtime_env_value("HERMES_API_URL", "http://127.0.0.1:8642")
+DEFAULT_HERMES_API_URL = "http://127.0.0.1:8642"
+HERMES_API_URL = _effective_hermes_api_url(DEFAULT_HERMES_API_URL)
 BACKUP_DIR = HERMES_HOME / "backups"
 
 # Chat session storage (persisted to disk)
@@ -162,6 +444,7 @@ CHAT_FOLDERS_PATH = CHAT_DATA_DIR / ".folders.json"
 CHAT_REQUEST_DIR = APP_ROOT / "run" / "chat_requests"
 CHAT_REQUEST_DIR.mkdir(parents=True, exist_ok=True)
 CHAT_REQUEST_TIMEOUT = int(_runtime_env_value("HERMES_CHAT_TIMEOUT", "300"))
+CHAT_PERSIST_DEBUG_TRACE = _runtime_env_value("HERMES_WEBUI_PERSIST_DEBUG_TRACE", "0").strip().lower() not in {"", "0", "false", "no", "off"}
 CHAT_SERVER_TIMEOUT = int(
     _runtime_env_value(
         "GUNICORN_TIMEOUT",
@@ -684,16 +967,177 @@ def _normalize_chat_session(session: dict) -> dict:
     folder_id = session.get("folder_id")
     if not isinstance(folder_id, str):
         folder_id = ""
+    profile_name = _normalize_hermes_profile_name(session.get("profile"))
+    if not profile_name:
+        profile_name = _selected_hermes_profile_name()
     session["transport_mode"] = transport_mode
     session["transport_preference"] = transport_preference
     session["continuity_mode"] = continuity_mode
     session.setdefault("transport_notice", "")
     session["messages"] = _normalize_chat_messages(session.get("messages"))
     session["vision_assets"] = _normalize_vision_assets(session.get("vision_assets"))
+    session["segments"] = _normalize_chat_segments(session, profile_name)
+    active_segment = _active_chat_segment(session)
+    session["profile"] = (active_segment or {}).get("profile") or profile_name
+    session["hermes_session_id"] = _segment_hermes_session_id(active_segment)
     session["folder_id"] = folder_id.strip()
     session["workspace_roots"] = _clean_string_list(session.get("workspace_roots"))
     session["source_docs"] = _clean_string_list(session.get("source_docs"))
+    segment_map = {segment["id"]: segment for segment in session.get("segments") or []}
+    default_segment = active_segment or ((session.get("segments") or [None])[0])
+    for index, entry in enumerate(session["messages"]):
+        segment = segment_map.get(str(entry.get("segment_id") or "").strip())
+        if not segment:
+            segment = default_segment
+            for candidate in session.get("segments") or []:
+                if index >= int(candidate.get("start_message_index") or 0):
+                    segment = candidate
+            if segment:
+                entry["segment_id"] = segment["id"]
+        if segment:
+            entry["segment_index"] = int(segment.get("index") or 1)
+            entry["profile"] = _normalize_hermes_profile_name(entry.get("profile")) or segment.get("profile") or session["profile"]
+            transport = str(entry.get("transport") or "").strip().lower()
+            if transport not in (CHAT_TRANSPORT_CLI, CHAT_TRANSPORT_API):
+                transport = str(segment.get("transport") or session.get("transport_mode") or "").strip().lower()
+            if transport in (CHAT_TRANSPORT_CLI, CHAT_TRANSPORT_API):
+                entry["transport"] = transport
     return session
+
+
+def _clean_hermes_session_id(value) -> str | None:
+    normalized = str(value or "").strip()
+    return normalized or None
+
+
+def _normalize_chat_segments(session: dict, fallback_profile: str | None = None) -> list[dict]:
+    raw_segments = session.get("segments")
+    normalized = []
+    base_profile = _normalize_hermes_profile_name(fallback_profile or session.get("profile")) or _selected_hermes_profile_name()
+    base_transport = str(session.get("transport_mode") or "").strip().lower()
+    legacy_hermes_session_id = _clean_hermes_session_id(session.get("hermes_session_id"))
+    raw_active_segment_id = str(session.get("active_segment_id") or "").strip()
+    if base_transport not in (CHAT_TRANSPORT_CLI, CHAT_TRANSPORT_API):
+        base_transport = ""
+    if isinstance(raw_segments, list):
+        for item in raw_segments:
+            if not isinstance(item, dict):
+                continue
+            profile = _normalize_hermes_profile_name(item.get("profile")) or base_profile
+            segment_id = str(item.get("id") or f"segment-{len(normalized) + 1}").strip() or f"segment-{len(normalized) + 1}"
+            transport = str(item.get("transport") or "").strip().lower()
+            if transport not in (CHAT_TRANSPORT_CLI, CHAT_TRANSPORT_API):
+                transport = ""
+            start_message_index = item.get("start_message_index")
+            if not isinstance(start_message_index, int) or start_message_index < 0:
+                start_message_index = 0
+            hermes_session_id = _clean_hermes_session_id(item.get("hermes_session_id"))
+            if not hermes_session_id and segment_id == raw_active_segment_id:
+                hermes_session_id = legacy_hermes_session_id
+            normalized.append({
+                "id": segment_id,
+                "index": len(normalized) + 1,
+                "profile": profile,
+                "transport": transport,
+                "hermes_session_id": hermes_session_id,
+                "started_at": str(item.get("started_at") or session.get("created") or "").strip(),
+                "start_message_index": start_message_index,
+            })
+    if not normalized:
+        normalized = [{
+            "id": "segment-1",
+            "index": 1,
+            "profile": base_profile,
+            "transport": base_transport,
+            "hermes_session_id": legacy_hermes_session_id,
+            "started_at": str(session.get("created") or "").strip(),
+            "start_message_index": 0,
+        }]
+    active_segment_id = str(session.get("active_segment_id") or "").strip()
+    if not any(segment["id"] == active_segment_id for segment in normalized):
+        active_segment_id = normalized[-1]["id"]
+    session["active_segment_id"] = active_segment_id
+    return normalized
+
+
+def _trim_trailing_empty_chat_segments(session: dict) -> bool:
+    segments = session.get("segments") or []
+    if len(segments) <= 1:
+        return False
+    message_count = len(session.get("messages") or [])
+    trimmed = False
+    while len(segments) > 1:
+        last_segment = segments[-1]
+        start_message_index = int(last_segment.get("start_message_index") or 0)
+        if start_message_index < message_count:
+            break
+        segments.pop()
+        trimmed = True
+    if not trimmed:
+        return False
+    for index, segment in enumerate(segments, start=1):
+        segment["index"] = index
+    session["segments"] = segments
+    session["active_segment_id"] = segments[-1].get("id") or ""
+    session["profile"] = segments[-1].get("profile") or session.get("profile")
+    session["hermes_session_id"] = _segment_hermes_session_id(segments[-1])
+    return True
+
+
+def _active_chat_segment(session: dict) -> dict | None:
+    segments = session.get("segments") or []
+    active_segment_id = str(session.get("active_segment_id") or "").strip()
+    for segment in segments:
+        if segment.get("id") == active_segment_id:
+            return segment
+    return segments[-1] if segments else None
+
+
+def _segment_hermes_session_id(segment: dict | None) -> str | None:
+    if not isinstance(segment, dict):
+        return None
+    return _clean_hermes_session_id(segment.get("hermes_session_id"))
+
+
+def _latest_chat_segment_for_profile(session: dict, profile_name: str) -> dict | None:
+    normalized_profile = _normalize_hermes_profile_name(profile_name) or _selected_hermes_profile_name()
+    for segment in reversed(session.get("segments") or []):
+        if _normalize_hermes_profile_name(segment.get("profile")) == normalized_profile:
+            return segment
+    return None
+
+
+def _append_chat_segment(session: dict, profile_name: str, *, transport: str = "") -> dict:
+    normalized_profile = _normalize_hermes_profile_name(profile_name) or _selected_hermes_profile_name()
+    if "segments" not in session:
+        session["segments"] = _normalize_chat_segments(session, normalized_profile)
+    active = _active_chat_segment(session)
+    clean_transport = str(transport or "").strip().lower()
+    if clean_transport not in (CHAT_TRANSPORT_CLI, CHAT_TRANSPORT_API):
+        clean_transport = ""
+    if active and active.get("profile") == normalized_profile:
+        if clean_transport and not active.get("transport"):
+            active["transport"] = clean_transport
+        session["active_segment_id"] = active.get("id")
+        session["profile"] = normalized_profile
+        session["hermes_session_id"] = _segment_hermes_session_id(active)
+        return active
+    previous = _latest_chat_segment_for_profile(session, normalized_profile)
+    next_index = len(session.get("segments") or []) + 1
+    segment = {
+        "id": f"segment-{next_index}",
+        "index": next_index,
+        "profile": normalized_profile,
+        "transport": clean_transport,
+        "hermes_session_id": _segment_hermes_session_id(previous),
+        "started_at": datetime.now().isoformat(),
+        "start_message_index": len(session.get("messages") or []),
+    }
+    session.setdefault("segments", []).append(segment)
+    session["active_segment_id"] = segment["id"]
+    session["profile"] = normalized_profile
+    session["hermes_session_id"] = _segment_hermes_session_id(segment)
+    return segment
 
 
 def _normalize_chat_messages(messages) -> list[dict]:
@@ -1444,6 +1888,54 @@ def _write_request_control(request_id: str, payload: dict) -> None:
     tmp.replace(path)
 
 
+def _request_output_path(request_id: str) -> Path:
+    return CHAT_REQUEST_DIR / f"{secure_filename(request_id)}.log"
+
+
+def _truncate_recent_lines(lines: list[str], limit: int = 24) -> list[str]:
+    cleaned = [str(line).rstrip("\n") for line in (lines or []) if str(line).strip()]
+    if limit <= 0 or len(cleaned) <= limit:
+        return cleaned
+    return cleaned[-limit:]
+
+
+def _request_progress_lines(request_id: str, limit: int = 0) -> list[str]:
+    path = _request_output_path(request_id)
+    if not path.exists():
+        return []
+    try:
+        return _truncate_recent_lines(path.read_text(encoding="utf-8", errors="replace").splitlines(), limit=limit)
+    except Exception:
+        return []
+
+
+def _active_request_for_session(session_id: str) -> dict | None:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None
+    latest = None
+    for path in CHAT_REQUEST_DIR.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if str(payload.get("session_id") or "").strip() != sid:
+            continue
+        status = str(payload.get("status") or "").strip().lower()
+        if status not in {"running", "cancel_requested"}:
+            continue
+        updated_at = str(payload.get("updated_at") or "")
+        if latest is None or updated_at > latest.get("updated_at", ""):
+            latest = {
+                "request_id": str(payload.get("request_id") or "").strip(),
+                "status": status,
+                "cancel_supported": bool(payload.get("cancel_supported")),
+                "transport": str(payload.get("transport") or "").strip(),
+                "updated_at": updated_at,
+            }
+    return latest
+
+
 def _register_chat_request(
     request_id: str,
     session_id: str | None,
@@ -1462,6 +1954,7 @@ def _register_chat_request(
         "pid": None,
         "pgid": None,
         "cancel_requested_at": None,
+        "output_path": str(_request_output_path(request_id)),
     })
 
 
@@ -1669,23 +2162,119 @@ def _current_webui_token() -> str:
 
 HERMES_WEBUI_TOKEN = _current_webui_token()
 
+# --- Cookie-based session auth (login screen) ---
+import secrets as _secrets
+
+_DASHBOARD_USER = os.environ.get("HERMES_DASHBOARD_USER", "admin")
+_DASHBOARD_PASS = os.environ.get("HERMES_DASHBOARD_PASS", "Unaitxo@13")
+_SESSION_TOKEN_TTL = 86400  # 24 hours
+_SESSION_TOKEN_STORE = Path(os.environ.get(
+    "HERMES_WEBUI_TOKEN_STORE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".session_tokens.json"),
+))
+
+
+def _load_session_tokens() -> dict[str, float]:
+    """Load valid session tokens from disk (shared across workers)."""
+    if not _SESSION_TOKEN_STORE.exists():
+        return {}
+    try:
+        data = json.loads(_SESSION_TOKEN_STORE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    now = time.time()
+    return {str(k): float(v) for k, v in data.items()
+            if isinstance(v, (int, float)) and float(v) > now}
+
+
+def _save_session_tokens(tokens: dict[str, float]) -> None:
+    """Persist session tokens to disk."""
+    try:
+        _SESSION_TOKEN_STORE.write_text(json.dumps(tokens), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _register_session_token(token: str, expiry: float) -> None:
+    tokens = _load_session_tokens()
+    tokens[token] = expiry
+    _save_session_tokens(tokens)
+
+
+def _remove_session_token(token: str) -> None:
+    tokens = _load_session_tokens()
+    tokens.pop(token, None)
+    _save_session_tokens(tokens)
+
+
+def _verify_session_cookie() -> bool:
+    token = request.cookies.get("hermes_webui")
+    if not token:
+        return False
+    tokens = _load_session_tokens()
+    expiry = tokens.get(token)
+    if expiry is None or time.time() > expiry:
+        if expiry is not None:
+            _remove_session_token(token)
+        return False
+    return True
+
+
+@app.route("/api/login", methods=["POST"])
+def webui_login():
+    data = request.get_json(silent=True) or {}
+    username = data.get("username", "")
+    password = data.get("password", "")
+    if username == _DASHBOARD_USER and password == _DASHBOARD_PASS:
+        token = _secrets.token_urlsafe(32)
+        _register_session_token(token, time.time() + _SESSION_TOKEN_TTL)
+        resp = jsonify({"ok": True})
+        resp.set_cookie(
+            "hermes_webui", token,
+            httponly=True, samesite="Lax", secure=True, max_age=_SESSION_TOKEN_TTL,
+        )
+        return resp
+    return jsonify({"ok": False, "error": "Invalid credentials"}), 401
+
+
+@app.route("/api/auth/check", methods=["GET"])
+def webui_auth_check():
+    if _verify_session_cookie():
+        return jsonify({"authenticated": True})
+    return jsonify({"authenticated": False}), 401
+
+
+@app.route("/api/logout", methods=["POST"])
+def webui_logout():
+    token = request.cookies.get("hermes_webui")
+    if token:
+        _remove_session_token(token)
+    resp = jsonify({"ok": True})
+    resp.delete_cookie("hermes_webui")
+    return resp
+
+
 def require_token(f):
-    """Decorator to require HERMES_WEBUI_TOKEN for API endpoints."""
+    """Decorator to require authentication for API endpoints.
+    Accepts either a session cookie (login screen) or Bearer token (legacy)."""
     @wraps(f)
     def decorated_function(*args, **kwargs):
+        # 1. Check session cookie first (login screen flow)
+        if _verify_session_cookie():
+            return f(*args, **kwargs)
+
+        # 2. Fall back to Bearer token (legacy/API flow)
         expected_token = _current_webui_token()
         if not expected_token:
             logger.warning("Authentication not configured - rejecting API request")
-            # Fail closed: if no token is configured, deny access
             return jsonify({"ok": False, "error": "API authentication not configured"}), 401
         
-        # Check Authorization header for Bearer token
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             logger.warning("API request missing Authorization header from %s", request.remote_addr)
             return jsonify({"ok": False, "error": "Missing or invalid Authorization header"}), 401
         
-        provided_token = auth_header[7:]  # Remove "Bearer " prefix
+        provided_token = auth_header[7:]
         if provided_token != expected_token:
             logger.warning("API authentication failed - invalid token from %s", request.remote_addr)
             return jsonify({"ok": False, "error": "Invalid token"}), 401
@@ -1762,8 +2351,9 @@ class ConfigManager:
             object.__setattr__(self, "_config_mtime_ns", self._config_file_mtime_ns())
 
     def _config_file_mtime_ns(self):
+        config_path = _selected_config_path()
         try:
-            return CONFIG_PATH.stat().st_mtime_ns
+            return config_path.stat().st_mtime_ns
         except FileNotFoundError:
             return None
         except OSError:
@@ -1789,9 +2379,10 @@ class ConfigManager:
     # -- loading ----------------------------------------------------------
     def load(self):
         """Read config.yaml from disk (or return empty dict)."""
-        if CONFIG_PATH.exists():
+        config_path = _selected_config_path()
+        if config_path.exists():
             try:
-                with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+                with open(config_path, "r", encoding="utf-8") as fh:
                     self._replace_config_from_disk(yaml.safe_load(fh) or {})
             except Exception as exc:
                 self._replace_config_from_disk({})
@@ -1802,13 +2393,15 @@ class ConfigManager:
     # -- saving -----------------------------------------------------------
     def save(self):
         """Write config to disk, creating a timestamped backup first."""
-        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        config_path = _selected_config_path()
+        backup_dir = _selected_backup_dir()
+        backup_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup = BACKUP_DIR / f"config_{ts}.yaml"
-        if CONFIG_PATH.exists():
-            shutil.copy2(CONFIG_PATH, backup)
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
+        backup = backup_dir / f"config_{ts}.yaml"
+        if config_path.exists():
+            shutil.copy2(config_path, backup)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path, "w", encoding="utf-8") as fh:
             yaml.dump(
                 self._config,
                 fh,
@@ -2027,14 +2620,16 @@ def _raw_role_profile_candidate(role: str, *, model_cfg: dict | None = None, raw
     model_cfg = model_cfg if model_cfg is not None else _normalized_model_config()
     if role == "primary":
         explicit_profile = str(model_cfg.get("default_profile") or "").strip()
-        provider = _normalize_provider_type(model_cfg.get("default_provider", ""))
+        declared_provider = str(model_cfg.get("default_provider") or "").strip()
+        provider = _normalize_provider_type(declared_provider)
         model = str(model_cfg.get("default_model") or "").strip()
         base_url = str(model_cfg.get("base_url") or _provider_default_base_url(provider) or "").strip()
         api_key = str(model_cfg.get("api_key") or "").strip()
         routing_provider = _role_routing_provider("primary", model_cfg=model_cfg)
     elif role == "fallback":
         explicit_profile = str(model_cfg.get("fallback_profile") or "").strip()
-        provider = _normalize_provider_type(model_cfg.get("fallback_provider", ""))
+        declared_provider = str(model_cfg.get("fallback_provider") or "").strip()
+        provider = _normalize_provider_type(declared_provider)
         model = str(model_cfg.get("fallback_model") or "").strip()
         base_url = str(model_cfg.get("fallback_base_url") or _provider_default_base_url(provider) or "").strip()
         api_key = str(model_cfg.get("fallback_api_key") or "").strip()
@@ -2043,14 +2638,16 @@ def _raw_role_profile_candidate(role: str, *, model_cfg: dict | None = None, raw
         vision_cfg = model_cfg.get("vision")
         if isinstance(vision_cfg, str):
             explicit_profile = ""
-            provider = _normalize_provider_type(model_cfg.get("default_provider", ""))
+            declared_provider = str(model_cfg.get("default_provider") or "").strip()
+            provider = _normalize_provider_type(declared_provider)
             model = vision_cfg.strip()
             base_url = str(model_cfg.get("base_url") or _provider_default_base_url(provider) or "").strip()
             api_key = str(model_cfg.get("api_key") or "").strip()
             routing_provider = ""
         elif isinstance(vision_cfg, dict):
             explicit_profile = str(vision_cfg.get("profile") or "").strip()
-            provider = _normalize_provider_type(vision_cfg.get("provider", ""), base_url=vision_cfg.get("base_url", ""))
+            declared_provider = str(vision_cfg.get("provider") or "").strip()
+            provider = _normalize_provider_type(declared_provider, base_url=vision_cfg.get("base_url", ""))
             model = str(vision_cfg.get("model") or "").strip()
             base_url = str(vision_cfg.get("base_url") or _provider_default_base_url(provider) or "").strip()
             api_key = str(vision_cfg.get("api_key") or "").strip()
@@ -2064,7 +2661,7 @@ def _raw_role_profile_candidate(role: str, *, model_cfg: dict | None = None, raw
         return None
     if not explicit_profile and provider in ("", "auto") and not any((model, base_url, api_key)):
         return None
-    name = explicit_profile or provider or role
+    name = explicit_profile or declared_provider or provider or role
     return _normalize_provider_profile({
         "name": name,
         "provider": provider,
@@ -2189,8 +2786,13 @@ def _resolve_role_target(role: str) -> dict:
         model_cfg.get("default_provider", ""),
         base_url=model_cfg.get("base_url", ""),
     )
+    # The web UI is a gateway *client* — resolve the gateway URL from the
+    # active profile's API_SERVER_PORT (handles multi-gateway setups like
+    # default:8642 / leire:8644).  Falls back to model.base_url only when
+    # no gateway port is configured for the profile.
+    _gateway_url = _profile_api_gateway_url()
     default_target = {
-        "base_url": (model_cfg.get("base_url") or _provider_default_base_url(default_provider) or _runtime_env_value("HERMES_API_URL", "") or HERMES_API_URL or "").strip(),
+        "base_url": (_gateway_url or model_cfg.get("base_url") or _provider_default_base_url(default_provider) or _effective_hermes_api_url("") or DEFAULT_HERMES_API_URL).strip(),
         "api_key": str(model_cfg.get("api_key") or "").strip(),
         "model": str(model_cfg.get("default_model") or "").strip(),
         "provider": default_provider,
@@ -2201,11 +2803,15 @@ def _resolve_role_target(role: str) -> dict:
     primary_profile = _get_provider_profile(default_target.get("profile"), raw)
     if primary_profile:
         default_target["provider"] = primary_profile.get("provider") or default_target["provider"]
-        default_target["base_url"] = primary_profile.get("base_url") or default_target["base_url"]
+        # Only apply primary_profile base_url when no gateway URL was resolved
+        # — the web UI must route through the local gateway, not the upstream LLM.
+        if not _gateway_url:
+            default_target["base_url"] = primary_profile.get("base_url") or default_target["base_url"]
         if primary_profile.get("api_key"):
             default_target["api_key"] = primary_profile.get("api_key")
         if not default_target["model"]:
             default_target["model"] = primary_profile.get("model") or default_target["model"]
+    default_target["base_url"] = _resolve_runtime_template(default_target.get("base_url") or "").strip()
     default_target["api_key"] = _resolved_target_api_key(default_target)
 
     if role == "primary":
@@ -2232,6 +2838,7 @@ def _resolve_role_target(role: str) -> dict:
                 fallback_target["api_key"] = fallback_profile.get("api_key")
             if not fallback_target["model"]:
                 fallback_target["model"] = fallback_profile.get("model") or fallback_target["model"]
+        fallback_target["base_url"] = _resolve_runtime_template(fallback_target.get("base_url") or "").strip()
         fallback_target["api_key"] = _resolved_target_api_key(fallback_target)
         return fallback_target
 
@@ -2256,6 +2863,7 @@ def _resolve_role_target(role: str) -> dict:
             for key in ("base_url", "api_key", "model", "provider"):
                 if isinstance(vision_cfg.get(key), str) and vision_cfg.get(key).strip():
                     merged[key] = vision_cfg.get(key).strip()
+            merged["base_url"] = _resolve_runtime_template(merged.get("base_url") or "").strip()
             merged["provider"] = _normalize_provider_type(
                 merged.get("provider", ""),
                 base_url=merged.get("base_url", ""),
@@ -3536,7 +4144,7 @@ def _utc_now_z() -> str:
 
 
 def _read_gateway_pid_record() -> dict:
-    pid_file = HERMES_HOME / "gateway.pid"
+    pid_file = _selected_gateway_pid_path()
     if not pid_file.exists():
         return {}
     try:
@@ -3625,7 +4233,7 @@ def _selected_hermes_bin() -> Path:
 
 def _selection_reason_for_candidate(source: str) -> str:
     if source == "active_gateway":
-        return f"Using the live gateway binary recorded in {HERMES_HOME / 'gateway.pid'}."
+        return f"Using the live gateway binary recorded in {_selected_gateway_pid_path()}."
     if source == "env_override":
         return "Using the Hermes binary path from HERMES_WEBUI_HERMES_BIN."
     if source == "env_hint":
@@ -3633,7 +4241,7 @@ def _selection_reason_for_candidate(source: str) -> str:
     if source == "managed_repo":
         return f"Using the repo-managed Hermes install under {HERMES_REPO_DIR}."
     if source == "legacy_home_venv":
-        return f"Using the Hermes venv rooted at {HERMES_HOME}."
+        return f"Using the Hermes venv rooted at {_selected_hermes_home()}."
     if source == "user_local_bin":
         return "Using the Hermes launcher from ~/.local/bin."
     if source == "path_lookup":
@@ -3642,7 +4250,7 @@ def _selection_reason_for_candidate(source: str) -> str:
 
 
 def _run_hermes_with_bin(bin_path: Path, *args, timeout: int = 30, cwd: Path | None = None) -> subprocess.CompletedProcess:
-    env = {**os.environ, "NO_COLOR": "1"}
+    env = {**os.environ, "NO_COLOR": "1", "HERMES_HOME": str(_selected_hermes_home())}
     return subprocess.run(
         [str(bin_path)] + list(args),
         capture_output=True,
@@ -4584,12 +5192,19 @@ def _gateway_status() -> dict:
         status_line = lines[0] if lines else ""
         raw = r.stdout + r.stderr
 
-        running = "✓ Gateway is running" in status_line
+        normalized_status = raw.casefold()
+        running = (
+            "gateway is running" in normalized_status
+            or "gateway service is running" in normalized_status
+            or "user gateway service is running" in normalized_status
+        ) and "not running" not in normalized_status
         pid: int | None = None
         if running:
-            # Extract PID from "✓ Gateway is running (PID: NNNNN)"
+            # Extract PID from either Hermes CLI or systemd output.
             import re
-            m = re.search(r"PID:\s*(\d+)", status_line)
+            m = re.search(r"PID:\s*(\d+)", raw)
+            if not m:
+                m = re.search(r"Main PID:\s*(\d+)", raw)
             if m:
                 pid = int(m.group(1))
 
@@ -4697,8 +5312,9 @@ def api_health():
             "gateway_pid": pid,
             "gateway_running": gs["running"],
             "version": version,
-            "hermes_home": str(HERMES_HOME),
+            "hermes_home": str(_selected_hermes_home()),
             "hermes_bin": str(_selected_hermes_bin()),
+            "profile": _selected_hermes_profile_name(),
         })
     except Exception as exc:
         return _http_error(str(exc))
@@ -4848,6 +5464,68 @@ def api_config_reload():
         return _http_error(str(exc))
 
 
+@app.route("/api/runtime/profiles", methods=["GET"])
+@require_token
+def api_runtime_profiles_get():
+    try:
+        cfg.load()
+        return jsonify(_selected_hermes_profile_payload())
+    except Exception as exc:
+        return _http_error(str(exc))
+
+
+@app.route("/api/runtime/profiles", methods=["PUT"])
+@require_token
+def api_runtime_profiles_put():
+    try:
+        data = request.get_json(force=True) or {}
+        selected = _set_selected_hermes_profile_name(data.get("profile") or "default")
+        cfg.load()
+        return jsonify({"ok": True, **_selected_hermes_profile_payload(), "selected": selected})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        return _http_error(str(exc))
+
+
+@app.route("/api/runtime/profiles/<profile_name>/api-token", methods=["GET"])
+@require_token
+def api_runtime_profile_api_token_get(profile_name):
+    try:
+        return jsonify({"ok": True, **_profile_api_token_metadata(profile_name)})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        return _http_error(str(exc))
+
+
+@app.route("/api/runtime/profiles/<profile_name>/api-token", methods=["PUT"])
+@require_token
+def api_runtime_profile_api_token_put(profile_name):
+    try:
+        normalized = _normalize_hermes_profile_name(profile_name)
+        if normalized not in _available_hermes_profile_names():
+            raise ValueError(f"Unknown Hermes profile: {normalized}")
+        data = request.get_json(force=True) or {}
+        token = str(data.get("token") or "").strip()
+        api_url = _profile_api_gateway_url(normalized)
+        port = _api_url_port(api_url)
+        env_path = REPO_ENV_PATH
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        raw = dotenv_values(str(env_path)) if env_path.exists() else {}
+        for key in _api_token_repo_keys_for_port(port):
+            if raw.get(key) is not None:
+                unset_key(str(env_path), key)
+        if token:
+            key_name = f"HERMES_API_TOKEN_PORT_{port}" if port else "HERMES_API_TOKEN"
+            _set_env_value(env_path, key_name, token)
+        return jsonify({"ok": True, **_profile_api_token_metadata(normalized)})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        return _http_error(str(exc))
+
+
 # ===================================================================
 # 7–9. Environment variables
 # ===================================================================
@@ -4856,7 +5534,8 @@ def api_config_reload():
 @require_token
 def api_env_get():
     try:
-        raw = dotenv_values(str(ENV_PATH)) if ENV_PATH.exists() else {}
+        env_path = _selected_env_path()
+        raw = dotenv_values(str(env_path)) if env_path.exists() else {}
         masked = {k: _mask_value(k, v) for k, v in raw.items() if v is not None}
         skills = _discover_skill_entries()
         dynamic_presets = _skill_env_var_presets(skills)
@@ -4898,8 +5577,9 @@ def api_env_set():
         key, value = data.get("key"), data.get("value")
         if not key:
             return jsonify({"ok": False, "error": "key is required"}), 400
-        ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _set_env_value(ENV_PATH, key, value or "")
+        env_path = _selected_env_path()
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        _set_env_value(env_path, key, value or "")
         return jsonify({"ok": True})
     except Exception as exc:
         return _http_error(str(exc))
@@ -4911,7 +5591,8 @@ def api_env_update(key):
     try:
         data = request.get_json(force=True)
         value = data.get("value", "")
-        current = dotenv_values(str(ENV_PATH)).get(key) if ENV_PATH.exists() else None
+        env_path = _selected_env_path()
+        current = dotenv_values(str(env_path)).get(key) if env_path.exists() else None
         if (
             isinstance(value, str)
             and isinstance(current, str)
@@ -4919,7 +5600,7 @@ def api_env_update(key):
             and value == _mask_value(key, current)
         ):
             return jsonify({"ok": True})
-        _set_env_value(ENV_PATH, key, value)
+        _set_env_value(env_path, key, value)
         return jsonify({"ok": True})
     except Exception as exc:
         return _http_error(str(exc))
@@ -4929,7 +5610,7 @@ def api_env_update(key):
 @require_token
 def api_env_delete(key):
     try:
-        unset_key(str(ENV_PATH), key)
+        unset_key(str(_selected_env_path()), key)
         return jsonify({"ok": True})
     except Exception as exc:
         return _http_error(str(exc))
@@ -5921,11 +6602,11 @@ def api_logs_get():
         # Fallback: read from common log locations
         if not log_text:
             log_candidates = [
-                HERMES_HOME / "logs" / "hermes.log",
-                HERMES_HOME / "logs" / "gateway.log",
-                HERMES_HOME / "logs" / "errors.log",
-                HERMES_HOME / "hermes.log",
-                HERMES_HOME / "gateway.log",
+                _selected_hermes_home() / "logs" / "hermes.log",
+                _selected_hermes_home() / "logs" / "gateway.log",
+                _selected_hermes_home() / "logs" / "errors.log",
+                _selected_hermes_home() / "hermes.log",
+                _selected_hermes_home() / "gateway.log",
             ]
             for lc in log_candidates:
                 content = _read_log_file(lc, lines)
@@ -6082,9 +6763,8 @@ def api_service_action(action):
         if action == "start":
             import subprocess
             bin_path = _selected_hermes_bin()
-            env = {**os.environ, "HERMES_HOME": str(HERMES_HOME)}
-            pid_file = HERMES_HOME / "gateway.pid"
-            log_path = HERMES_HOME / "logs" / "gateway.log"
+            env = {**os.environ, "HERMES_HOME": str(_selected_hermes_home())}
+            log_path = _selected_gateway_log_path()
             log_path.parent.mkdir(exist_ok=True)
             # Kill any existing gateway process first
             _run_hermes("gateway", "stop", timeout=10)
@@ -6116,8 +6796,8 @@ def api_service_action(action):
             # After stop, start in background
             import subprocess
             bin_path = _selected_hermes_bin()
-            env = {**os.environ, "HERMES_HOME": str(HERMES_HOME)}
-            log_path = HERMES_HOME / "logs" / "gateway.log"
+            env = {**os.environ, "HERMES_HOME": str(_selected_hermes_home())}
+            log_path = _selected_gateway_log_path()
             log_path.parent.mkdir(exist_ok=True)
             time.sleep(1)
             with open(log_path, "a") as lf:
@@ -6359,6 +7039,23 @@ def _session_has_image_history(session: dict) -> bool:
     return False
 
 
+def _messages_for_active_segment(session: dict) -> list[dict]:
+    messages = session.get("messages") or []
+    active_segment = _active_chat_segment(session) or {}
+    start_message_index = int(active_segment.get("start_message_index") or 0)
+    if start_message_index <= 0:
+        return messages
+    return messages[start_message_index:]
+
+
+def _active_segment_has_image_history(session: dict) -> bool:
+    for message in _messages_for_active_segment(session):
+        for file_name in message.get("files", []) or []:
+            if Path(file_name).suffix.lower() in IMAGE_EXTENSIONS:
+                return True
+    return False
+
+
 def _build_attachment_refs(files: list[Path], display_names: dict | None = None) -> list[dict]:
     refs = []
     for path in files or []:
@@ -6424,7 +7121,13 @@ def _latest_turn_sidecar_asset_names(session: dict) -> list[str]:
 def _chat_session_meta(session: dict) -> dict:
     normalized = _normalize_chat_session(copy.deepcopy(session))
     context = _effective_session_context(normalized)
+    active_segment = _active_chat_segment(normalized) or {}
+    active_request = _active_request_for_session(normalized.get("id") or "")
     return {
+        "profile": normalized.get("profile") or _selected_hermes_profile_name(),
+        "active_segment_id": active_segment.get("id") or "",
+        "active_segment_index": active_segment.get("index") or 1,
+        "segments": copy.deepcopy(normalized.get("segments") or []),
         "transport_mode": normalized.get("transport_mode"),
         "transport_preference": normalized.get("transport_preference") or CHAT_TRANSPORT_AUTO,
         "transport_preference_label": _transport_preference_label(normalized.get("transport_preference")),
@@ -6440,6 +7143,10 @@ def _chat_session_meta(session: dict) -> dict:
         "source_docs": context.get("source_docs") or [],
         "folder_workspace_roots": context.get("folder_workspace_roots") or [],
         "folder_source_docs": context.get("folder_source_docs") or [],
+        "active_request_id": (active_request or {}).get("request_id") or "",
+        "active_request_status": (active_request or {}).get("status") or "",
+        "active_request_cancel_supported": bool((active_request or {}).get("cancel_supported")),
+        "active_request_transport": (active_request or {}).get("transport") or "",
     }
 
 
@@ -7505,6 +8212,7 @@ def _chat_completion_request(target: dict, messages: list[dict]) -> str:
     import urllib.request
 
     payload = {"model": target["model"] or "hermes-agent", "messages": messages, "stream": False}
+    api_url = str(target.get("base_url") or "").strip() or _effective_hermes_api_url(DEFAULT_HERMES_API_URL)
     provider_type = str(target.get("provider") or "").strip().lower()
     routing_provider = str(target.get("routing_provider") or "").strip()
     if provider_type == "openrouter" and routing_provider:
@@ -7512,10 +8220,10 @@ def _chat_completion_request(target: dict, messages: list[dict]) -> str:
             "order": [routing_provider],
             "allow_fallbacks": True,
         }
-    headers = _api_server_headers(target.get("api_key"), target.get("provider"))
+    headers = _api_server_headers(target.get("api_key"), target.get("provider"), target)
     headers["Content-Type"] = "application/json"
     req = urllib.request.Request(
-        _build_openai_api_url(target["base_url"], "chat/completions"),
+        _build_openai_api_url(api_url, "chat/completions"),
         data=json.dumps(payload).encode(),
         headers=headers,
         method="POST",
@@ -7738,19 +8446,27 @@ def _call_hermes_prompt(
         cmd.extend(["--resume", session["hermes_session_id"]])
     cmd.extend(["-q", prompt])
     try:
+        output_path = _request_output_path(request_id) if request_id else None
+        if output_path:
+            try:
+                output_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        output_handle = output_path.open("w", encoding="utf-8") if output_path else None
         proc = subprocess.Popen(
             cmd,
             cwd=str(Path.home()),
-            env={**os.environ, "NO_COLOR": "1"},
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            env={**os.environ, "NO_COLOR": "1", "HERMES_HOME": str(_selected_hermes_home())},
+            stdout=output_handle if output_handle is not None else subprocess.PIPE,
+            stderr=subprocess.STDOUT if output_handle is not None else subprocess.PIPE,
             text=True,
             start_new_session=True,
         )
         if request_id:
             _update_chat_request(request_id, pid=proc.pid, pgid=os.getpgid(proc.pid))
 
-        deadline = time.time() + CHAT_REQUEST_TIMEOUT
+        last_activity_at = time.time()
+        last_output_size = 0
         while True:
             if request_id:
                 state = _read_request_control(request_id)
@@ -7762,9 +8478,19 @@ def _call_hermes_prompt(
                     except subprocess.TimeoutExpired:
                         _terminate_chat_process(proc.pid, pgid, signal.SIGKILL)
                         stdout, stderr = proc.communicate()
+                    if output_handle is not None:
+                        output_handle.flush()
                     _update_chat_request(request_id, status="cancelled")
                     raise ChatRequestCancelled("Request cancelled")
-            remaining = deadline - time.time()
+            if output_path and output_path.exists():
+                try:
+                    current_size = output_path.stat().st_size
+                    if current_size > last_output_size:
+                        last_output_size = current_size
+                        last_activity_at = time.time()
+                except OSError:
+                    pass
+            remaining = CHAT_REQUEST_TIMEOUT - (time.time() - last_activity_at)
             if remaining <= 0:
                 _terminate_chat_process(proc.pid, os.getpgid(proc.pid), signal.SIGKILL)
                 proc.communicate()
@@ -7773,7 +8499,20 @@ def _call_hermes_prompt(
                 stdout, stderr = proc.communicate(timeout=min(CHAT_CANCEL_POLL_INTERVAL, remaining))
                 break
             except subprocess.TimeoutExpired:
+                if output_handle is not None:
+                    output_handle.flush()
+                if output_path and output_path.exists():
+                    try:
+                        current_size = output_path.stat().st_size
+                        if current_size > last_output_size:
+                            last_output_size = current_size
+                            last_activity_at = time.time()
+                    except OSError:
+                        pass
                 continue
+
+        if output_handle is not None:
+            output_handle.flush()
 
         if request_id:
             state = _read_request_control(request_id)
@@ -7782,12 +8521,19 @@ def _call_hermes_prompt(
                 raise ChatRequestCancelled("Request cancelled")
 
         if proc.returncode != 0:
-            error_output = stderr.strip() or stdout.strip() or f"Hermes CLI exited with status {proc.returncode}"
+            if output_path and output_path.exists():
+                error_output = output_path.read_text(encoding="utf-8", errors="replace").strip()
+            else:
+                error_output = (stderr or "").strip() or (stdout or "").strip()
+            error_output = error_output or f"Hermes CLI exited with status {proc.returncode}"
             raise ChatBackendError(error_output)
 
-        output = stdout.strip()
+        if output_path and output_path.exists():
+            output = output_path.read_text(encoding="utf-8", errors="replace").strip()
+        else:
+            output = (stdout or "").strip()
         if not output:
-            raise ChatBackendError(stderr.strip() or "Hermes returned an empty response")
+            raise ChatBackendError(((stderr or "").strip()) or "Hermes returned an empty response")
         import re as _re
         output = _re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', output)
         output = _re.sub(r'\x1b\].*?\x07', '', output)
@@ -7795,11 +8541,14 @@ def _call_hermes_prompt(
     except ChatRequestCancelled:
         raise
     except subprocess.TimeoutExpired:
-        raise ChatRequestTimeout(f"Hermes did not respond within {CHAT_REQUEST_TIMEOUT} seconds")
+        raise ChatRequestTimeout(f"Hermes did not produce activity within {CHAT_REQUEST_TIMEOUT} seconds")
     except ChatBackendError:
         raise
     except Exception as e:
         raise ChatBackendError(f"Error calling Hermes: {e}") from e
+    finally:
+        if 'output_handle' in locals() and output_handle is not None:
+            output_handle.close()
 
 
 def _call_hermes_direct(
@@ -7906,28 +8655,30 @@ def _provider_env_api_key(provider: str | None) -> str:
 
 def _resolved_target_api_key(target: dict | None) -> str:
     target = target or {}
-    explicit_api_key = (target.get("api_key") or "").strip()
+    explicit_api_key = _resolve_runtime_template((target.get("api_key") or "").strip()).strip()
     if explicit_api_key:
         return explicit_api_key
     provider_api_key = _provider_env_api_key(target.get("provider"))
     if provider_api_key:
         return provider_api_key
-    return _runtime_env_value(
-        "HERMES_API_KEY",
-        _runtime_env_value("API_SERVER_KEY", ""),
-    ).strip()
+    target_port = _api_url_port(target.get("base_url") or _effective_hermes_api_url(DEFAULT_HERMES_API_URL))
+    repo_env = _repo_env_values()
+    return (
+        next((str(repo_env.get(key) or "").strip() for key in _api_token_repo_keys_for_port(target_port) if str(repo_env.get(key) or "").strip()), "")
+        or str(os.environ.get("HERMES_API_KEY") or "").strip()
+        or str(os.environ.get("HERMES_API_TOKEN") or "").strip()
+        or str(os.environ.get("API_SERVER_KEY") or "").strip()
+        or str(os.environ.get("API_SERVER_TOKEN") or "").strip()
+    )
 
 
-def _api_server_headers(api_key: str | None = None, provider: str | None = None) -> dict:
+def _api_server_headers(api_key: str | None = None, provider: str | None = None, target: dict | None = None) -> dict:
     headers = {}
     resolved_api_key = (api_key or "").strip() if api_key is not None else ""
     if not resolved_api_key and provider:
         resolved_api_key = _provider_env_api_key(provider)
     if not resolved_api_key:
-        resolved_api_key = _runtime_env_value(
-            "HERMES_API_KEY",
-            _runtime_env_value("API_SERVER_KEY", ""),
-        ).strip()
+        resolved_api_key = _resolved_target_api_key(target)
     if resolved_api_key:
         headers["Authorization"] = f"Bearer {resolved_api_key}"
     return headers
@@ -7944,6 +8695,20 @@ def _resolve_api_target(prefer_vision: bool = False) -> dict:
 
 def _resolve_fallback_api_target() -> dict:
     return _resolve_role_target("fallback")
+
+
+def _api_target_missing_credentials(target: dict | None) -> bool:
+    import urllib.parse
+
+    target = target or {}
+    base_url = str(target.get("base_url") or "").strip()
+    if not base_url:
+        return False
+    parsed = urllib.parse.urlparse(base_url)
+    hostname = (parsed.hostname or "").strip().lower()
+    if hostname in {"", "localhost", "127.0.0.1", "::1"}:
+        return False
+    return not bool(_resolved_target_api_key(target))
 
 
 def _openrouter_model_supports_images(target: dict, timeout: int = 3) -> tuple[bool | None, str]:
@@ -8142,19 +8907,11 @@ def _api_server_probe(timeout: int = 3, prefer_vision: bool = False) -> tuple[bo
 
 
 def _check_api_server() -> bool:
-    """Check if Hermes API server is reachable and compression is enabled.
-
-    Currently returns False to force CLI mode — the CLI (hermes chat -q)
-    respects compression settings in ~/.hermes/config.yaml (threshold: 0.5).
-    The API server does not yet support session-level compression.
-    Set HERMES_USE_API=true in the environment to re-enable API server mode.
-    """
-    if _runtime_env_value("HERMES_USE_API", "").lower() in ("1", "true", "yes"):
-        try:
-            return _api_server_healthcheck()
-        except Exception:
-            return False
-    return False
+    """Check if the configured API target is reachable."""
+    try:
+        return _api_server_healthcheck()
+    except Exception:
+        return False
 
 
 def _api_server_healthcheck(timeout: int = 3) -> bool:
@@ -8182,29 +8939,44 @@ def _image_attachment_support_status() -> tuple[bool, str]:
     if not vision_ready:
         return False, vision_reason
     target = _resolve_api_target(prefer_vision=True)
+    if _api_target_missing_credentials(target):
+        api_url = target.get("base_url") or _effective_hermes_api_url(DEFAULT_HERMES_API_URL)
+        return False, f"Vision API key is missing for remote endpoint {api_url}"
     api_ok, api_reason, _ = _api_server_probe(timeout=2, prefer_vision=True)
     if api_ok:
         image_model_ok, image_model_reason = _openrouter_model_supports_images(target, timeout=3)
         if image_model_ok is False:
             return False, image_model_reason
         return True, ""
-    api_url = target.get("base_url") or HERMES_API_URL
+    api_url = target.get("base_url") or _effective_hermes_api_url(DEFAULT_HERMES_API_URL)
     return False, f"OpenAI-compatible vision sidecar API is not reachable at {api_url} ({api_reason})"
 
 
-def _get_or_create_chat_session(session_id=None):
+def _get_or_create_chat_session(session_id=None, profile_name=None):
     existing = _load_session(session_id) if session_id else None
     if existing:
         return _normalize_chat_session(existing)
     if not session_id:
         session_id = str(uuid.uuid4())[:8]
     now = datetime.now().isoformat()
+    selected_profile = _normalize_hermes_profile_name(profile_name) or _selected_hermes_profile_name()
     session = {
         "id": session_id,
         "messages": [],
         "created": now,
         "title": "New Chat",
         "updated": now,
+        "profile": selected_profile,
+        "segments": [{
+            "id": "segment-1",
+            "index": 1,
+            "profile": selected_profile,
+            "transport": "",
+            "hermes_session_id": None,
+            "started_at": now,
+            "start_message_index": 0,
+        }],
+        "active_segment_id": "segment-1",
         "hermes_session_id": None,
         "transport_mode": None,
         "transport_preference": None,
@@ -8237,6 +9009,9 @@ def api_chat():
     data = request.get_json(silent=True) or {}
     message = data.get("message", "").strip()
     session_id = data.get("session_id")
+    requested_profile = _normalize_hermes_profile_name(data.get("profile") or "")
+    if requested_profile and requested_profile not in _available_hermes_profile_names():
+        return jsonify({"error": "Invalid profile"}), 400
     requested_transport_preference = _normalize_transport_preference(data.get("transport_preference"))
     requested_folder_id = str(data.get("folder_id") or "").strip()
     request_id = (data.get("request_id") or str(uuid.uuid4())).strip()
@@ -8260,7 +9035,8 @@ def api_chat():
                 file_display_names[fpath.name] = display_name
     if not message and not files:
         return jsonify({"error": "Message or attachment is required"}), 400
-    sess = _get_or_create_chat_session(session_id)
+    sess = _get_or_create_chat_session(session_id, profile_name=requested_profile)
+    sess["profile"] = _normalize_hermes_profile_name(sess.get("profile")) or _selected_hermes_profile_name()
     if data.get("transport_preference") is not None:
         validated_preference, preference_notice = _validated_transport_preference(requested_transport_preference)
         sess["transport_preference"] = validated_preference
@@ -8271,8 +9047,11 @@ def api_chat():
     if requested_folder_id and not sess.get("folder_id"):
         sess["folder_id"] = requested_folder_id
     sid = sess["id"]
-    request_plan = _plan_chat_request(sess, files)
-    attachment_errors = _validate_attachment_selection(files, request_plan["image_support"])
+    with _scoped_profile_override(sess.get("profile")):
+        request_plan = _plan_chat_request(sess, files)
+        active_segment = _append_chat_segment(sess, sess["profile"], transport=request_plan["transport"])
+        sess["hermes_session_id"] = _segment_hermes_session_id(active_segment)
+        attachment_errors = _validate_attachment_selection(files, request_plan["image_support"])
     if attachment_errors:
         return jsonify({"error": "Unsupported attachment selection", "details": attachment_errors}), 400
 
@@ -8297,6 +9076,10 @@ def api_chat():
         "files": [_attachment_display_name(f, file_display_names) for f in files],
         "attachment_refs": _build_attachment_refs(files, file_display_names),
         "timestamp": datetime.now().isoformat(),
+        "segment_id": active_segment.get("id"),
+        "segment_index": active_segment.get("index"),
+        "profile": active_segment.get("profile") or sess.get("profile"),
+        "transport": request_plan["transport"],
     }
     sess["messages"].append(user_msg)
     # Auto-title from first user message
@@ -8313,71 +9096,76 @@ def api_chat():
     if sess.get("messages"):
         user_msg = sess["messages"][-1]
     try:
-        use_api_server = request_plan["transport"] == CHAT_TRANSPORT_API
-        if use_api_server:
-            if sess.get("transport_mode") != CHAT_TRANSPORT_API:
-                sess["transport_mode"] = CHAT_TRANSPORT_API
-                sess["continuity_mode"] = CHAT_CONTINUITY_LOCAL
-                sess["transport_notice"] = request_plan["transport_notice"]
-                sess["hermes_session_id"] = None
-            api_msgs = []
-            for m in sess["messages"]:
-                msg = {"role": m["role"], "content": m["content"]}
-                if m.get("files"):
-                    msg["files"] = m["files"]
-                api_msgs.append(msg)
-            response_text = _call_api_server(
-                sess,
-                api_msgs,
-                sid,
-                files,
-                prefer_vision=_session_has_image_history(sess) or any(
-                    f.suffix.lower() in IMAGE_EXTENSIONS for f in files
-                ),
-                file_display_names=file_display_names,
-            )
-        else:
-            sidecar_result = {}
-            if any(f.suffix.lower() in IMAGE_EXTENSIONS for f in files) or _vision_reanalysis_requested(message, sess):
-                sidecar_result = _run_sidecar_vision_analysis(
+        with _scoped_profile_override(sess.get("profile")):
+            use_api_server = request_plan["transport"] == CHAT_TRANSPORT_API
+            if use_api_server:
+                if sess.get("transport_mode") != CHAT_TRANSPORT_API:
+                    sess["transport_mode"] = CHAT_TRANSPORT_API
+                    sess["continuity_mode"] = CHAT_CONTINUITY_LOCAL
+                    sess["transport_notice"] = request_plan["transport_notice"]
+                    sess["hermes_session_id"] = None
+                api_msgs = []
+                for m in _messages_for_active_segment(sess):
+                    msg = {"role": m["role"], "content": m["content"]}
+                    if m.get("files"):
+                        msg["files"] = m["files"]
+                    api_msgs.append(msg)
+                response_text = _call_api_server(
                     sess,
-                    message,
+                    api_msgs,
+                    sid,
                     files,
-                    user_message=user_msg,
+                    prefer_vision=_active_segment_has_image_history(sess) or any(
+                        f.suffix.lower() in IMAGE_EXTENSIONS for f in files
+                    ),
                     file_display_names=file_display_names,
-                )
-            if sidecar_result:
-                prompt = _compose_cli_prompt_with_sidecar(
-                    sess,
-                    message,
-                    files,
-                    sidecar_result=sidecar_result,
-                    file_display_names=file_display_names,
-                )
-                response_text, hermes_session_id = _call_hermes_prompt(
-                    sess,
-                    prompt,
-                    request_id=request_id,
                 )
             else:
-                response_text, hermes_session_id = _call_hermes_direct(
-                    sess,
-                    message,
-                    files,
-                    request_id=request_id,
-                    file_display_names=file_display_names,
-                )
-            sess["transport_mode"] = CHAT_TRANSPORT_CLI
-            if hermes_session_id:
-                sess["hermes_session_id"] = hermes_session_id
-                sess["continuity_mode"] = CHAT_CONTINUITY_HERMES
-                sess["transport_notice"] = ""
-            else:
-                sess["continuity_mode"] = CHAT_CONTINUITY_LIMITED
-                sess["transport_notice"] = (
-                    "Hermes CLI did not return a resumable session id for this chat yet. "
-                    "Follow-up turns may not preserve Hermes-side context."
-                )
+                sidecar_result = {}
+                if any(f.suffix.lower() in IMAGE_EXTENSIONS for f in files) or _vision_reanalysis_requested(message, sess):
+                    sidecar_result = _run_sidecar_vision_analysis(
+                        sess,
+                        message,
+                        files,
+                        user_message=user_msg,
+                        file_display_names=file_display_names,
+                    )
+                if sidecar_result:
+                    prompt = _compose_cli_prompt_with_sidecar(
+                        sess,
+                        message,
+                        files,
+                        sidecar_result=sidecar_result,
+                        file_display_names=file_display_names,
+                    )
+                    response_text, hermes_session_id = _call_hermes_prompt(
+                        sess,
+                        prompt,
+                        request_id=request_id,
+                    )
+                else:
+                    response_text, hermes_session_id = _call_hermes_direct(
+                        sess,
+                        message,
+                        files,
+                        request_id=request_id,
+                        file_display_names=file_display_names,
+                    )
+                sess["transport_mode"] = CHAT_TRANSPORT_CLI
+                effective_hermes_session_id = _clean_hermes_session_id(hermes_session_id) or _segment_hermes_session_id(active_segment)
+                if effective_hermes_session_id:
+                    active_segment["hermes_session_id"] = effective_hermes_session_id
+                    sess["hermes_session_id"] = effective_hermes_session_id
+                    sess["continuity_mode"] = CHAT_CONTINUITY_HERMES
+                    sess["transport_notice"] = ""
+                else:
+                    active_segment["hermes_session_id"] = None
+                    sess["hermes_session_id"] = None
+                    sess["continuity_mode"] = CHAT_CONTINUITY_LIMITED
+                    sess["transport_notice"] = (
+                        "Hermes CLI did not return a resumable session id for this chat yet. "
+                        "Follow-up turns may not preserve Hermes-side context."
+                    )
         _update_chat_request(request_id, status="completed")
     except ChatRequestCancelled:
         _rollback_failed_chat_turn(sess, sid, user_msg)
@@ -8413,7 +9201,11 @@ def api_chat():
     finally:
         _remove_chat_request(request_id)
     assistant_msg = {"role": "assistant", "content": response_text,
-                     "timestamp": datetime.now().isoformat()}
+                     "timestamp": datetime.now().isoformat(),
+                     "segment_id": active_segment.get("id"),
+                     "segment_index": active_segment.get("index"),
+                     "profile": active_segment.get("profile") or sess.get("profile"),
+                     "transport": sess.get("transport_mode") or request_plan["transport"]}
     sess["messages"].append(assistant_msg)
     sess["updated"] = datetime.now().isoformat()
     _write_session(sess)
@@ -8720,7 +9512,10 @@ def api_chat_folder_source_from_chat(folder_id):
 @require_token
 def api_chat_sessions_create():
     data = request.get_json() or {}
-    session = _get_or_create_chat_session()
+    requested_profile = _normalize_hermes_profile_name(data.get("profile") or "")
+    if requested_profile and requested_profile not in _available_hermes_profile_names():
+        return jsonify({"error": "Invalid profile"}), 400
+    session = _get_or_create_chat_session(profile_name=requested_profile)
     context_update, errors = _parse_chat_context_update(data)
     transport_preference, transport_notice = _validated_transport_preference(data.get("transport_preference"))
     folder_id = context_update.get("folder_id") or ""
@@ -8750,6 +9545,9 @@ def api_chat_messages(session_id):
     session = _load_session(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
+    if _trim_trailing_empty_chat_segments(session):
+        _write_session(session)
+        session = _load_session(session_id) or session
     return jsonify({"messages": session["messages"],
                      "title": session.get("title", ""),
                      "session": _chat_session_meta(session)})
@@ -8805,6 +9603,31 @@ def api_chat_session_transport_update(session_id):
     return jsonify({"ok": True, "session": _chat_session_meta(session)})
 
 
+@app.route("/api/chat/sessions/<session_id>/profile", methods=["PUT"])
+@require_token
+def api_chat_session_profile_update(session_id):
+    session = _load_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    data = request.get_json() or {}
+    requested_profile = _normalize_hermes_profile_name(data.get("profile"))
+    if requested_profile not in _available_hermes_profile_names():
+        return jsonify({"error": "Invalid profile"}), 400
+    selected = requested_profile
+    segment = _append_chat_segment(session, selected)
+    session["profile"] = selected
+    session["transport_mode"] = None
+    session["continuity_mode"] = None
+    session["hermes_session_id"] = _segment_hermes_session_id(segment)
+    session["transport_notice"] = (
+        f"Switched to Hermes profile {selected}. "
+        "Next messages in this chat will use that profile."
+    )
+    session["updated"] = datetime.now().isoformat()
+    _write_session(session)
+    return jsonify({"ok": True, "selected": selected, "session": _chat_session_meta(session)})
+
+
 @app.route("/api/chat/sessions/<session_id>/folder", methods=["PUT"])
 @require_token
 def api_chat_session_folder_update(session_id):
@@ -8850,6 +9673,26 @@ def api_chat_clear(session_id):
 @app.route("/api/chat/status", methods=["GET"])
 @require_token
 def api_chat_status():
+    request_id = str(request.args.get("request_id") or "").strip()
+    if request_id:
+        payload = _read_request_control(request_id)
+        if payload is None:
+            return jsonify({"error": "Request not found", "request_id": request_id}), 404
+        response = jsonify({
+            "request_id": request_id,
+            "status": payload.get("status") or "running",
+            "transport": payload.get("transport") or "",
+            "cancel_supported": bool(payload.get("cancel_supported")),
+            "session_id": payload.get("session_id") or "",
+            "created_at": payload.get("created_at") or "",
+            "updated_at": payload.get("updated_at") or "",
+            "progress_lines": _request_progress_lines(request_id),
+            "error": payload.get("error") or "",
+        })
+        response.headers["Cache-Control"] = "no-store, no-cache, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
     api_server = _check_api_server()
     default_api_ok, default_api_reason, default_api_probe = _api_server_probe(timeout=2)
     image_support, image_reason = _image_attachment_support_status()
@@ -8859,7 +9702,8 @@ def api_chat_status():
     api_selectable = api_server and not runtime.get("requires_cli")
     return jsonify({
         "api_server": api_server,
-        "api_url": _runtime_env_value("HERMES_API_URL", HERMES_API_URL),
+        "api_url": _effective_hermes_api_url(DEFAULT_HERMES_API_URL),
+        "profile": _selected_hermes_profile_name(),
         "api_probe": {
             "reachable": default_api_ok,
             "reason": default_api_reason,
@@ -8889,6 +9733,9 @@ def api_chat_status():
             "max_upload_bytes": MAX_UPLOAD_SIZE,
             "max_request_body_bytes": MAX_REQUEST_BODY_SIZE,
         },
+        "debug": {
+            "persist_trace": CHAT_PERSIST_DEBUG_TRACE,
+        },
         "transport_policy": {
             "requires_cli": runtime.get("requires_cli"),
             "api_selectable": api_selectable,
@@ -8901,7 +9748,7 @@ def api_chat_status():
             "vision_sidecar_ready": image_support,
             "vision_configured": vision_ready,
             "vision_reason": vision_reason,
-            "vision_api_url": vision_target.get("base_url") or _runtime_env_value("HERMES_API_URL", HERMES_API_URL),
+            "vision_api_url": vision_target.get("base_url") or _effective_hermes_api_url(DEFAULT_HERMES_API_URL),
             "vision_model": vision_target.get("model") if vision_ready else "",
             "api_reachable": default_api_ok,
             "api_reason": default_api_reason,

@@ -24,13 +24,13 @@ export TEMP=/tmp
 export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}"
 WEBUI_VENV="${WEBUI_VENV:-}"
 
-for candidate in "${WEBUI_VENV:-}" "$ROOT_DIR/.venv" "$HOME/.hermes/.venv"; do
+for candidate in "${WEBUI_VENV:-}" "$ROOT_DIR/venv" "$HOME/.hermes/hermes-agent/venv"; do
   if [[ -n "$candidate" && -x "$candidate/bin/python" ]]; then
     WEBUI_VENV="$candidate"
     break
   fi
 done
-WEBUI_VENV="${WEBUI_VENV:-$ROOT_DIR/.venv}"
+WEBUI_VENV="${WEBUI_VENV:-$ROOT_DIR/venv}"
 
 PLAYWRIGHT_PYTHON="$WEBUI_VENV/bin/python"
 if [[ ! -x "$PLAYWRIGHT_PYTHON" ]]; then

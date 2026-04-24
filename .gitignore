@@ -28,6 +28,7 @@ chat_data/
 uploads/
 /run/
 /.codex
+.session_tokens.json
 
 # Cache / temp
 .cache/
