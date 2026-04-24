@@ -14,13 +14,13 @@ detect_webui_venv() {
         echo "$WEBUI_VENV"
         return
     fi
-    for candidate in "$APP_DIR/.venv" "$HOME/.hermes/.venv"; do
+    for candidate in "$APP_DIR/venv" "$HOME/.hermes/hermes-agent/venv"; do
         if [ -x "$candidate/bin/python" ]; then
             echo "$candidate"
             return
         fi
     done
-    echo "$APP_DIR/.venv"
+    echo "$APP_DIR/venv"
 }
 
 WEBUI_VENV="$(detect_webui_venv)"
